@@ -8,8 +8,8 @@ which provides better write performance and data durability.
 ## Technical Aspects
 ### Append-only Storage
 LiteKV stores data in an append-only manner, which means that new key-value pairs are always added
-to the end of the store, even when updating existing keys. This approach provides better write performance
-and ensures that data remains intact even in the case of a crash or failure.
+to the end of the store, even when updating and deleting existing keys. This approach provides better write performance
+and ensures that data remains intact even in the case of a crash or failure. Updating works because on
 ### Compaction
 As the store grows, it may accumulate duplicate or deleted entries, which can affect performance and
 memory usage. LiteKV provides a compaction feature that removes duplicates and deleted key-value pairs,
@@ -40,7 +40,7 @@ library in different use cases.
 To use LiteKV, first import the library:
 ```go
 import (
-"github.com/tillknuesting/litekv"
+    "github.com/tillknuesting/litekv"
 )
 ```
 Then, create a new instance of KeyValueStore:
