@@ -2,12 +2,12 @@ package main
 
 import (
 	"fmt"
-	"github.com/tillknuesting/litekv/kv"
+	"github.com/tillknuesting/litekv"
 	"log"
 )
 
 func main() {
-	kvs := &kv.KeyValueStore{}
+	kvs := &litekv.KeyValueStore{}
 
 	// Write a key-value pair to the store
 	kvs.Write([]byte("foo"), []byte("bar"))
