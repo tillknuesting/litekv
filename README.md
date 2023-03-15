@@ -40,12 +40,12 @@ library in different use cases.
 To use LiteKV, first import the library:
 ```go
 import (
-"github.com/tillknuesting/litekv/kv"
+"github.com/tillknuesting/litekv"
 )
 ```
 Then, create a new instance of KeyValueStore:
 ```go
-kvs := &kv.KeyValueStore{}
+kvs := &litekv.KeyValueStore{}
 ```
 You can now perform basic operations on the store:
 ```go
