@@ -2,8 +2,9 @@ package main
 
 import (
 	"fmt"
-	"github.com/tillknuesting/litekv"
 	"log"
+
+	"github.com/tillknuesting/litekv"
 )
 
 func main() {

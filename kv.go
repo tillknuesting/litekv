@@ -30,9 +30,11 @@ type Error string
 
 func (e Error) Error() string { return string(e) }
 
-const ErrorKeyDeleted = Error("key is deleted")
-const ErrorKeyNotFound = Error("key not found")
-const ErrorChecksumMismatch = Error("checksum mismatch")
+const (
+	ErrorKeyDeleted       = Error("key is deleted")
+	ErrorKeyNotFound      = Error("key not found")
+	ErrorChecksumMismatch = Error("checksum mismatch")
+)
 
 type KeyValueStore struct {
 	sync.RWMutex
