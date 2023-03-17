@@ -261,6 +261,56 @@ func BenchmarkKeyValueStore_Delete(b *testing.B) {
 	}
 }
 
+func TestKeyValueStore_Compact(t *testing.T) {
+	// TODO: Refactor test to consider more cases
+	kvs := &KeyValueStore{}
+
+	kvs.Write([]byte("foo"), []byte("bar"))
+	kvs.Write([]byte("foo2"), []byte("bar2"))
+
+	kvs.Delete([]byte("foo"))
+
+	kvs.Compact()
+
+	latestRecords := kvs.findLatestRecords()
+
+	if len(latestRecords) != 1 {
+		t.Errorf("latestRecords length is not 1")
+	} else if string(latestRecords["foo2"].Key) != "foo2" {
+		t.Errorf("latestRecords key is not foo2")
+	} else if string(latestRecords["foo2"].Value) != "bar2" {
+		t.Errorf("latestRecords value is not bar2")
+	} else if latestRecords["foo2"].Type != RecordTypeNormal {
+		t.Errorf("latestRecords type is not RecordTypeWrite")
+	}
+}
+
+func TestKeyValueStore_RebuildIndex(t *testing.T) {
+	// TODO: Refactor test to consider more cases
+	kvs := &KeyValueStore{}
+
+	kvs.Write([]byte("foo"), []byte("bar"))
+	kvs.Write([]byte("foo2"), []byte("bar2"))
+	kvs.Write([]byte("foo3"), []byte("bar3"))
+
+	fmt.Println("kvs.index", kvs.index)
+
+	kvsTemp := kvs.index
+	kvs.index = nil
+
+	kvs.RebuildIndex()
+
+	if kvs.index == nil {
+		t.Errorf("index is nil")
+	} else if len(kvsTemp) != len(kvsTemp) {
+		t.Errorf("index is not equal to kvsTemp")
+	} else if kvs.index["foo"] != kvsTemp["foo"] {
+		t.Errorf("index is not equal to kvsTemp")
+	} else if kvs.index["foo2"] != kvsTemp["foo2"] {
+		t.Errorf("index is not equal to kvsTemp")
+	}
+}
+
 func FuzzKeyValueStore_WriteReadDelete(f *testing.F) {
 	kvs := &KeyValueStore{}
 	f.Fuzz(func(t *testing.T, a []byte, b []byte) {

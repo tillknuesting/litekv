@@ -233,7 +233,6 @@ func (kvs *KeyValueStore) SaveIndex() ([]byte, error) {
 
 	// Encode the KeyValueStore's index using the gob.Encoder.
 	err := encoder.Encode(kvs.index)
-
 	// If there's an error during encoding, return nil and the error.
 	if err != nil {
 		return nil, err
@@ -258,7 +257,6 @@ func (kvs *KeyValueStore) LoadIndex(data []byte) error {
 
 	// Decode the serialized index using the gob.Decoder into the KeyValueStore's index.
 	err := decoder.Decode(&kvs.index)
-
 	// If there's an error during decoding, return the error.
 	if err != nil {
 		return err
@@ -268,11 +266,12 @@ func (kvs *KeyValueStore) LoadIndex(data []byte) error {
 	return nil
 }
 
-// findLatestRecords iterates through the KeyValueStore's data byte slice and constructs a map of the latest records for each key.
-// This method is used internally by the Compact() method to identify the latest records that need to be kept during compaction.
 func (kvs *KeyValueStore) findLatestRecords() map[string]*Record {
 	// Initialize an empty map to store the latest records for each key.
 	latestRecords := make(map[string]*Record)
+
+	// Initialize a set to store deleted keys.
+	deletedKeys := make(map[string]struct{})
 
 	// Create a new bytes.Buffer initialized with the KeyValueStore's data.
 	buf := bytes.NewBuffer(kvs.data)
@@ -285,20 +284,22 @@ func (kvs *KeyValueStore) findLatestRecords() map[string]*Record {
 		// Deserialize the record from the buffer.
 		record.fromBytes(buf)
 
+		// Convert the byte slice key to a string.
+		key := string(record.Key)
+
 		// Check if the current record is of type RecordTypeNormal.
 		if record.Type == RecordTypeNormal {
-			// Convert the byte slice key to a string.
-			key := string(record.Key)
-
-			// Check if the key already exists in the latestRecords map.
+			// Check if the key already exists in the latestRecords map and if it is not in the deletedKeys set.
 			_, exists := latestRecords[key]
+			_, isDeleted := deletedKeys[key]
 
-			// Update the latestRecords map if:
-			// 1. The key doesn't exist yet.
-			// 2. The current record is of type RecordTypeNormal.
-			if !exists {
+			if !exists && !isDeleted {
 				latestRecords[key] = record
 			}
+		} else if record.Type == RecordTypeDeleted {
+			// If the record is of type RecordTypeDeleted, add it to the deletedKeys set and remove it from the latestRecords map.
+			deletedKeys[key] = struct{}{}
+			delete(latestRecords, key)
 		}
 	}
 
@@ -334,30 +335,6 @@ func (kvs *KeyValueStore) Compact() {
 			// Append the record's serialized form to the data slice.
 			kvs.data = append(kvs.data, record.toBytes()...)
 		}
-	}
-}
-
-// PrintAllKeyValuePairs iterates through the KeyValueStore's data byte slice, deserializes each record,
-// and prints the key, value, and record type for each record.
-// This method is useful for debugging and getting an overview of the KeyValueStore's contents.
-func (kvs *KeyValueStore) PrintAllKeyValuePairs() {
-	// Acquire a read lock on the KeyValueStore to ensure thread safety.
-	kvs.RLock()
-	defer kvs.RUnlock()
-
-	// Create a new bytes.Buffer initialized with the KeyValueStore's data.
-	buf := bytes.NewBuffer(kvs.data)
-
-	// Iterate through the data byte slice as long as there are remaining bytes.
-	for buf.Len() > 0 {
-		// Create a new Record.
-		record := new(Record)
-
-		// Deserialize the record from the buffer.
-		record.fromBytes(buf)
-
-		// Print the key, value, and record type for the current record.
-		fmt.Printf("Key: %s, Value: %s, Type: %b\n", record.Key, record.Value, record.Type)
 	}
 }
 
@@ -397,5 +374,29 @@ func (kvs *KeyValueStore) RebuildIndex() {
 
 		// Update the position for the next record.
 		pos += recordSize
+	}
+}
+
+// PrintAllKeyValuePairs iterates through the KeyValueStore's data byte slice, deserializes each record,
+// and prints the key, value, and record type for each record.
+// This method is useful for debugging and getting an overview of the KeyValueStore's contents.
+func (kvs *KeyValueStore) PrintAllKeyValuePairs() {
+	// Acquire a read lock on the KeyValueStore to ensure thread safety.
+	kvs.RLock()
+	defer kvs.RUnlock()
+
+	// Create a new bytes.Buffer initialized with the KeyValueStore's data.
+	buf := bytes.NewBuffer(kvs.data)
+
+	// Iterate through the data byte slice as long as there are remaining bytes.
+	for buf.Len() > 0 {
+		// Create a new Record.
+		record := new(Record)
+
+		// Deserialize the record from the buffer.
+		record.fromBytes(buf)
+
+		// Print the key, value, and record type for the current record.
+		fmt.Printf("Key: %s, Value: %s, Type: %b\n", record.Key, record.Value, record.Type)
 	}
 }

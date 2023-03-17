@@ -58,6 +58,8 @@ func main() {
 		fmt.Println("foo =", string(v))
 	}
 
+	kvs.Write([]byte("foo2"), []byte("bar2"))
+
 	// Print all key-value pairs before compaction
 	// Compaction removes duplicates and deleted key-value pairs
 	fmt.Println("All key = Val before compaction:")
