@@ -123,9 +123,9 @@ func TestKeyValueStore_Read(t *testing.T) {
 
 		kvs.Write(test.writeKey, test.writeValue)
 
-		// Modify data to create a checksum mismatch
+		// Modify Data to create a checksum mismatch
 		if test.modifyData {
-			kvs.data[0]++
+			kvs.Data[0]++
 		}
 
 		value, err := kvs.Read(test.readKey)
@@ -143,7 +143,7 @@ func TestKeyValueStore_Read(t *testing.T) {
 func BenchmarkKeyValueStore_Read(b *testing.B) {
 	kvs := &KeyValueStore{}
 
-	// Write some sample data to the store
+	// Write some sample Data to the store
 	kvs.Write([]byte("foo"), []byte("bar"))
 	kvs.Write([]byte("baz"), []byte(strings.Repeat("a", 1024)))
 	kvs.Write([]byte("quux"), []byte(strings.Repeat("b", 1048576)))
@@ -230,7 +230,7 @@ func TestKeyValueStore_Delete(t *testing.T) {
 func BenchmarkKeyValueStore_Delete(b *testing.B) {
 	kvs := &KeyValueStore{}
 
-	// Write some sample data to the store
+	// Write some sample Data to the store
 	kvs.Write([]byte("foo"), []byte("bar"))
 	kvs.Write([]byte("baz"), []byte(strings.Repeat("a", 1024)))
 	kvs.Write([]byte("quux"), []byte(strings.Repeat("b", 1048576)))
@@ -293,21 +293,21 @@ func TestKeyValueStore_RebuildIndex(t *testing.T) {
 	kvs.Write([]byte("foo2"), []byte("bar2"))
 	kvs.Write([]byte("foo3"), []byte("bar3"))
 
-	fmt.Println("kvs.index", kvs.index)
+	fmt.Println("kvs.Index", kvs.Index)
 
-	kvsTemp := kvs.index
-	kvs.index = nil
+	kvsTemp := kvs.Index
+	kvs.Index = nil
 
 	kvs.RebuildIndex()
 
-	if kvs.index == nil {
-		t.Errorf("index is nil")
+	if kvs.Index == nil {
+		t.Errorf("Index is nil")
 	} else if len(kvsTemp) != len(kvsTemp) {
-		t.Errorf("index is not equal to kvsTemp")
-	} else if kvs.index["foo"] != kvsTemp["foo"] {
-		t.Errorf("index is not equal to kvsTemp")
-	} else if kvs.index["foo2"] != kvsTemp["foo2"] {
-		t.Errorf("index is not equal to kvsTemp")
+		t.Errorf("Index is not equal to kvsTemp")
+	} else if kvs.Index["foo"] != kvsTemp["foo"] {
+		t.Errorf("Index is not equal to kvsTemp")
+	} else if kvs.Index["foo2"] != kvsTemp["foo2"] {
+		t.Errorf("Index is not equal to kvsTemp")
 	}
 }
 
