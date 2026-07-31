@@ -108,15 +108,19 @@ func main() {
 		log.Fatalln(err)
 	}
 
-	durability()
+	// log.Fatalln calls os.Exit, which skips deferred calls, so the durability
+	// half returns its error rather than exiting from under its own defer.
+	if err := durability(); err != nil {
+		log.Fatalln(err)
+	}
 }
 
 // durability shows the two ways a store outlives the process: hand the Data
 // slice around yourself, or let the store keep a file.
-func durability() {
+func durability() error {
 	dir, err := os.MkdirTemp("", "litekv")
 	if err != nil {
-		log.Fatalln(err)
+		return err
 	}
 	defer os.RemoveAll(dir)
 
@@ -126,44 +130,52 @@ func durability() {
 	// for not waiting on the disk every time; the default, SyncAlways, waits.
 	kvs, err := litekv.Open(path, litekv.Options{Sync: litekv.SyncEvery, Interval: time.Second})
 	if err != nil {
-		log.Fatalln(err)
+		return err
 	}
+
+	// Close syncs whatever the timer has not, and runs even if what follows
+	// panics. It does not run if the process is killed, which costs nothing:
+	// every record is already with the operating system by the time Write
+	// returns, so only losing power can take one back.
+	defer kvs.Close()
+
 	if err := kvs.Write([]byte("persisted"), []byte("across restarts")); err != nil {
-		log.Fatalln(err)
+		return err
 	}
-	// Close syncs whatever the timer has not.
 	if err := kvs.Close(); err != nil {
-		log.Fatalln(err)
+		return err
 	}
 
 	reopened, err := litekv.Open(path, litekv.Options{})
 	if err != nil {
-		log.Fatalln(err)
+		return err
 	}
 	defer reopened.Close()
 
 	v, err := reopened.Read([]byte("persisted"))
 	if err != nil {
-		log.Fatalln(err)
+		return err
 	}
 	fmt.Println("after reopening, persisted =", string(v))
 
 	// The file is just the Data slice, so it can be loaded by hand instead.
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		log.Fatalln(err)
+		return err
 	}
 
 	byHand := &litekv.KeyValueStore{Data: raw}
 	discarded, err := byHand.Recover()
 	if err != nil {
-		log.Fatalln(err)
+		return err
 	}
 	fmt.Printf("loaded %d bytes by hand, discarded %d\n", len(raw), discarded)
 
 	v, err = byHand.Read([]byte("persisted"))
 	if err != nil {
-		log.Fatalln(err)
+		return err
 	}
 	fmt.Println("read from the loaded slice:", string(v))
+
+	return nil
 }

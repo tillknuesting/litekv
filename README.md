@@ -137,6 +137,43 @@ it, since the sync happens under the write lock — there is no way to acknowled
 waiting for the disk. Those numbers are from an SSD on macOS, where `Sync` is a full barrier; an SD card
 in a Raspberry Pi is worse.
 
+#### Shutting down
+
+`Close` syncs and releases the file, and is worth deferring:
+
+```go
+kvs, err := litekv.Open("store.kv", litekv.Options{Sync: litekv.SyncEvery})
+if err != nil {
+    return err
+}
+defer kvs.Close()
+```
+
+A deferred `Close` runs while a panic unwinds. It does *not* run on `os.Exit`, which `log.Fatal` calls,
+nor on an unhandled signal, nor on `SIGKILL`. That matters less than it sounds: a record is with the
+operating system by the time `Write` returns, so a process that dies without closing loses nothing, and
+the next `Open` recovers every record it wrote. There is a test for exactly that — twenty writes, no
+sync, no close, all twenty recovered.
+
+What `Close` is for is the case no defer can cover anyway. Losing power loses whatever the sync policy
+had not yet covered, and a deferred function does not run when the power goes out. If you want a
+bounded window there, that is `SyncEvery`; if you want none, that is `SyncAlways`. For a graceful
+shutdown on a signal, handle it yourself and call `Close` — a library should not take a program's
+signals out from under it:
+
+```go
+signals := make(chan os.Signal, 1)
+signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+go func() {
+    <-signals
+    kvs.Close()
+    os.Exit(0)
+}()
+```
+
+One caveat under `SyncEvery`: the timer goroutine holds a reference to the store, so a store that is
+abandoned instead of closed keeps that goroutine and its file descriptor for the life of the process.
+
 A crash can leave a record half written at the end of the log. `Open` recovers, dropping everything from
 the first record that fails to decode or fails its checksum and truncating the file to match. Under
 `SyncAlways` such a record cannot have been acknowledged, because the acknowledgement waits for the sync;

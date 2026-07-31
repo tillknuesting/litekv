@@ -648,3 +648,52 @@ func BenchmarkWriteDurability(b *testing.B) {
 		}
 	})
 }
+
+// TestUnclosedStoreSurvives is the answer to "what if we never get to Close".
+// A record is written to the log as it happens, so the operating system has it
+// the moment Write returns, whether or not anything is ever synced or closed.
+// Killing the process cannot take it back: only losing power can, which is what
+// the sync policy is about.
+//
+// Opening the same file a second time while the first store is still open and
+// unclosed stands in for a process that died without cleaning up.
+func TestUnclosedStoreSurvives(t *testing.T) {
+	for _, policy := range []struct {
+		name string
+		opts Options
+	}{
+		{"SyncNever", Options{Sync: SyncNever}},
+		{"SyncEvery/1h", Options{Sync: SyncEvery, Interval: time.Hour}}, // never fires
+	} {
+		t.Run(policy.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "kv")
+
+			doomed, err := Open(path, policy.opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i < 20; i++ {
+				if err := doomed.Write([]byte(fmt.Sprintf("key%02d", i)), []byte("value")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// No Sync. No Close. The process is gone.
+
+			survivor, err := Open(path, Options{})
+			if err != nil {
+				t.Fatalf("Open after the crash: %v", err)
+			}
+			defer survivor.Close()
+
+			if got := len(survivor.Index); got != 20 {
+				t.Errorf("recovered %d keys, want 20", got)
+			}
+			if value, err := survivor.Read([]byte("key19")); err != nil || string(value) != "value" {
+				t.Errorf("key19: got '%s' (err %v)", value, err)
+			}
+			if err := survivor.Verify(); err != nil {
+				t.Errorf("Verify: %v", err)
+			}
+		})
+	}
+}

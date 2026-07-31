@@ -356,6 +356,18 @@ func (kvs *KeyValueStore) Sync() error {
 
 // Close syncs the store and, if it opened the log itself, closes it. A closed
 // store rejects writes. Closing a store that lives only in memory does nothing.
+//
+// Close is worth deferring, and a deferred Close does run while a panic
+// unwinds. It does not run on os.Exit, which log.Fatal calls, or on a signal
+// that is not handled, or on SIGKILL. That costs less than it sounds: a record
+// is handed to the operating system as Write returns, so a process that dies
+// without closing loses nothing, and Open recovers everything it wrote. Only
+// losing power loses records, and only those the sync policy had not yet
+// covered, which no amount of deferring can help with.
+//
+// Under SyncEvery the timer goroutine holds a reference to the store, so a
+// store that is abandoned rather than closed keeps that goroutine and its file
+// descriptor for the life of the process.
 func (kvs *KeyValueStore) Close() error {
 	kvs.Lock()
 	state := kvs.state
