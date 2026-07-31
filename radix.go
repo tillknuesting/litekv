@@ -345,10 +345,7 @@ func (n *node) walk(fn func(value int64) bool) bool {
 // commonPrefixLen returns the length of the longest run of bytes that a and b
 // begin with.
 func commonPrefixLen(a, b []byte) int {
-	n := len(a)
-	if len(b) < n {
-		n = len(b)
-	}
+	n := min(len(a), len(b))
 
 	for i := 0; i < n; i++ {
 		if a[i] != b[i] {

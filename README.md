@@ -154,6 +154,9 @@ if err := kvs.RebuildIndex(); errors.As(err, &corrupt) {
 
 ## Getting Started
 
+LiteKV needs Go 1.26 or newer, which is what `go.mod` asks for. Nothing in the library needs a recent
+language feature, so if you have to build it with an older toolchain, lowering that one line is enough.
+
 To use LiteKV, first import the library:
 ```go
 import (

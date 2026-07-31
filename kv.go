@@ -454,11 +454,7 @@ func (kvs *KeyValueStore) scan(fn func(pos, next int64, r Record) bool) error {
 func (kvs *KeyValueStore) offsets() ([]int64, error) {
 	// A record is at least a header, which bounds the count, but that bound is
 	// wildly high for a store of large values, so cap the head start.
-	hint := len(kvs.Data)/headerSize + 1
-	if hint > 4096 {
-		hint = 4096
-	}
-	offs := make([]int64, 0, hint)
+	offs := make([]int64, 0, min(len(kvs.Data)/headerSize+1, 4096))
 
 	var pos int64
 	for pos < int64(len(kvs.Data)) {
