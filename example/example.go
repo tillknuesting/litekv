@@ -11,7 +11,9 @@ func main() {
 	kvs := &litekv.KeyValueStore{}
 
 	// Write a key-value pair to the store
-	kvs.Write([]byte("foo"), []byte("bar"))
+	if err := kvs.Write([]byte("foo"), []byte("bar")); err != nil {
+		log.Fatalln(err)
+	}
 
 	// Export the index, which can be saved to disk for persistence
 	// The index maps keys to their positions within the store
@@ -19,9 +21,9 @@ func main() {
 	if err != nil {
 		log.Fatalln(err)
 	}
-	// Import the index back into the store, allowing for efficient lookups
-	err = kvs.LoadIndex(indexExported)
-	if err != nil {
+	// Import the index back into the store, allowing for efficient lookups.
+	// LoadIndex validates every entry against the data, so restore the data first.
+	if err := kvs.LoadIndex(indexExported); err != nil {
 		log.Fatalln(err)
 	}
 
@@ -33,11 +35,23 @@ func main() {
 		fmt.Println("foo =", string(v))
 	}
 
-	// Rebuild the index from the current data, in case the index is lost or corrupted
-	kvs.RebuildIndex()
+	// Rebuild the index from the current data, in case the index is lost or corrupted.
+	// A *litekv.CorruptAtError here means the data has a damaged tail, for example
+	// from an append cut short by a crash; the index still covers everything
+	// before that offset.
+	if err := kvs.RebuildIndex(); err != nil {
+		log.Fatalln(err)
+	}
+
+	// Check every stored record against its checksum
+	if err := kvs.Verify(); err != nil {
+		log.Fatalln(err)
+	}
 
 	// Update the value associated with the key "foo"
-	kvs.Write([]byte("foo"), []byte("newValue"))
+	if err := kvs.Write([]byte("foo"), []byte("newValue")); err != nil {
+		log.Fatalln(err)
+	}
 
 	// Read the updated value associated with the key "foo"
 	v, err = kvs.Read([]byte("foo"))
@@ -48,7 +62,9 @@ func main() {
 	}
 
 	// Delete the key-value pair with the key "foo"
-	kvs.Delete([]byte("foo"))
+	if err := kvs.Delete([]byte("foo")); err != nil {
+		log.Fatalln(err)
+	}
 
 	// Attempt to read the deleted key-value pair
 	v, err = kvs.Read([]byte("foo"))
@@ -58,17 +74,34 @@ func main() {
 		fmt.Println("foo =", string(v))
 	}
 
-	kvs.Write([]byte("foo2"), []byte("bar2"))
+	if err := kvs.Write([]byte("foo2"), []byte("bar2")); err != nil {
+		log.Fatalln(err)
+	}
 
 	// Print all key-value pairs before compaction
-	// Compaction removes duplicates and deleted key-value pairs
+	// Compaction removes superseded records and deleted key-value pairs
 	fmt.Println("All key = Val before compaction:")
-	kvs.PrintAllKeyValuePairs()
+	if err := kvs.PrintAllKeyValuePairs(); err != nil {
+		log.Fatalln(err)
+	}
 
 	// Perform compaction on the KeyValueStore
-	kvs.Compact()
+	if err := kvs.Compact(); err != nil {
+		log.Fatalln(err)
+	}
 
 	// Print all key-value pairs after compaction
 	fmt.Println("All key = Val after compaction:")
-	kvs.PrintAllKeyValuePairs()
+	if err := kvs.PrintAllKeyValuePairs(); err != nil {
+		log.Fatalln(err)
+	}
+
+	// Walk the store without printing it
+	err = kvs.ForEach(func(key, value []byte, deleted bool) bool {
+		fmt.Printf("%s = %s (deleted: %t)\n", key, value, deleted)
+		return true
+	})
+	if err != nil {
+		log.Fatalln(err)
+	}
 }

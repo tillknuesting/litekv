@@ -6,6 +6,7 @@ import (
 	"encoding/gob"
 	"fmt"
 	"hash/crc32"
+	"math"
 	"sync"
 )
 
@@ -21,6 +22,13 @@ const (
 	// RecordTypeDeleted represents a deleted record, which is marked as deleted but not removed from the Data slice.
 	RecordTypeDeleted
 )
+
+// headerSize is the size of the fixed-width part of a serialized record:
+// Crc (4) + Type (1) + KeyLength (4) + ValueLength (4).
+const headerSize = 13
+
+// maxFieldLen is the largest key or value that fits in the uint32 length fields.
+const maxFieldLen = math.MaxUint32
 
 // Record represents a single key-value pair along with its metadata in the KeyValueStore.
 // It contains fields for the CRC checksum, record type (normal or deleted), key, value, key length, and value length.
@@ -52,11 +60,42 @@ const (
 	// ErrorChecksumMismatch is returned when a record's calculated checksum
 	// does not match its stored checksum, indicating Data corruption.
 	ErrorChecksumMismatch = Error("checksum mismatch")
+
+	// ErrorCorruptData is returned when a record cannot be decoded from the Data
+	// slice, for example because its length fields run past the end of the slice.
+	// Errors reported by a scan of the whole store also match this via errors.Is.
+	ErrorCorruptData = Error("corrupt data")
+
+	// ErrorKeyMismatch is returned when the Index points at a record that holds a
+	// different key than the one being looked up, which means the Index is stale
+	// or belongs to a different store.
+	ErrorKeyMismatch = Error("index points at a different key")
+
+	// ErrorRecordTooLarge is returned when a key or value does not fit in the
+	// uint32 length fields of the binary format.
+	ErrorRecordTooLarge = Error("key or value exceeds 4 GiB")
 )
+
+// CorruptAtError reports the offset in the Data slice at which decoding stopped.
+// It matches ErrorCorruptData under errors.Is, so callers that do not care about
+// the offset can test for ErrorCorruptData.
+type CorruptAtError struct {
+	Offset int64
+}
+
+func (e *CorruptAtError) Error() string {
+	return fmt.Sprintf("corrupt record at offset %d", e.Offset)
+}
+
+func (e *CorruptAtError) Is(target error) bool { return target == ErrorCorruptData }
 
 // KeyValueStore is a simple key-value store implementation.
 // It utilizes a byte slice (Data) to store serialized records and a map (Index) to map keys to their position in the Data byte slice.
 // The KeyValueStore struct also embeds the sync.RWMutex to ensure thread safety during concurrent read and write operations.
+//
+// Data and Index are exported so that the store can be backed by a file or by
+// POSIX shared memory. Callers that touch them directly must hold the embedded
+// mutex, and must call RebuildIndex after replacing Data.
 type KeyValueStore struct {
 	sync.RWMutex                  // Embed the RWMutex to ensure thread safety during concurrent read and write operations.
 	Data         []byte           // A byte slice that holds the serialized records.
@@ -64,11 +103,17 @@ type KeyValueStore struct {
 }
 
 // Write takes a key and a value, both in byte slices, and stores them in the KeyValueStore instance.
-// This method is responsible for creating a new Record with the given key-value pair and appending it
-// to the Data byte slice. It also updates the Index map to map the key to the position of the new record.
-func (kvs *KeyValueStore) Write(key, value []byte) {
-	// First, create a new record with the given key and value.
-	// Set the record type to "RecordTypeNormal" to indicate that it's a normal record, not a deleted one.
+// This method creates a new Record for the given key-value pair, appends it to the Data byte slice
+// and updates the Index map to map the key to the position of the new record.
+//
+// It returns ErrorRecordTooLarge if the key or the value does not fit in the
+// uint32 length fields of the binary format. The key and value are copied into
+// Data, so the caller may reuse both slices afterwards.
+func (kvs *KeyValueStore) Write(key, value []byte) error {
+	if uint64(len(key)) > maxFieldLen || uint64(len(value)) > maxFieldLen {
+		return ErrorRecordTooLarge
+	}
+
 	record := &Record{
 		Type:        RecordTypeNormal,
 		Key:         key,
@@ -76,327 +121,380 @@ func (kvs *KeyValueStore) Write(key, value []byte) {
 		KeyLength:   uint32(len(key)),
 		ValueLength: uint32(len(value)),
 	}
-
-	// Calculate the CRC checksum of the record and store it in the record's Crc field.
 	record.Crc = record.calculateChecksum()
 
-	// Acquire a write lock on the KeyValueStore instance to ensure thread safety.
 	kvs.Lock()
-	// Defer the unlocking operation so that the lock is released after the method finishes.
 	defer kvs.Unlock()
 
-	// Check if the Index map is initialized, and if not, initialize it.
 	if kvs.Index == nil {
 		kvs.Index = make(map[string]int64)
 	}
 
-	// Update the Index map to associate the key with the current position in the Data byte slice.
 	kvs.Index[string(key)] = int64(len(kvs.Data))
-
-	// Convert the record to a byte slice and append it to the Data byte slice.
-	kvs.Data = append(kvs.Data, record.toBytes()...)
+	kvs.Data = record.appendTo(kvs.Data)
+	return nil
 }
 
 // Read takes a key in the form of a byte slice and retrieves the associated value from the KeyValueStore instance.
-// It returns the value as a byte slice, or an error if the key is not found, deleted, or there's a checksum mismatch.
+// It returns a copy of the value, or an error if the key is not found, is deleted, or the record cannot be
+// verified: ErrorChecksumMismatch for a damaged record, ErrorKeyMismatch or ErrorCorruptData for an Index
+// entry that does not describe the record it points at.
 func (kvs *KeyValueStore) Read(key []byte) ([]byte, error) {
-	// Acquire a read lock on the KeyValueStore instance to ensure thread safety.
 	kvs.RLock()
-	// Defer the unlocking operation so that the lock is released after the method finishes.
 	defer kvs.RUnlock()
 
-	// Use the Index map to find the position of the record associated with the given key.
-	// If the key doesn't exist in the Index map, return an ErrorKeyNotFound error.
 	pos, exists := kvs.Index[string(key)]
 	if !exists {
 		return nil, ErrorKeyNotFound
 	}
 
-	// Create a new bytes.Buffer with the Data from the position found in the Index map.
-	buf := bytes.NewBuffer(kvs.Data[pos:])
+	record, _, err := parseRecordAt(kvs.Data, pos)
+	if err != nil {
+		return nil, err
+	}
 
-	// Initialize a new Record instance and deserialize the record Data from the bytes.Buffer.
-	record := new(Record)
-	record.fromBytes(buf)
-
-	// Verify the CRC checksum of the record. If the checksum doesn't match, return an ErrorChecksumMismatch error.
 	if record.Crc != record.calculateChecksum() {
 		return nil, ErrorChecksumMismatch
 	}
 
-	// Check the record type. If it's a normal record, return the value as a byte slice.
-	// If the record type is deleted, return an ErrorKeyDeleted error.
-	if record.Type == RecordTypeNormal {
-		return record.Value, nil
+	// The record decoded cleanly, so a key that differs from the one asked for
+	// means the Index is stale rather than the Data being damaged.
+	if !bytes.Equal(record.Key, key) {
+		return nil, ErrorKeyMismatch
 	}
-	return nil, ErrorKeyDeleted
+
+	if record.Type != RecordTypeNormal {
+		return nil, ErrorKeyDeleted
+	}
+
+	// record.Value aliases kvs.Data, which later writes and Compact may reuse,
+	// so hand the caller its own copy.
+	value := make([]byte, len(record.Value))
+	copy(value, record.Value)
+	return value, nil
 }
 
 // Delete takes a key in the form of a byte slice and marks the associated record as deleted in the KeyValueStore instance.
 // It achieves this by creating a new Record with the RecordType set to RecordTypeDeleted and appending it to the Data byte slice.
 // It also updates the Index map to map the key to the position of the new deleted record.
-func (kvs *KeyValueStore) Delete(key []byte) {
-	// Create a new Record with the given key and set the record type to "RecordTypeDeleted" to indicate that it's a deleted record.
+//
+// Deleting a key that was never written is not an error; it appends a tombstone
+// that Compact later drops. It returns ErrorRecordTooLarge for an oversized key.
+func (kvs *KeyValueStore) Delete(key []byte) error {
+	if uint64(len(key)) > maxFieldLen {
+		return ErrorRecordTooLarge
+	}
+
 	record := &Record{
 		Type:      RecordTypeDeleted,
 		Key:       key,
 		KeyLength: uint32(len(key)),
 	}
-
-	// Calculate the CRC checksum of the record and store it in the record's Crc field.
 	record.Crc = record.calculateChecksum()
 
-	// Acquire a write lock on the KeyValueStore instance to ensure thread safety.
 	kvs.Lock()
-	// Defer the unlocking operation so that the lock is released after the method finishes.
 	defer kvs.Unlock()
 
-	// Update the Index map to associate the key with the current position in the Data byte slice.
+	if kvs.Index == nil {
+		kvs.Index = make(map[string]int64)
+	}
+
 	kvs.Index[string(key)] = int64(len(kvs.Data))
-
-	// Convert the record to a byte slice and append it to the Data byte slice.
-	kvs.Data = append(kvs.Data, record.toBytes()...)
+	kvs.Data = record.appendTo(kvs.Data)
+	return nil
 }
 
-// calculateChecksum calculates the CRC checksum of a Record instance.
-// It does this by serializing the record's fields, excluding the Crc field, into a bytes.Buffer,
-// and then calculating the CRC-32 checksum of the buffer's contents using the IEEE polynomial.
-// The resulting uint32 checksum value is returned by the method.
+// calculateChecksum calculates the CRC-32 (IEEE) checksum over the record's Type,
+// KeyLength, ValueLength, Key and Value fields, in that order. The Crc field
+// itself is excluded. The checksum is computed incrementally, so no intermediate
+// copy of the key or value is made.
 func (r *Record) calculateChecksum() uint32 {
-	// Create a new bytes.Buffer to store the serialized record fields.
-	buf := new(bytes.Buffer)
+	var hdr [headerSize - 4]byte
+	hdr[0] = byte(r.Type)
+	binary.LittleEndian.PutUint32(hdr[1:5], r.KeyLength)
+	binary.LittleEndian.PutUint32(hdr[5:9], r.ValueLength)
 
-	// Write the record fields to the buffer in little-endian byte order, excluding the Crc field.
-	// The fields written are: Type, KeyLength, ValueLength, Key, and Value.
-	binary.Write(buf, binary.LittleEndian, r.Type)
-	binary.Write(buf, binary.LittleEndian, r.KeyLength)
-	binary.Write(buf, binary.LittleEndian, r.ValueLength)
-	buf.Write(r.Key)
-	buf.Write(r.Value)
-
-	// Calculate the CRC-32 checksum of the buffer's contents using the IEEE polynomial
-	// and return the resulting uint32 checksum value.
-	return crc32.ChecksumIEEE(buf.Bytes())
+	crc := crc32.ChecksumIEEE(hdr[:])
+	crc = crc32.Update(crc, crc32.IEEETable, r.Key)
+	crc = crc32.Update(crc, crc32.IEEETable, r.Value)
+	return crc
 }
 
-// toBytes serializes a Record instance into a byte slice.
-// It writes the record fields, including the Crc field, into a bytes.Buffer in little-endian byte order,
-// and returns the buffer's contents as a byte slice.
-func (r *Record) toBytes() []byte {
-	// Create a new bytes.Buffer to store the serialized record fields.
-	buf := new(bytes.Buffer)
+// appendTo serializes the Record and appends it to dst, returning the extended
+// slice. Fields are written in little-endian order: Crc, Type, KeyLength,
+// ValueLength, Key, Value.
+func (r *Record) appendTo(dst []byte) []byte {
+	var hdr [headerSize]byte
+	binary.LittleEndian.PutUint32(hdr[0:4], r.Crc)
+	hdr[4] = byte(r.Type)
+	binary.LittleEndian.PutUint32(hdr[5:9], r.KeyLength)
+	binary.LittleEndian.PutUint32(hdr[9:13], r.ValueLength)
 
-	// Write the record fields to the buffer in little-endian byte order.
-	// The fields written are: Crc, Type, KeyLength, ValueLength, Key, and Value.
-	binary.Write(buf, binary.LittleEndian, r.Crc)
-	binary.Write(buf, binary.LittleEndian, r.Type)
-	binary.Write(buf, binary.LittleEndian, r.KeyLength)
-	binary.Write(buf, binary.LittleEndian, r.ValueLength)
-	buf.Write(r.Key)
-	buf.Write(r.Value)
-
-	// Return the buffer's contents as a byte slice.
-	return buf.Bytes()
+	dst = append(dst, hdr[:]...)
+	dst = append(dst, r.Key...)
+	dst = append(dst, r.Value...)
+	return dst
 }
 
-// fromBytes deserializes a byte slice into a Record instance.
-// It takes a bytes.Buffer containing the serialized record Data as an input,
-// reads the record fields in little-endian byte order, and stores them in the corresponding fields of the Record instance.
-func (r *Record) fromBytes(buf *bytes.Buffer) {
-	// Read the record fields from the buffer in little-endian byte order.
-	// The fields read are: Crc, Type, KeyLength, ValueLength.
-	binary.Read(buf, binary.LittleEndian, &r.Crc)
-	binary.Read(buf, binary.LittleEndian, &r.Type)
-	binary.Read(buf, binary.LittleEndian, &r.KeyLength)
-	binary.Read(buf, binary.LittleEndian, &r.ValueLength)
+// size returns the number of bytes the record occupies in the Data slice.
+func (r *Record) size() int64 {
+	return headerSize + int64(len(r.Key)) + int64(len(r.Value))
+}
 
-	// Allocate memory for the Key and Value fields based on their lengths,
-	// then read the Key and Value Data from the buffer into the allocated memory.
-	r.Key = make([]byte, r.KeyLength)
-	r.Value = make([]byte, r.ValueLength)
-	buf.Read(r.Key)
-	buf.Read(r.Value)
+// parseRecordAt decodes the record starting at pos in data and returns it along
+// with the offset of the following record. The declared key and value lengths
+// are checked against the bytes actually available, so damaged or attacker
+// supplied input yields an error instead of a panic or a multi-gigabyte
+// allocation. The returned Key and Value alias data and must be copied before
+// being handed to a caller or retained across a mutation of the store.
+func parseRecordAt(data []byte, pos int64) (Record, int64, error) {
+	if pos < 0 || pos > int64(len(data)) || int64(len(data))-pos < headerSize {
+		return Record{}, 0, &CorruptAtError{Offset: pos}
+	}
+
+	buf := data[pos:]
+
+	var r Record
+	r.Crc = binary.LittleEndian.Uint32(buf[0:4])
+	r.Type = RecordType(buf[4])
+	r.KeyLength = binary.LittleEndian.Uint32(buf[5:9])
+	r.ValueLength = binary.LittleEndian.Uint32(buf[9:13])
+
+	// Widening to uint64 keeps the sum from overflowing on 32-bit platforms.
+	end := uint64(headerSize) + uint64(r.KeyLength) + uint64(r.ValueLength)
+	if end > uint64(len(buf)) {
+		return Record{}, 0, &CorruptAtError{Offset: pos}
+	}
+
+	keyEnd := headerSize + uint64(r.KeyLength)
+	r.Key = buf[headerSize:keyEnd:keyEnd]
+	r.Value = buf[keyEnd:end:end]
+
+	return r, pos + int64(end), nil
+}
+
+// scan walks the records in the Data slice in order and calls fn for each one,
+// stopping early if fn returns false. It returns a *CorruptAtError as soon as a
+// record fails to decode. Callers must hold at least a read lock.
+func (kvs *KeyValueStore) scan(fn func(pos int64, r *Record) bool) error {
+	var pos int64
+	for pos < int64(len(kvs.Data)) {
+		record, next, err := parseRecordAt(kvs.Data, pos)
+		if err != nil {
+			return err
+		}
+		if !fn(pos, &record) {
+			return nil
+		}
+		pos = next
+	}
+	return nil
 }
 
 // SaveIndex serializes the KeyValueStore's Index (a map of keys to their position in the Data byte slice)
 // using the gob package, and returns the serialized Index as a byte slice.
 // This method can be used to persist the Index to disk or another storage medium, for later restoration.
 func (kvs *KeyValueStore) SaveIndex() ([]byte, error) {
-	kvs.Lock()
-	defer kvs.Unlock()
+	kvs.RLock()
+	defer kvs.RUnlock()
 
-	// Create a new bytes.Buffer to store the serialized Index.
 	var buf bytes.Buffer
-
-	// Create a new gob.Encoder that writes to the buffer.
-	encoder := gob.NewEncoder(&buf)
-
-	// Encode the KeyValueStore's Index using the gob.Encoder.
-	err := encoder.Encode(kvs.Index)
-	// If there's an error during encoding, return nil and the error.
-	if err != nil {
+	if err := gob.NewEncoder(&buf).Encode(kvs.Index); err != nil {
 		return nil, err
 	}
-
-	// Return the buffer's contents as a byte slice, and no error.
 	return buf.Bytes(), nil
 }
 
 // LoadIndex deserializes a byte slice containing a serialized Index (a map of keys to their position in the Data byte slice)
 // using the gob package, and restores the deserialized Index to the KeyValueStore.
 // This method can be used to load a previously saved Index from disk or another storage medium.
+//
+// The Index replaces the current one rather than being merged into it, and every
+// entry is checked against the Data slice before it is installed: an entry that
+// does not point at a record holding that exact key makes LoadIndex fail with
+// ErrorKeyMismatch or ErrorCorruptData and leaves the store untouched. Populate
+// Data before calling LoadIndex.
 func (kvs *KeyValueStore) LoadIndex(data []byte) error {
+	index := make(map[string]int64)
+	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&index); err != nil {
+		return err
+	}
+
 	kvs.Lock()
 	defer kvs.Unlock()
 
-	// Create a new bytes.Buffer initialized with the input Data.
-	buf := bytes.NewBuffer(data)
+	for key, pos := range index {
+		record, _, err := parseRecordAt(kvs.Data, pos)
+		if err != nil {
+			return fmt.Errorf("index entry %q at offset %d: %w", key, pos, err)
+		}
+		if string(record.Key) != key {
+			return fmt.Errorf("index entry %q points at record %q: %w", key, record.Key, ErrorKeyMismatch)
+		}
+	}
 
-	// Create a new gob.Decoder that reads from the buffer.
-	decoder := gob.NewDecoder(buf)
+	kvs.Index = index
+	return nil
+}
 
-	// Decode the serialized Index using the gob.Decoder into the KeyValueStore's Index.
-	err := decoder.Decode(&kvs.Index)
-	// If there's an error during decoding, return the error.
+// latestOffsets returns the offset of the newest live record for each key.
+// Records are appended, so a later record supersedes an earlier one with the
+// same key, and a tombstone removes the key until a later write re-adds it.
+// Callers must hold at least a read lock.
+func (kvs *KeyValueStore) latestOffsets() (map[string]int64, error) {
+	latest := make(map[string]int64)
+
+	err := kvs.scan(func(pos int64, r *Record) bool {
+		key := string(r.Key)
+		if r.Type == RecordTypeNormal {
+			latest[key] = pos
+		} else {
+			delete(latest, key)
+		}
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return latest, nil
+}
+
+// findLatestRecords returns the newest live record for each key in the store.
+// The Key and Value of each returned record alias the Data slice.
+// Callers must hold at least a read lock.
+func (kvs *KeyValueStore) findLatestRecords() (map[string]*Record, error) {
+	latest, err := kvs.latestOffsets()
+	if err != nil {
+		return nil, err
+	}
+
+	records := make(map[string]*Record, len(latest))
+	for key, pos := range latest {
+		record, _, err := parseRecordAt(kvs.Data, pos)
+		if err != nil {
+			return nil, err
+		}
+		records[key] = &record
+	}
+
+	return records, nil
+}
+
+// Compact iterates through the KeyValueStore's Data byte slice, identifies the latest record for each key,
+// and rebuilds the Data slice and Index, dropping superseded records and deleted keys.
+// This method is useful for reducing the storage size and improving the performance of the KeyValueStore.
+//
+// Surviving records keep their relative order, so compacting the same store
+// twice produces byte-identical Data. If the Data slice cannot be decoded,
+// Compact returns an error and leaves the store unchanged.
+func (kvs *KeyValueStore) Compact() error {
+	kvs.Lock()
+	defer kvs.Unlock()
+
+	latest, err := kvs.latestOffsets()
 	if err != nil {
 		return err
 	}
 
-	// Return no error, indicating that the Index was successfully loaded.
+	var total int64
+	for _, pos := range latest {
+		record, _, err := parseRecordAt(kvs.Data, pos)
+		if err != nil {
+			return err
+		}
+		total += record.size()
+	}
+
+	data := make([]byte, 0, total)
+	index := make(map[string]int64, len(latest))
+
+	// Walk the Data slice a second time instead of ranging over the map, so that
+	// the compacted layout does not depend on Go's map iteration order.
+	err = kvs.scan(func(pos int64, r *Record) bool {
+		if r.Type != RecordTypeNormal {
+			return true
+		}
+		if survivor, ok := latest[string(r.Key)]; !ok || survivor != pos {
+			return true
+		}
+		index[string(r.Key)] = int64(len(data))
+		data = r.appendTo(data)
+		return true
+	})
+	if err != nil {
+		return err
+	}
+
+	kvs.Data = data
+	kvs.Index = index
 	return nil
-}
-
-func (kvs *KeyValueStore) findLatestRecords() map[string]*Record {
-	// Initialize an empty map to store the latest records for each key.
-	latestRecords := make(map[string]*Record)
-
-	// Initialize a set to store deleted keys.
-	deletedKeys := make(map[string]struct{})
-
-	// Create a new bytes.Buffer initialized with the KeyValueStore's Data.
-	buf := bytes.NewBuffer(kvs.Data)
-
-	// Iterate through the Data byte slice as long as there are remaining bytes.
-	for buf.Len() > 0 {
-		// Create a new Record.
-		record := new(Record)
-
-		// Deserialize the record from the buffer.
-		record.fromBytes(buf)
-
-		// Convert the byte slice key to a string.
-		key := string(record.Key)
-
-		// Check if the current record is of type RecordTypeNormal.
-		if record.Type == RecordTypeNormal {
-			// Check if the key already exists in the latestRecords map and if it is not in the deletedKeys set.
-			_, exists := latestRecords[key]
-			_, isDeleted := deletedKeys[key]
-
-			if !exists && !isDeleted {
-				latestRecords[key] = record
-			}
-		} else if record.Type == RecordTypeDeleted {
-			// If the record is of type RecordTypeDeleted, add it to the deletedKeys set and remove it from the latestRecords map.
-			deletedKeys[key] = struct{}{}
-			delete(latestRecords, key)
-		}
-	}
-
-	// Return the map of latest records.
-	return latestRecords
-}
-
-// Compact iterates through the KeyValueStore's Data byte slice, identifies the latest records for each key,
-// and rebuilds the Data slice and Index, effectively removing any deleted or outdated records.
-// This method is useful for reducing the storage size and improving the performance of the KeyValueStore.
-func (kvs *KeyValueStore) Compact() {
-	// Acquire a lock on the KeyValueStore to ensure thread safety.
-	kvs.Lock()
-	defer kvs.Unlock()
-
-	// Find the latest records for each key using the findLatestRecords method.
-	latestRecords := kvs.findLatestRecords()
-
-	// Rebuild the Data slice and Index by initializing them as empty.
-	kvs.Data = make([]byte, 0)
-	kvs.Index = make(map[string]int64)
-
-	// Iterate through the latest records.
-	for key, record := range latestRecords {
-		// Check if the record is of type RecordTypeNormal.
-		if record.Type == RecordTypeNormal {
-			// Calculate the new position for the key in the Data slice.
-			pos := int64(len(kvs.Data))
-
-			// Update the Index with the new position.
-			kvs.Index[key] = pos
-
-			// Append the record's serialized form to the Data slice.
-			kvs.Data = append(kvs.Data, record.toBytes()...)
-		}
-	}
 }
 
 // RebuildIndex iterates through the KeyValueStore's Data byte slice, deserializes each record,
 // and rebuilds the Index by calculating the position of each key in the Data slice.
 // This method is useful when the Index has been lost or corrupted and needs to be reconstructed.
-func (kvs *KeyValueStore) RebuildIndex() {
-	// Acquire a lock on the KeyValueStore to ensure thread safety.
+//
+// If a record fails to decode, which is what a torn append at the tail of the
+// Data slice looks like, RebuildIndex still installs the Index built from the
+// records before it and returns a *CorruptAtError. Truncating Data to that
+// offset discards the damaged tail.
+func (kvs *KeyValueStore) RebuildIndex() error {
 	kvs.Lock()
 	defer kvs.Unlock()
 
-	// Create a new bytes.Buffer initialized with the KeyValueStore's Data.
-	buf := bytes.NewBuffer(kvs.Data)
+	index := make(map[string]int64)
+	err := kvs.scan(func(pos int64, r *Record) bool {
+		index[string(r.Key)] = pos
+		return true
+	})
 
-	// Initialize a new empty Index.
-	kvs.Index = make(map[string]int64)
+	kvs.Index = index
+	return err
+}
 
-	// Initialize a variable to track the position of the current record in the Data byte slice.
-	var pos int64
+// Verify walks every record in the Data slice and checks it against its stored
+// checksum. It returns ErrorChecksumMismatch for a damaged record and a
+// *CorruptAtError for one that cannot be decoded at all, both wrapped with the
+// offset at which the problem was found.
+func (kvs *KeyValueStore) Verify() error {
+	kvs.RLock()
+	defer kvs.RUnlock()
 
-	// Iterate through the Data byte slice as long as there are remaining bytes.
-	for buf.Len() > 0 {
-		// Create a new Record.
-		record := new(Record)
-
-		// Deserialize the record from the buffer.
-		record.fromBytes(buf)
-
-		// Convert the byte slice key to a string.
-		key := string(record.Key)
-
-		// Update the Index with the key's position in the Data byte slice.
-		kvs.Index[key] = pos
-
-		// Calculate the size of the current record (Crc, Type, KeyLength, ValueLength, Key, and Value fields).
-		recordSize := int64(4 + 1 + 4 + 4 + len(record.Key) + len(record.Value))
-
-		// Update the position for the next record.
-		pos += recordSize
+	var bad error
+	err := kvs.scan(func(pos int64, r *Record) bool {
+		if r.Crc != r.calculateChecksum() {
+			bad = fmt.Errorf("record at offset %d: %w", pos, ErrorChecksumMismatch)
+			return false
+		}
+		return true
+	})
+	if err != nil {
+		return err
 	}
+	return bad
+}
+
+// ForEach calls fn for every record in the Data slice, in the order the records
+// were written, stopping early if fn returns false. Superseded records and
+// tombstones are included; deleted reports whether a record is a tombstone. The
+// key and value passed to fn alias the Data slice and are only valid until fn
+// returns.
+func (kvs *KeyValueStore) ForEach(fn func(key, value []byte, deleted bool) bool) error {
+	kvs.RLock()
+	defer kvs.RUnlock()
+
+	return kvs.scan(func(_ int64, r *Record) bool {
+		return fn(r.Key, r.Value, r.Type == RecordTypeDeleted)
+	})
 }
 
 // PrintAllKeyValuePairs iterates through the KeyValueStore's Data byte slice, deserializes each record,
 // and prints the key, value, and record type for each record.
 // This method is useful for debugging and getting an overview of the KeyValueStore's contents.
-func (kvs *KeyValueStore) PrintAllKeyValuePairs() {
-	// Acquire a read lock on the KeyValueStore to ensure thread safety.
-	kvs.RLock()
-	defer kvs.RUnlock()
-
-	// Create a new bytes.Buffer initialized with the KeyValueStore's Data.
-	buf := bytes.NewBuffer(kvs.Data)
-
-	// Iterate through the Data byte slice as long as there are remaining bytes.
-	for buf.Len() > 0 {
-		// Create a new Record.
-		record := new(Record)
-
-		// Deserialize the record from the buffer.
-		record.fromBytes(buf)
-
-		// Print the key, value, and record type for the current record.
-		fmt.Printf("Key: %s, Value: %s, Type: %b\n", record.Key, record.Value, record.Type)
-	}
+func (kvs *KeyValueStore) PrintAllKeyValuePairs() error {
+	return kvs.ForEach(func(key, value []byte, deleted bool) bool {
+		fmt.Printf("Key: %s, Value: %s, Deleted: %t\n", key, value, deleted)
+		return true
+	})
 }
