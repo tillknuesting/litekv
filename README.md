@@ -46,41 +46,59 @@ panic or an outsized allocation.
 
 ### Index
 
-The index is a radix tree mapping each key to the offset of its newest record. It holds no key bytes of
-its own: every key is already in the data, so a node records where its slice of the key lives rather
-than copying it, which is why indexing a key allocates no key bytes and why the tree survives the
+The index is an adaptive radix tree mapping each key to the offset of its newest record. It holds no key
+bytes of its own: every key is already in the data, so a node records where its slice of the key lives
+rather than copying it, which is why indexing a key allocates no key bytes and why the tree survives the
 reallocation an append can cause. The consequence is that a tree only means anything alongside the exact
 data its offsets came from, so replacing `Data` means calling `RebuildIndex`.
 
-The tree is there for `PrefixScan`. It is not a faster hash table, and replacing the map with it cost
-speed on the operations a map is good at:
+Adaptive means each node holds its children in one of three shapes, sized to how many it has: up to 8
+labels live in the node itself, up to 48 in a 256-byte slot table, and beyond that the children are
+addressed by the label directly with no search at all. Uniform nodes are what make a plain radix tree
+slow — searching a sorted list of a hundred children means jumping around a kilobyte of memory, once per
+level, per lookup. Adapting the node shape was worth 2-4x on lookups, most of it on keys that branch
+widely. Unlike the published tree, whose node prefix is a fixed handful of bytes, this one is an offset
+into the data and has no length limit, because the keys are already there to point at.
 
-| operation                   | map      | radix tree | |
-| --------------------------- | -------- | ---------- | --- |
-| prefix query, 10 of 100k keys | 984 µs | 179 ns     | **5500x faster** |
-| index lookup, 100k keys     | 10.0 ns  | 48.6 ns    | 4.9x slower |
-| index lookup, random keys   | 10.2 ns  | 109.6 ns   | 10.7x slower |
-| `Read`, 16-byte value       | 37.4 ns  | 62.6 ns    | 1.7x slower |
-| `Write`, existing key       | 58.1 ns  | 50.8 ns    | 1.14x faster |
-| `Write`, new key            | 69.1 ns  | 86.3 ns    | 1.25x slower |
+The tree exists for `PrefixScan`. It is not a faster hash table:
 
-A hash table computes one hash and probes one bucket, whichever key it is given. A radix tree walks down
-one node per branching point in the key, and each step is a dependent load the processor cannot start
-until the previous one lands, so the cost is cache misses that no amount of tuning removes. That is the
-trade: point lookups get slower, and prefix queries stop costing a full scan of the store. Keys that
-diverge early, like random ones, make the tree deepest and the gap widest.
+| operation                       | Go map    | radix tree | |
+| ------------------------------- | --------- | ---------- | --- |
+| prefix query, 10 of 100k keys   | 1.01 ms   | 214 ns     | **4700x faster** |
+| index lookup, 100k keys         | 16.3 ns   | 73.1 ns    | 4.5x slower |
+| `Read`, 16-byte value           | 37.4 ns   | 45.2 ns    | 1.2x slower |
+| `Write`, existing key           | 58.1 ns   | 49.8 ns    | **1.17x faster** |
+| `Write`, new key                | 69.1 ns   | 62.3 ns    | **1.11x faster** |
+
+Writes come out ahead because re-indexing a key allocates nothing, where the map copied the key every
+time. Lookups do not, and no amount of tuning closes that: a hash table computes one hash and probes one
+bucket, whatever the key, while a tree walks one node per branching point and each step is a load that
+cannot start until the previous one lands.
+
+That gap widens with the key count, rather than closing, because the chain of dependent loads is what
+misses cache. Lookups of `user:%08d:profile` keys, probed in an order unrelated to insertion:
+
+| keys | Go map  | radix tree |
+| ---- | ------- | ---------- |
+| 10k  | 12.0 ns | 27.9 ns    |
+| 100k | 17.9 ns | 77.2 ns    |
+| 1M   | 103 ns  | 341 ns     |
+| 5M   | 114 ns  | 491 ns     |
+
+Note the access pattern: walking keys in the order they were inserted reads the same path repeatedly and
+reports two to four times better than this for both structures. These are the random-access numbers.
 
 Memory per key, 100k keys, counting the key copies a map has to make and the tree does not:
 
-| keys                             | map     | radix tree |
-| -------------------------------- | ------- | ---------- |
-| `user:00000001:profile` (21 B)   | 59 B    | 82 B       |
-| `/var/log/service-3/17.log` (24 B) | 67 B  | 93 B       |
-| 90-byte paths sharing 80 bytes   | 131 B   | 82 B       |
-| 20 random bytes                  | 59 B    | 89 B       |
+| keys                               | Go map  | radix tree |
+| ---------------------------------- | ------- | ---------- |
+| `user:00000001:profile` (21 B)     | 59 B    | 114 B      |
+| `/var/log/service-3/17.log` (24 B) | 67 B    | 120 B      |
+| 90-byte paths sharing 80 bytes     | 131 B   | 114 B      |
+| 20 random bytes                    | 59 B    | 96 B       |
 
-The tree only comes out ahead once keys are long enough that the prefixes it shares outweigh the 48 bytes
-a node costs. For short keys it is the larger of the two.
+The tree only comes out ahead once keys are long enough that the prefixes it shares outweigh the 64 bytes
+a node costs. For short keys it is roughly twice the map.
 
 LiteKV uses byte slices as the underlying data format for storing key-value pairs. Byte slices offer
 versatility and flexibility, making it easier to perform various operations such as saving data to disk or using POSIX shared memory.

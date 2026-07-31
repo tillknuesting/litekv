@@ -300,6 +300,9 @@ func shapeKeys(key func(int) string, n int) []string {
 	return keys
 }
 
+// BenchmarkIndexLookup probes in an order unrelated to insertion. Walking the
+// keys in the order they went in reads the same path over and over and reports
+// numbers two to four times better than random access does.
 func BenchmarkIndexLookup(b *testing.B) {
 	for _, shape := range keyShapes {
 		keys := shapeKeys(shape.key, indexBenchKeys)
@@ -307,13 +310,14 @@ func BenchmarkIndexLookup(b *testing.B) {
 		for i, key := range keys {
 			byteKeys[i] = []byte(key)
 		}
+		probe := rand.New(rand.NewSource(7)).Perm(len(keys))
 
 		b.Run(shape.name+"/tree", func(b *testing.B) {
 			tree, data := indexKeys(keys)
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if _, ok := tree.Lookup(data, byteKeys[i%len(byteKeys)]); !ok {
+				if _, ok := tree.Lookup(data, byteKeys[probe[i%len(probe)]]); !ok {
 					b.Fatal("missing key")
 				}
 			}
@@ -327,11 +331,52 @@ func BenchmarkIndexLookup(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if _, ok := index[string(byteKeys[i%len(byteKeys)])]; !ok {
+				if _, ok := index[string(byteKeys[probe[i%len(probe)]])]; !ok {
 					b.Fatal("missing key")
 				}
 			}
 		})
+	}
+}
+
+// BenchmarkIndexScale is the same comparison as the key count grows, which is
+// where a hash table and a tree diverge: one probe stays one probe, while a
+// walk down a tree turns into a chain of loads that miss cache.
+func BenchmarkIndexScale(b *testing.B) {
+	for _, shape := range keyShapes[:1] {
+		for _, n := range []int{10_000, 100_000, 1_000_000} {
+			keys := shapeKeys(shape.key, n)
+			byteKeys := make([][]byte, len(keys))
+			for i, key := range keys {
+				byteKeys[i] = []byte(key)
+			}
+			probe := rand.New(rand.NewSource(7)).Perm(n)
+
+			b.Run(fmt.Sprintf("%d/tree", n), func(b *testing.B) {
+				tree, data := indexKeys(keys)
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if _, ok := tree.Lookup(data, byteKeys[probe[i%len(probe)]]); !ok {
+						b.Fatal("missing key")
+					}
+				}
+			})
+
+			b.Run(fmt.Sprintf("%d/map", n), func(b *testing.B) {
+				index := make(map[string]int64, n)
+				for i, key := range keys {
+					index[key] = int64(i)
+				}
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if _, ok := index[string(byteKeys[probe[i%len(probe)]])]; !ok {
+						b.Fatal("missing key")
+					}
+				}
+			})
+
+			runtime.GC()
+		}
 	}
 }
 
@@ -379,9 +424,14 @@ func treeBytes(tree *Tree) uintptr {
 
 	var visit func(n *node)
 	visit = func(n *node) {
-		total += unsafe.Sizeof(node{}) + uintptr(cap(n.edges))*unsafe.Sizeof(edge{})
-		for i := range n.edges {
-			visit(n.edges[i].node)
+		total += unsafe.Sizeof(node{}) + uintptr(cap(n.children))*unsafe.Sizeof((*node)(nil))
+		if n.index != nil {
+			total += unsafe.Sizeof(*n.index)
+		}
+		for _, child := range n.children {
+			if child != nil {
+				visit(child)
+			}
 		}
 	}
 

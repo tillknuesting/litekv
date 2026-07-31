@@ -2,10 +2,10 @@ package litekv
 
 import "bytes"
 
-// Tree is a radix tree that maps keys to the offset of the record holding them.
-// It replaces the map that used to index the store, and buys the store ordered
-// traversal: the keys under a prefix can be found without looking at every key,
-// which a map cannot do.
+// Tree is an adaptive radix tree that maps keys to the offset of the record
+// holding them. It replaces the map that used to index the store, and buys the
+// store ordered traversal: the keys under a prefix can be found without looking
+// at every key, which a map cannot do.
 //
 // The tree holds no key bytes of its own. Every key it indexes is already
 // stored in the Data slice of the store, so a node records where its slice of
@@ -23,27 +23,49 @@ type Tree struct {
 	count int
 }
 
+// A node holds its children in one of three shapes, sized to how many it has.
+// This is what "adaptive" means: a node that branches two ways should not pay
+// what a node that branches two hundred ways needs, and a node that branches
+// two hundred ways should not be searched.
+//
+// Uniform nodes are what make a plain radix tree slow. Searching a sorted list
+// of a hundred children means jumping around a kilobyte of memory, and each
+// jump is a cache miss, on every level of every lookup.
+const (
+	// kindInline keeps the labels in the node itself, so finding a child reads
+	// no memory beyond the node already loaded.
+	kindInline = iota
+
+	// kindIndexed keeps a 256 byte table of slots, one per possible label. One
+	// load finds the slot, a second the child.
+	kindIndexed
+
+	// kindDirect indexes the children by the label itself. No search at all.
+	kindDirect
+)
+
+const (
+	inlineMax  = 8  // labels that fit in the node
+	indexedMax = 48 // children worth indexing rather than addressing directly
+)
+
 // node is one point in the tree. Its prefix is the run of key bytes shared by
 // everything beneath it, which is what keeps the tree shallow: a key of n bytes
 // costs one node per branching point rather than one node per byte.
 //
-// Whether a node carries a value is a flag rather than a reserved offset, so
-// that every int64 stays a usable value. It costs nothing: the field sits in
-// padding the struct had anyway.
+// Unlike the fixed prefix of the published Adaptive Radix Tree, which stores a
+// handful of bytes and re-checks the rest at the leaf, this prefix is an offset
+// into Data and so has no length limit. The keys are already there to point at.
 type node struct {
-	prefixOff int64 // where this node's slice of the key starts in Data
-	value     int64 // record offset for the key ending here, if hasValue
-	edges     []edge
+	prefixOff int64       // where this node's slice of the key starts in Data
+	value     int64       // record offset for the key ending here, if hasValue
+	children  []*node     // kindDirect indexes this by label; otherwise packed
+	index     *[256]uint8 // kindIndexed: label to slot, biased by one
 	prefixLen int32
+	nchild    uint16 // a direct node can hold 256 children, which a uint8 cannot count
+	kind      uint8
 	hasValue  bool
-}
-
-// edge links a node to a child. The label repeats the first byte of the child's
-// prefix so that a lookup can choose a branch without touching the child, and
-// edges are kept sorted by it so that a walk comes out in byte order.
-type edge struct {
-	label byte
-	node  *node
+	labels    [inlineMax]byte // kindInline: the labels, sorted
 }
 
 // Len returns the number of keys in the tree.
@@ -54,46 +76,98 @@ func (n *node) prefix(data []byte) []byte {
 	return data[n.prefixOff : n.prefixOff+int64(n.prefixLen)]
 }
 
-// edge finds the child to follow for label.
-func (n *node) edge(label byte) *node {
-	// Most nodes branch a handful of ways, where a scan beats a search; the
-	// wide ones, near the root of a set of keys that vary early, do not.
-	if len(n.edges) <= 8 {
-		for i := range n.edges {
-			if n.edges[i].label == label {
-				return n.edges[i].node
+// child returns the child to follow for label, or nil.
+func (n *node) child(label byte) *node {
+	switch n.kind {
+	case kindInline:
+		// The labels sit in the node, which the caller has already loaded, so
+		// this walks bytes that are certain to be in cache.
+		for i := 0; i < int(n.nchild); i++ {
+			if n.labels[i] == label {
+				return n.children[i]
 			}
 		}
 		return nil
-	}
 
-	i := n.searchEdges(label)
-	if i < len(n.edges) && n.edges[i].label == label {
-		return n.edges[i].node
+	case kindIndexed:
+		if slot := n.index[label]; slot != 0 {
+			return n.children[slot-1]
+		}
+		return nil
+
+	default:
+		return n.children[label]
 	}
-	return nil
 }
 
-// searchEdges returns the position where label is or would be inserted.
-func (n *node) searchEdges(label byte) int {
-	lo, hi := 0, len(n.edges)
-	for lo < hi {
-		mid := int(uint(lo+hi) >> 1)
-		if n.edges[mid].label < label {
-			lo = mid + 1
-		} else {
-			hi = mid
+// addChild links child under label, growing the node to a wider shape when the
+// current one is full.
+func (n *node) addChild(label byte, child *node) {
+	switch n.kind {
+	case kindInline:
+		if int(n.nchild) == inlineMax {
+			n.growToIndexed()
+			n.addChild(label, child)
+			return
+		}
+
+		// Kept sorted, so that an inline node walks in byte order for free.
+		at := 0
+		for at < int(n.nchild) && n.labels[at] < label {
+			at++
+		}
+		copy(n.labels[at+1:], n.labels[at:n.nchild])
+		n.labels[at] = label
+		n.children = append(n.children, nil)
+		copy(n.children[at+1:], n.children[at:])
+		n.children[at] = child
+
+	case kindIndexed:
+		if int(n.nchild) == indexedMax {
+			n.growToDirect()
+			n.addChild(label, child)
+			return
+		}
+		n.children = append(n.children, child)
+		n.index[label] = uint8(len(n.children)) // biased by one: 0 means empty
+
+	default:
+		n.children[label] = child
+	}
+
+	n.nchild++
+}
+
+// growToIndexed moves an inline node to a 256 slot index.
+func (n *node) growToIndexed() {
+	n.index = new([256]uint8)
+	for i := 0; i < int(n.nchild); i++ {
+		n.index[n.labels[i]] = uint8(i + 1)
+	}
+	n.kind = kindIndexed
+}
+
+// growToDirect moves an indexed node to one addressed by the label itself.
+func (n *node) growToDirect() {
+	children := make([]*node, 256)
+	for label := 0; label < 256; label++ {
+		if slot := n.index[label]; slot != 0 {
+			children[label] = n.children[slot-1]
 		}
 	}
-	return lo
+	n.children = children
+	n.index = nil
+	n.kind = kindDirect
 }
 
-// addEdge inserts a child, keeping the edges sorted by label.
-func (n *node) addEdge(label byte, child *node) {
-	i := n.searchEdges(label)
-	n.edges = append(n.edges, edge{})
-	copy(n.edges[i+1:], n.edges[i:])
-	n.edges[i] = edge{label: label, node: child}
+// takeChildrenOf moves the whole child structure of src onto n, leaving src
+// with none. It is how a split hands the old node's children to its tail.
+func (n *node) takeChildrenOf(src *node) {
+	n.children, src.children = src.children, nil
+	n.index, src.index = src.index, nil
+	n.labels, src.labels = src.labels, [inlineMax]byte{}
+	n.nchild, src.nchild = src.nchild, 0
+	n.kind, src.kind = src.kind, kindInline
 }
 
 // Insert indexes the key held at data[keyOff:keyOff+keyLen], recording value as
@@ -123,13 +197,13 @@ func (t *Tree) Insert(data []byte, keyOff int64, keyLen int, value int64) {
 				prefixLen: n.prefixLen - int32(shared),
 				value:     n.value,
 				hasValue:  n.hasValue,
-				edges:     n.edges,
 			}
+			tail.takeChildrenOf(n)
+
 			n.prefixLen = int32(shared)
 			n.value = 0
 			n.hasValue = false
-			n.edges = nil
-			n.addEdge(prefix[shared], tail)
+			n.addChild(prefix[shared], tail)
 		}
 
 		rest = rest[shared:]
@@ -144,13 +218,13 @@ func (t *Tree) Insert(data []byte, keyOff int64, keyLen int, value int64) {
 			return
 		}
 
-		if child := n.edge(rest[0]); child != nil {
+		if child := n.child(rest[0]); child != nil {
 			n = child
 			continue
 		}
 
 		// Nothing shares the rest of the key: hang it off this node whole.
-		n.addEdge(rest[0], &node{
+		n.addChild(rest[0], &node{
 			prefixOff: keyOff + int64(keyLen-len(rest)),
 			prefixLen: int32(len(rest)),
 			value:     value,
@@ -180,7 +254,7 @@ func (t *Tree) Lookup(data, key []byte) (int64, bool) {
 			return n.value, true
 		}
 
-		n = n.edge(rest[0])
+		n = n.child(rest[0])
 	}
 
 	return 0, false
@@ -218,7 +292,7 @@ func (t *Tree) WalkPrefix(data, prefix []byte, fn func(value int64) bool) bool {
 			return n.walk(fn)
 		}
 
-		n = n.edge(rest[0])
+		n = n.child(rest[0])
 	}
 
 	return true
@@ -231,9 +305,37 @@ func (n *node) walk(fn func(value int64) bool) bool {
 		return false
 	}
 
-	for i := range n.edges {
-		if !n.edges[i].node.walk(fn) {
-			return false
+	// Inline nodes hold their children sorted; the wider shapes are ordered by
+	// label, so walking the labels in order puts the children in order too.
+	switch n.kind {
+	case kindInline:
+		for i := 0; i < int(n.nchild); i++ {
+			if !n.children[i].walk(fn) {
+				return false
+			}
+		}
+
+	case kindIndexed:
+		// Both wide shapes are scanned by label, to come out in order, and both
+		// stop as soon as every child has been seen: a node with ten children
+		// should not cost a walk of all two hundred and fifty six slots.
+		for label, seen := 0, uint16(0); label < 256 && seen < n.nchild; label++ {
+			if slot := n.index[label]; slot != 0 {
+				seen++
+				if !n.children[slot-1].walk(fn) {
+					return false
+				}
+			}
+		}
+
+	default:
+		for label, seen := 0, uint16(0); label < 256 && seen < n.nchild; label++ {
+			if child := n.children[label]; child != nil {
+				seen++
+				if !child.walk(fn) {
+					return false
+				}
+			}
 		}
 	}
 
