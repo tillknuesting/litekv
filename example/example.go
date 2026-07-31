@@ -25,6 +25,7 @@ func main() {
 		{"in memory", inMemory},
 		{"backed by a file", backedByFile},
 		{"mirrored to your own log", ownLog},
+		{"split across segments", segments},
 	} {
 		fmt.Printf("\n== %s ==\n", section.name)
 		if err := section.run(); err != nil {
@@ -279,4 +280,68 @@ func ownLog() error {
 	fmt.Println("the log's own copy says written =", string(value))
 
 	return nil
+}
+
+// segments shows the store split across several logs, merged in the background
+// instead of compacted all at once.
+func segments() error {
+	dir, err := os.MkdirTemp("", "litekv-db")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+
+	// Tiny segments, so that a handful of records is enough to see rotation and
+	// merging. A real one would be megabytes.
+	db, err := litekv.OpenDB(dir, litekv.DBOptions{
+		Sync:         litekv.SyncNever,
+		SegmentSize:  256,
+		MergeTrigger: 1 << 30, // merge only when asked, so the example can show it
+	})
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	// The same few keys, written over and over: most of these records are dead
+	// the moment the next one lands.
+	for round := 0; round < 20; round++ {
+		for _, key := range []string{"alpha", "beta", "gamma"} {
+			if err := db.Write([]byte(key), []byte(fmt.Sprintf("%s-%02d", key, round))); err != nil {
+				return err
+			}
+		}
+	}
+	if err := db.Delete([]byte("gamma")); err != nil {
+		return err
+	}
+
+	fmt.Printf("%d records over %d segments\n", db.Len(), db.Segments())
+
+	// Merging keeps the newest record for each live key and drops the rest.
+	// Reads and writes carry on while it runs; here it is called directly so
+	// that the effect is visible.
+	if err := db.Merge(); err != nil {
+		return err
+	}
+	fmt.Printf("after merging: %d segments\n", db.Segments())
+
+	value, err := db.Read([]byte("alpha"))
+	if err != nil {
+		return err
+	}
+	fmt.Println("alpha =", string(value))
+
+	// A deleted key reads as deleted until a merge drops the tombstone, and as
+	// missing afterwards. Both mean there is no value.
+	if _, err := db.Read([]byte("gamma")); errors.Is(err, litekv.ErrorKeyNotFound) || errors.Is(err, litekv.ErrorKeyDeleted) {
+		fmt.Println("gamma is gone")
+	} else if err != nil {
+		return err
+	}
+
+	return db.ForEach(func(key, value []byte) bool {
+		fmt.Printf("  %s = %s\n", key, value)
+		return true
+	})
 }

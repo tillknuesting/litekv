@@ -2,7 +2,8 @@
 
 LiteKV is a small key-value store written in Go. Records are appended to a log, an index maps each key
 to its newest record, and the whole store is one byte slice you can hold in memory, save yourself, or
-have written to disk as it changes.
+have written to disk as it changes. For a store too big to compact in one go, `DB` splits it across
+several logs and merges them in the background.
 
 The design is Bitcask, described by Justin Sheehy and David Smith at Basho Technologies in their 2010
 paper *Bitcask: A Log-Structured Hash Table for Fast Key/Value Data*, which credits Eric Brewer for the
@@ -173,6 +174,63 @@ so an interrupted compaction leaves either the whole old log or the whole new on
 It is stop-the-world: the store is locked for the duration, and peak memory is two copies of the live
 records.
 
+## Segments
+
+`Compact` on a single log stops the world: it takes the write lock, copies every live record, and while
+it runs there are two copies of the data. The wait grows with the store, and it lands on whichever write
+happens to arrive during it.
+
+`DB` splits the store across several logs instead. One is active and takes the writes; when it reaches
+`SegmentSize` it is frozen and a new one started, and a frozen log is never written again. The frozen
+ones are merged in the background, and because the merge builds a new file rather than editing the old
+ones, reads and writes carry on against the old ones the whole time — only the swap at the end needs the
+store to itself, and that is a slice being rebuilt.
+
+```go
+db, err := litekv.OpenDB("data", litekv.DBOptions{
+    Sync:         litekv.SyncEvery,
+    Interval:     time.Second,
+    SegmentSize:  4 << 20, // freeze a log at 4 MiB
+    MergeTrigger: 4,       // merge once four have piled up
+})
+defer db.Close()
+
+err = db.Write([]byte("foo"), []byte("bar"))
+value, err := db.Read([]byte("foo"))
+err = db.Merge()  // or merge now, rather than waiting
+```
+
+Each log keeps its own index, so a lookup asks the active one first and then the frozen ones from newest
+to oldest, stopping at the first answer. That is what makes a record in a newer log shadow an older one,
+and a tombstone in a newer log shadow a value in an older one. Merging keeps the number of logs small, so
+a lookup does not have many to ask.
+
+The worst wait a single write suffers, writing 128-byte values with half the writes landing on keys
+already stored:
+
+| records written | one log, compacted | segments, merged in the background |
+| --------------- | ------------------ | ---------------------------------- |
+| 10,000          | 21.2 ms            | 4.2 ms                             |
+| 40,000          | 18.6 ms            | 4.3 ms                             |
+
+The single log's wait is the compaction itself and grows with what is stored. The segmented one does not
+grow, and what is left is not lock contention at all: it is the one sync that makes the merge crash safe,
+which on macOS is a full device barrier and stalls other writes at the operating system. That is one
+barrier per merge, whatever the store holds.
+
+### What a crash leaves behind
+
+The merged log is written beside the others, renamed over the *oldest* of them, and only then are the
+rest removed, oldest first. That order is what makes an interrupted merge harmless. At every point the
+logs still on disk are the merged one plus the newest few of the ones it replaced, and since those are
+newer they are asked first: a key they hold answers from them, and a key they do not falls through to the
+merged log, which holds the newest version of everything older. A tombstone is only dropped once every
+log that could still hold the value it hides has gone. There is a test that stops the removals at every
+point and checks each state reads the same as the finished merge.
+
+A half-built merge left behind by a crash is discarded on the next open, since every log it was merging
+is still there.
+
 ## Recovering a damaged store
 
 Three methods, in order of how much they do:
@@ -272,10 +330,14 @@ which version wrote it.
 - **No range or prefix queries.** The index is a hash map, so keys have no order. A radix tree that gave
   ordered traversal was measured and reverted: prefix queries went from a full scan to 214 ns, but point
   lookups cost 3 to 4.5x more, which was the wrong trade here. It is in the history at `9e3cf2c`.
-- **One log, compacted whole.** There are no segments, so compaction stops the world and cannot run in
-  the background.
-- **One writer at a time.** Writes take every shard of the lock, so they serialize with each other and
-  with compaction.
+- **One writer at a time.** Writes take every shard of the lock, so they serialize with each other, and
+  for a single `KeyValueStore` with compaction as well.
+- **Merging rewrites everything frozen.** A `DB` merges all its frozen logs into one rather than merging
+  them in tiers, so each merge costs what the store holds. It runs in the background, but on a large
+  store it is a lot of background.
+- **Segments do not save memory.** Every log is held in memory as well as on disk. Keeping only the keys
+  in memory and reading values from disk, as Bitcask does, would fix the two entries above this one, and
+  is the obvious next step.
 
 ## Running Tests
 

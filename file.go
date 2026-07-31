@@ -395,6 +395,30 @@ func (kvs *KeyValueStore) Close() error {
 	return err
 }
 
+// closeNoSync closes the log without syncing it, for a log whose contents are
+// about to be thrown away. Syncing one of those only costs a barrier the disk
+// then has nothing to do with.
+func (kvs *KeyValueStore) closeNoSync() error {
+	kvs.Lock()
+	state := kvs.state
+	if state == nil || state.closed {
+		kvs.Unlock()
+		return nil
+	}
+	state.closed = true
+	kvs.Unlock()
+
+	close(state.stop)
+	state.done.Wait()
+
+	if state.owned {
+		if closer, ok := state.log.(io.Closer); ok {
+			return closer.Close()
+		}
+	}
+	return nil
+}
+
 // syncEvery syncs on a timer for SyncEvery.
 func (kvs *KeyValueStore) syncEvery(state *logState) {
 	defer state.done.Done()

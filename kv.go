@@ -235,6 +235,15 @@ func (kvs *KeyValueStore) Write(key, value []byte) error {
 	return kvs.appendRecord(record, key)
 }
 
+// Size returns the number of bytes the store's records occupy, superseded
+// records and tombstones included.
+func (kvs *KeyValueStore) Size() int64 {
+	kvs.RLock()
+	defer kvs.RUnlock()
+
+	return int64(len(kvs.Data))
+}
+
 // Read takes a key in the form of a byte slice and retrieves the associated value from the KeyValueStore instance.
 // It returns a copy of the value, or an error if the key is not found, is deleted, or the record cannot be
 // verified: ErrorChecksumMismatch for a damaged record, ErrorKeyMismatch or ErrorCorruptData for an Index
