@@ -4,9 +4,11 @@ LiteKV is a small key-value store written in Go. Records are appended to a log, 
 to its newest record, and the whole store is one byte slice you can hold in memory, save yourself, or
 have written to disk as it changes.
 
-It is the design Designing Data-Intensive Applications calls Bitcask: an append-only log with an
-in-memory index. Writes never seek, a crash costs at most the record being written, and the price is
-that every key has to fit in memory.
+The design is Bitcask, described by Justin Sheehy and David Smith at Basho Technologies in their 2010
+paper *Bitcask: A Log-Structured Hash Table for Fast Key/Value Data*, which credits Eric Brewer for the
+idea, and shipped as the storage engine behind Riak. An append-only log holds the records and an
+in-memory index holds an offset per key, so a write never seeks, a read is one lookup and one read, a
+crash costs at most the record being written, and every key has to fit in memory.
 
 ## Getting Started
 
