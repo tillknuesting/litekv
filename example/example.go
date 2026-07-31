@@ -1,107 +1,282 @@
+// Command example walks through what litekv does: the store on its own, the
+// same store keeping a file, and the same store mirroring its writes to a log
+// of your own.
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
 
 	"github.com/tillknuesting/litekv"
 )
 
 func main() {
+	// log.Fatalln calls os.Exit, which skips deferred calls, so each section
+	// returns its error rather than exiting from under its own defer.
+	for _, section := range []struct {
+		name string
+		run  func() error
+	}{
+		{"in memory", inMemory},
+		{"backed by a file", backedByFile},
+		{"mirrored to your own log", ownLog},
+	} {
+		fmt.Printf("\n== %s ==\n", section.name)
+		if err := section.run(); err != nil {
+			log.Fatalln(err)
+		}
+	}
+}
+
+// inMemory is the store on its own: no files, no options, nothing to close.
+func inMemory() error {
 	kvs := &litekv.KeyValueStore{}
 
-	// Write a key-value pair to the store
 	if err := kvs.Write([]byte("foo"), []byte("bar")); err != nil {
-		log.Fatalln(err)
+		return err
 	}
 
-	// Export the index, which can be saved to disk for persistence
-	// The index maps keys to their positions within the store
-	indexExported, err := kvs.SaveIndex()
+	// Read hands back a copy, so it is yours to keep or modify.
+	value, err := kvs.Read([]byte("foo"))
 	if err != nil {
-		log.Fatalln(err)
+		return err
 	}
-	// Import the index back into the store, allowing for efficient lookups.
-	// LoadIndex validates every entry against the data, so restore the data first.
-	if err := kvs.LoadIndex(indexExported); err != nil {
-		log.Fatalln(err)
+	fmt.Println("foo =", string(value))
+
+	// View hands back the stored bytes instead, which saves the copy. They are
+	// only valid until the callback returns, and the store is locked for
+	// reading while it runs, so do not hold on to them or call back into it.
+	if err := kvs.View([]byte("foo"), func(value []byte) error {
+		fmt.Println("foo, without copying =", string(value))
+		return nil
+	}); err != nil {
+		return err
 	}
 
-	// Read the value associated with the key "foo"
-	v, err := kvs.Read([]byte("foo"))
-	if err != nil {
-		fmt.Println(err)
-	} else {
-		fmt.Println("foo =", string(v))
-	}
-
-	// Rebuild the index from the current data, in case the index is lost or corrupted.
-	// A *litekv.CorruptAtError here means the data has a damaged tail, for example
-	// from an append cut short by a crash; the index still covers everything
-	// before that offset.
-	if err := kvs.RebuildIndex(); err != nil {
-		log.Fatalln(err)
-	}
-
-	// Check every stored record against its checksum
-	if err := kvs.Verify(); err != nil {
-		log.Fatalln(err)
-	}
-
-	// Update the value associated with the key "foo"
+	// An update appends a new record and repoints the index at it.
 	if err := kvs.Write([]byte("foo"), []byte("newValue")); err != nil {
-		log.Fatalln(err)
+		return err
 	}
 
-	// Read the updated value associated with the key "foo"
-	v, err = kvs.Read([]byte("foo"))
-	if err != nil {
-		fmt.Println(err)
-	} else {
-		fmt.Println("foo =", string(v))
-	}
-
-	// Delete the key-value pair with the key "foo"
+	// A delete appends a tombstone, which reads as a deleted key rather than a
+	// missing one. The two are worth telling apart.
 	if err := kvs.Delete([]byte("foo")); err != nil {
-		log.Fatalln(err)
+		return err
 	}
-
-	// Attempt to read the deleted key-value pair
-	v, err = kvs.Read([]byte("foo"))
-	if err != nil {
-		fmt.Println(err)
-	} else {
-		fmt.Println("foo =", string(v))
+	if _, err := kvs.Read([]byte("foo")); errors.Is(err, litekv.ErrorKeyDeleted) {
+		fmt.Println("foo was deleted")
+	} else if errors.Is(err, litekv.ErrorKeyNotFound) {
+		fmt.Println("foo was never written")
+	} else if err != nil {
+		return err
 	}
 
 	if err := kvs.Write([]byte("foo2"), []byte("bar2")); err != nil {
-		log.Fatalln(err)
+		return err
 	}
 
-	// Print all key-value pairs before compaction
-	// Compaction removes superseded records and deleted key-value pairs
-	fmt.Println("All key = Val before compaction:")
+	// The index can be saved and loaded, which is cheaper than rebuilding it
+	// from the records. Put the data in place before loading an index for it.
+	saved, err := kvs.SaveIndex()
+	if err != nil {
+		return err
+	}
+	if err := kvs.LoadIndex(saved); err != nil {
+		return err
+	}
+
+	// Or rebuild it from the records themselves, if it was lost. A
+	// *litekv.CorruptAtError here means the data has a damaged tail; the index
+	// still covers everything before that offset.
+	if err := kvs.RebuildIndex(); err != nil {
+		return err
+	}
+
+	// Verify checks every record against its checksum.
+	if err := kvs.Verify(); err != nil {
+		return err
+	}
+
+	// Every version of every key is still there until compaction.
+	fmt.Println("all records before compaction:")
 	if err := kvs.PrintAllKeyValuePairs(); err != nil {
-		log.Fatalln(err)
+		return err
 	}
 
-	// Perform compaction on the KeyValueStore
 	if err := kvs.Compact(); err != nil {
-		log.Fatalln(err)
+		return err
 	}
 
-	// Print all key-value pairs after compaction
-	fmt.Println("All key = Val after compaction:")
-	if err := kvs.PrintAllKeyValuePairs(); err != nil {
-		log.Fatalln(err)
-	}
-
-	// Walk the store without printing it
-	err = kvs.ForEach(func(key, value []byte, deleted bool) bool {
-		fmt.Printf("%s = %s (deleted: %t)\n", key, value, deleted)
+	fmt.Println("all records after compaction:")
+	return kvs.ForEach(func(key, value []byte, deleted bool) bool {
+		fmt.Printf("  %s = %s (deleted: %t)\n", key, value, deleted)
 		return true
 	})
+}
+
+// backedByFile keeps the same store in a file, so it outlives the process.
+func backedByFile() error {
+	dir, err := os.MkdirTemp("", "litekv")
 	if err != nil {
-		log.Fatalln(err)
+		return err
 	}
+	defer os.RemoveAll(dir)
+
+	path := filepath.Join(dir, "store.kv")
+
+	// SyncEvery trades a bounded window of writes for not waiting on the disk
+	// every time. The default, SyncAlways, waits; SyncNever never does.
+	kvs, err := litekv.Open(path, litekv.Options{Sync: litekv.SyncEvery, Interval: time.Second})
+	if err != nil {
+		return err
+	}
+	// Close syncs whatever the timer has not, and runs even if what follows
+	// panics. It does not run if the process is killed, which costs nothing:
+	// every record is with the operating system by the time Write returns, so
+	// only losing power can take one back.
+	defer kvs.Close()
+
+	if err := kvs.Write([]byte("persisted"), []byte("across restarts")); err != nil {
+		return err
+	}
+
+	// Sync forces the flush the timer would have done, whatever the policy.
+	if err := kvs.Sync(); err != nil {
+		return err
+	}
+	if err := kvs.Close(); err != nil {
+		return err
+	}
+
+	reopened, err := litekv.Open(path, litekv.Options{})
+	if err != nil {
+		return err
+	}
+	defer reopened.Close()
+
+	value, err := reopened.Read([]byte("persisted"))
+	if err != nil {
+		return err
+	}
+	fmt.Println("after reopening, persisted =", string(value))
+
+	// The file holds exactly the Data slice, so it can be loaded by hand
+	// instead. Recover rebuilds the index and drops a damaged tail, reporting
+	// how many bytes it dropped.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	byHand := &litekv.KeyValueStore{Data: raw}
+	discarded, err := byHand.Recover()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("loaded %d bytes by hand, discarded %d\n", len(raw), discarded)
+
+	value, err = byHand.Read([]byte("persisted"))
+	if err != nil {
+		return err
+	}
+	fmt.Println("read from the loaded slice:", string(value))
+
+	return nil
+}
+
+// countingLog is a Log of one's own: three methods, and the store will mirror
+// every record to it. A real one might encrypt, or send the records somewhere.
+type countingLog struct {
+	mu      sync.Mutex
+	data    []byte
+	records int
+	syncs   int
+}
+
+func (c *countingLog) WriteAt(p []byte, off int64) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.data = append(c.data[:off], p...)
+	c.records++
+	return len(p), nil
+}
+
+func (c *countingLog) Truncate(size int64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if int64(len(c.data)) > size {
+		c.data = c.data[:size]
+	}
+	return nil
+}
+
+func (c *countingLog) Sync() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.syncs++
+	return nil
+}
+
+// ownLog mirrors a store to something this package knows nothing about.
+func ownLog() error {
+	// A store that already holds something, to show the log being seeded.
+	kvs := &litekv.KeyValueStore{}
+	if err := kvs.Write([]byte("written"), []byte("before attaching")); err != nil {
+		return err
+	}
+
+	sink := &countingLog{}
+	if err := kvs.Attach(sink, litekv.Options{Sync: litekv.SyncNever}); err != nil {
+		return err
+	}
+
+	// Attach assumes the log already holds what the store does, which it does
+	// not here, so put the store's records into it.
+	if err := kvs.Rewrite(); err != nil {
+		return err
+	}
+
+	if err := kvs.Write([]byte("written"), []byte("after attaching")); err != nil {
+		return err
+	}
+	if err := kvs.Sync(); err != nil {
+		return err
+	}
+
+	fmt.Printf("the log took %d writes and %d syncs, and holds %d bytes\n",
+		sink.records, sink.syncs, len(sink.data))
+
+	// Detach syncs once more and leaves an ordinary in-memory store behind.
+	if err := kvs.Detach(); err != nil {
+		return err
+	}
+
+	if err := kvs.Write([]byte("written"), []byte("after detaching")); err != nil {
+		return err
+	}
+
+	// The log stopped where it was left, while the store carried on.
+	fmt.Printf("after detaching: the log holds %d bytes, the store %d\n", len(sink.data), len(kvs.Data))
+
+	// What the log holds is a store in its own right.
+	fromLog := &litekv.KeyValueStore{Data: sink.data}
+	if _, err := fromLog.Recover(); err != nil {
+		return err
+	}
+
+	value, err := fromLog.Read([]byte("written"))
+	if err != nil {
+		return err
+	}
+	fmt.Println("the log's own copy says written =", string(value))
+
+	return nil
 }

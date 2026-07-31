@@ -97,13 +97,21 @@ func (e *CorruptAtError) Is(target error) bool { return target == ErrorCorruptDa
 //
 // Data and Index are exported so that the store can be backed by a file or by
 // POSIX shared memory. Callers that touch them directly must hold the embedded
-// lock, and must call RebuildIndex after replacing Data.
+// lock, and must call RebuildIndex or Recover after replacing Data.
+//
+// The zero value is an in-memory store that touches no disk. Open backs a store
+// with a file, and Attach mirrors it to any Log; see file.go. Neither is
+// required, and Data remains yours to save and restore by hand.
 //
 // The zero value is ready to use, and a store must not be copied once used.
 type KeyValueStore struct {
 	shardedRWMutex                  // Embed the lock to ensure thread safety during concurrent read and write operations.
 	Data           []byte           // A byte slice that holds the serialized records.
 	Index          map[string]int64 // A map that maps keys (as strings) to their position in the Data byte slice.
+
+	// state is the log the store mirrors writes to, nil for a store that lives
+	// only in memory. See file.go.
+	state *logState
 }
 
 // maxShards bounds the read side of the store's lock.
@@ -224,13 +232,7 @@ func (kvs *KeyValueStore) Write(key, value []byte) error {
 	kvs.Lock()
 	defer kvs.Unlock()
 
-	if kvs.Index == nil {
-		kvs.Index = make(map[string]int64)
-	}
-
-	kvs.Index[string(key)] = int64(len(kvs.Data))
-	kvs.Data = record.appendTo(kvs.Data)
-	return nil
+	return kvs.appendRecord(record, key)
 }
 
 // Read takes a key in the form of a byte slice and retrieves the associated value from the KeyValueStore instance.
@@ -323,13 +325,7 @@ func (kvs *KeyValueStore) Delete(key []byte) error {
 	kvs.Lock()
 	defer kvs.Unlock()
 
-	if kvs.Index == nil {
-		kvs.Index = make(map[string]int64)
-	}
-
-	kvs.Index[string(key)] = int64(len(kvs.Data))
-	kvs.Data = record.appendTo(kvs.Data)
-	return nil
+	return kvs.appendRecord(record, key)
 }
 
 // calculateChecksum calculates the CRC-32 (IEEE) checksum over the record's Type,
@@ -457,11 +453,7 @@ func (kvs *KeyValueStore) scan(fn func(pos, next int64, r Record) bool) error {
 func (kvs *KeyValueStore) offsets() ([]int64, error) {
 	// A record is at least a header, which bounds the count, but that bound is
 	// wildly high for a store of large values, so cap the head start.
-	hint := len(kvs.Data)/headerSize + 1
-	if hint > 4096 {
-		hint = 4096
-	}
-	offs := make([]int64, 0, hint)
+	offs := make([]int64, 0, min(len(kvs.Data)/headerSize+1, 4096))
 
 	var pos int64
 	for pos < int64(len(kvs.Data)) {
@@ -568,27 +560,6 @@ func (kvs *KeyValueStore) latestOffsets() (map[string]int64, error) {
 	return latest, nil
 }
 
-// findLatestRecords returns the newest live record for each key in the store.
-// The Key and Value of each returned record alias the Data slice.
-// Callers must hold at least a read lock.
-func (kvs *KeyValueStore) findLatestRecords() (map[string]*Record, error) {
-	latest, err := kvs.latestOffsets()
-	if err != nil {
-		return nil, err
-	}
-
-	records := make(map[string]*Record, len(latest))
-	for key, pos := range latest {
-		record, _, err := parseRecordAt(kvs.Data, pos)
-		if err != nil {
-			return nil, err
-		}
-		records[key] = &record
-	}
-
-	return records, nil
-}
-
 // Compact iterates through the KeyValueStore's Data byte slice, identifies the latest record for each key,
 // and rebuilds the Data slice and Index, dropping superseded records and deleted keys.
 // This method is useful for reducing the storage size and improving the performance of the KeyValueStore.
@@ -637,7 +608,10 @@ func (kvs *KeyValueStore) Compact() error {
 
 	kvs.Data = data
 	kvs.Index = index
-	return nil
+
+	// A store with a log has just shortened its data; the log has to follow, or
+	// the next recovery would bring the compacted records back.
+	return kvs.rewrite()
 }
 
 // RebuildIndex iterates through the KeyValueStore's Data byte slice, deserializes each record,

@@ -5,7 +5,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"math"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -929,5 +931,72 @@ func TestShardedRWMutexExcludes(t *testing.T) {
 
 	if guarded != 8*50 {
 		t.Errorf("expected 400 guarded increments, got %d", guarded)
+	}
+}
+
+func TestKeyValueStore_PrintAllKeyValuePairs(t *testing.T) {
+	kvs := &KeyValueStore{}
+	kvs.Write([]byte("a"), []byte("1"))
+	kvs.Write([]byte("b"), []byte("2"))
+	kvs.Delete([]byte("a"))
+
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout := os.Stdout
+	os.Stdout = write
+
+	printErr := kvs.PrintAllKeyValuePairs()
+
+	os.Stdout = stdout
+	write.Close()
+
+	printed, err := io.ReadAll(read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if printErr != nil {
+		t.Fatalf("PrintAllKeyValuePairs: %v", printErr)
+	}
+
+	want := "Key: a, Value: 1, Deleted: false\n" +
+		"Key: b, Value: 2, Deleted: false\n" +
+		"Key: a, Value: , Deleted: true\n"
+	if string(printed) != want {
+		t.Errorf("printed:\n%s\nwant:\n%s", printed, want)
+	}
+}
+
+func TestKeyValueStore_LoadIndexRejectsGarbage(t *testing.T) {
+	kvs := &KeyValueStore{}
+	kvs.Write([]byte("a"), []byte("1"))
+
+	if err := kvs.LoadIndex([]byte("this is not gob")); err == nil {
+		t.Error("LoadIndex accepted garbage")
+	}
+	// The store is untouched.
+	if value, err := kvs.Read([]byte("a")); err != nil || string(value) != "1" {
+		t.Errorf("a: got '%s' (err %v) after a rejected index", value, err)
+	}
+}
+
+func TestKeyValueStore_VerifyReportsBadFraming(t *testing.T) {
+	kvs := &KeyValueStore{}
+	kvs.Write([]byte("k"), []byte("v"))
+
+	// A value length that runs past the end of the data.
+	binary.LittleEndian.PutUint32(kvs.Data[9:13], 1<<20)
+
+	err := kvs.Verify()
+	var corrupt *CorruptAtError
+	if !errors.As(err, &corrupt) {
+		t.Fatalf("expected a *CorruptAtError, got '%v'", err)
+	}
+	if corrupt.Offset != 0 {
+		t.Errorf("reported offset %d, want 0", corrupt.Offset)
+	}
+	if !errors.Is(err, ErrorCorruptData) {
+		t.Error("a *CorruptAtError should match ErrorCorruptData")
 	}
 }

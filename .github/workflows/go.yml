@@ -14,15 +14,27 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
     - name: Set up Go
-      uses: actions/setup-go@v3
+      uses: actions/setup-go@v5
       with:
-        go-version: 1.19
+        # Whatever Go currently calls stable, which has to be at least the
+        # version in go.mod.
+        go-version: 'stable'
 
     - name: Build
       run: go build -v ./...
 
+    - name: Vet
+      run: go vet ./...
+
     - name: Test
       run: go test -race -v ./...
+
+    # A short run over both fuzz targets, enough to catch a corpus entry that
+    # has stopped passing. The long runs belong on a laptop, not in CI.
+    - name: Fuzz
+      run: |
+        go test -run xxx -fuzz FuzzTree -fuzztime 30s .
+        go test -run xxx -fuzz FuzzKeyValueStore_Data -fuzztime 30s .
