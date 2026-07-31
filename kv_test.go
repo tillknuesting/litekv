@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"math/rand"
 	"runtime"
 	"strings"
 	"sync"
@@ -52,37 +51,6 @@ func TestKeyValueStore_Write(t *testing.T) {
 		if test.readValue != nil && value != nil && string(value) != string(test.readValue) {
 			t.Errorf("test %d: expected value '%s', got '%s'", i, string(test.readValue), string(value))
 		}
-	}
-}
-
-func BenchmarkKeyValueStore_Write(b *testing.B) {
-	kvs := &KeyValueStore{}
-
-	// Run the benchmark with different key inputs and value sizes
-	for _, tc := range []struct {
-		key      []byte
-		valueLen int
-	}{
-		{[]byte("foo"), 1},
-		{[]byte("baz"), 1024},
-		{[]byte("quux"), 1048576},
-		{[]byte("zuux"), 104857600},
-		{[]byte("xuux"), 1073741824},
-	} {
-		b.Run(fmt.Sprintf("key=%s,valueLen=%d", tc.key, tc.valueLen), func(b *testing.B) {
-			b.ReportAllocs()
-			// Generate a value of the specified length
-			value := make([]byte, tc.valueLen)
-			rand.Read(value)
-
-			// Set the bytes processed per operation
-			b.SetBytes(int64(tc.valueLen))
-
-			// Run the benchmark
-			for i := 0; i < b.N; i++ {
-				kvs.Write(tc.key, value)
-			}
-		})
 	}
 }
 
@@ -145,47 +113,6 @@ func TestKeyValueStore_Read(t *testing.T) {
 	}
 }
 
-func BenchmarkKeyValueStore_Read(b *testing.B) {
-	kvs := &KeyValueStore{}
-
-	// Write some sample Data to the store
-	kvs.Write([]byte("foo"), []byte("bar"))
-	kvs.Write([]byte("baz"), []byte(strings.Repeat("a", 1024)))
-	kvs.Write([]byte("quux"), []byte(strings.Repeat("b", 1048576)))
-	kvs.Write([]byte("zuux"), []byte(strings.Repeat("c", 104857600)))
-	kvs.Write([]byte("xuux"), []byte(strings.Repeat("d", 1073741824)))
-
-	// Run the benchmark with different key inputs and value sizes
-	for _, tc := range []struct {
-		key      []byte
-		valueLen int
-	}{
-		{[]byte("foo"), 1},
-		{[]byte("baz"), 1024},
-		{[]byte("quux"), 1048576},
-		{[]byte("zuux"), 104857600},
-		{[]byte("xuux"), 1073741824},
-	} {
-		b.Run(fmt.Sprintf("key=%s,valueLen=%d", tc.key, tc.valueLen), func(b *testing.B) {
-			b.ReportAllocs()
-			// Generate a value of the specified length
-			value := make([]byte, tc.valueLen)
-			rand.Read(value)
-
-			// Write the value to the store
-			kvs.Write(tc.key, value)
-
-			// Set the bytes processed per operation
-			b.SetBytes(int64(tc.valueLen))
-
-			// Run the benchmark
-			for i := 0; i < b.N; i++ {
-				_, _ = kvs.Read(tc.key)
-			}
-		})
-	}
-}
-
 func TestKeyValueStore_Delete(t *testing.T) {
 	type deleteTest struct {
 		writeKey    []byte
@@ -229,40 +156,6 @@ func TestKeyValueStore_Delete(t *testing.T) {
 		if test.readValue != nil && value != nil && string(value) != string(test.readValue) {
 			t.Errorf("test %d: expected value '%s', got '%s'", i, string(test.readValue), string(value))
 		}
-	}
-}
-
-func BenchmarkKeyValueStore_Delete(b *testing.B) {
-	kvs := &KeyValueStore{}
-
-	// Write some sample Data to the store
-	kvs.Write([]byte("foo"), []byte("bar"))
-	kvs.Write([]byte("baz"), []byte(strings.Repeat("a", 1024)))
-	kvs.Write([]byte("quux"), []byte(strings.Repeat("b", 1048576)))
-
-	// Run the benchmark with different key inputs and value sizes
-	for _, tc := range []struct {
-		key      []byte
-		valueLen int
-	}{
-		{[]byte("foo"), 1},
-		{[]byte("baz"), 1024},
-		{[]byte("quux"), 1048576},
-	} {
-		b.Run(fmt.Sprintf("key=%s,valueLen=%d", tc.key, tc.valueLen), func(b *testing.B) {
-			b.ReportAllocs()
-			// Generate a value of the specified length
-			value := make([]byte, tc.valueLen)
-			rand.Read(value)
-
-			// Write the value to the store
-			kvs.Write(tc.key, value)
-
-			// Run the benchmark
-			for i := 0; i < b.N; i++ {
-				kvs.Delete(tc.key)
-			}
-		})
 	}
 }
 
@@ -644,6 +537,8 @@ func TestKeyValueStore_Concurrent(t *testing.T) {
 	kvs := &KeyValueStore{}
 	kvs.Write([]byte("seed"), []byte("seed"))
 
+	// Enough distinct keys that every lock shard is exercised, and a mix of the
+	// paths that take a shard, take them all, or walk the whole store.
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
@@ -654,12 +549,32 @@ func TestKeyValueStore_Concurrent(t *testing.T) {
 				kvs.Write(key, []byte(fmt.Sprintf("value%d", j)))
 				kvs.Read(key)
 				kvs.Read([]byte("seed"))
+				kvs.View([]byte("seed"), func(value []byte) error {
+					if string(value) != "seed" {
+						t.Errorf("View saw '%s'", value)
+					}
+					return nil
+				})
 				if j%25 == 0 {
 					kvs.Delete(key)
+					kvs.ForEach(func(key, value []byte, deleted bool) bool { return true })
 				}
 			}
 		}(i)
 	}
+
+	// A reader using the exported lock directly, as the docs describe.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for j := 0; j < 200; j++ {
+			kvs.RLock()
+			_ = len(kvs.Index)
+			_ = len(kvs.Data)
+			kvs.RUnlock()
+		}
+	}()
+
 	wg.Wait()
 
 	if err := kvs.Verify(); err != nil {
@@ -720,4 +635,299 @@ func FuzzKeyValueStore_Data(f *testing.F) {
 			t.Fatalf("compacted store fails RebuildIndex: %v", err)
 		}
 	})
+}
+
+func TestKeyValueStore_View(t *testing.T) {
+	kvs := &KeyValueStore{}
+	kvs.Write([]byte("k"), []byte("value"))
+	kvs.Write([]byte("gone"), []byte("x"))
+	kvs.Delete([]byte("gone"))
+
+	var seen string
+	if err := kvs.View([]byte("k"), func(value []byte) error {
+		seen = string(value)
+		// The value must be the stored bytes, not a copy of them.
+		if &value[0] != &kvs.Data[kvs.Index["k"]+headerSize+1] {
+			t.Error("View copied the value")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("View: %v", err)
+	}
+	if seen != "value" {
+		t.Errorf("expected 'value', got '%s'", seen)
+	}
+
+	called := false
+	err := kvs.View([]byte("gone"), func(value []byte) error {
+		called = true
+		return nil
+	})
+	if !errors.Is(err, ErrorKeyDeleted) {
+		t.Errorf("expected '%v', got '%v'", ErrorKeyDeleted, err)
+	}
+	if called {
+		t.Error("View called fn for a deleted key")
+	}
+
+	sentinel := errors.New("sentinel")
+	if err := kvs.View([]byte("k"), func(value []byte) error { return sentinel }); err != sentinel {
+		t.Errorf("expected the error from fn, got '%v'", err)
+	}
+}
+
+// Benchmarks keep the store bounded: appending gigabyte values in a b.N loop
+// measures the allocator, and on a small machine it simply runs out of memory.
+
+func makeKeys(n int) [][]byte {
+	keys := make([][]byte, n)
+	for i := range keys {
+		keys[i] = []byte(fmt.Sprintf("key:%016d", i))
+	}
+	return keys
+}
+
+// BenchmarkKeyValueStore_WriteUpdate rewrites the same key over and over: the update path.
+func BenchmarkKeyValueStore_WriteUpdate(b *testing.B) {
+	for _, size := range []int{16, 1024, 65536} {
+		b.Run(fmt.Sprint(size), func(b *testing.B) {
+			key := []byte("key:0000000000000000")
+			value := make([]byte, size)
+			kvs := &KeyValueStore{}
+			b.SetBytes(int64(size))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				kvs.Write(key, value)
+				if len(kvs.Data) > 1<<26 {
+					kvs.Data = kvs.Data[:0]
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkKeyValueStore_WriteInsert writes a fresh key every time: the insert path.
+func BenchmarkKeyValueStore_WriteInsert(b *testing.B) {
+	for _, size := range []int{16, 1024} {
+		b.Run(fmt.Sprint(size), func(b *testing.B) {
+			keys := makeKeys(4096)
+			value := make([]byte, size)
+			kvs := &KeyValueStore{}
+			b.SetBytes(int64(size))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				kvs.Write(keys[i%len(keys)], value)
+				if len(kvs.Data) > 1<<26 {
+					kvs.Data = kvs.Data[:0]
+					kvs.Index = nil
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkKeyValueStore_Read(b *testing.B) {
+	for _, size := range []int{16, 1024, 65536} {
+		b.Run(fmt.Sprint(size), func(b *testing.B) {
+			keys := makeKeys(1024)
+			value := make([]byte, size)
+			kvs := &KeyValueStore{}
+			for _, key := range keys {
+				kvs.Write(key, value)
+			}
+			b.SetBytes(int64(size))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_, _ = kvs.Read(keys[i%len(keys)])
+			}
+		})
+	}
+}
+
+func BenchmarkKeyValueStore_View(b *testing.B) {
+	for _, size := range []int{16, 1024, 65536} {
+		b.Run(fmt.Sprint(size), func(b *testing.B) {
+			keys := makeKeys(1024)
+			value := make([]byte, size)
+			kvs := &KeyValueStore{}
+			for _, key := range keys {
+				kvs.Write(key, value)
+			}
+			var sink int
+			b.SetBytes(int64(size))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				kvs.View(keys[i%len(keys)], func(v []byte) error {
+					sink += len(v)
+					return nil
+				})
+			}
+		})
+	}
+}
+
+func BenchmarkKeyValueStore_ViewParallel(b *testing.B) {
+	keys := makeKeys(1024)
+	value := make([]byte, 1024)
+	kvs := &KeyValueStore{}
+	for _, key := range keys {
+		kvs.Write(key, value)
+	}
+	b.SetBytes(1024)
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		sink := 0
+		for pb.Next() {
+			kvs.View(keys[i%len(keys)], func(v []byte) error {
+				sink += len(v)
+				return nil
+			})
+			i++
+		}
+	})
+}
+
+func BenchmarkKeyValueStore_ReadParallel(b *testing.B) {
+	keys := makeKeys(1024)
+	value := make([]byte, 1024)
+	kvs := &KeyValueStore{}
+	for _, key := range keys {
+		kvs.Write(key, value)
+	}
+	b.SetBytes(1024)
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			_, _ = kvs.Read(keys[i%len(keys)])
+			i++
+		}
+	})
+}
+
+func BenchmarkKeyValueStore_Compact(b *testing.B) {
+	keys := makeKeys(4096)
+	value := make([]byte, 256)
+	golden := &KeyValueStore{}
+	for round := 0; round < 4; round++ { // every key written 4 times
+		for _, key := range keys {
+			golden.Write(key, value)
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		kvs := &KeyValueStore{Data: append([]byte(nil), golden.Data...)}
+		kvs.RebuildIndex()
+		b.StartTimer()
+		kvs.Compact()
+	}
+}
+
+func BenchmarkKeyValueStore_RebuildIndex(b *testing.B) {
+	keys := makeKeys(4096)
+	value := make([]byte, 256)
+	kvs := &KeyValueStore{}
+	for _, key := range keys {
+		kvs.Write(key, value)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		kvs.RebuildIndex()
+	}
+}
+
+func TestShardCount(t *testing.T) {
+	for procs := 1; procs <= 64; procs++ {
+		n := shardCount(procs)
+
+		switch {
+		case n < 1 || n > maxShards:
+			t.Errorf("shardCount(%d) = %d, outside [1, %d]", procs, n, maxShards)
+		case n&(n-1) != 0:
+			t.Errorf("shardCount(%d) = %d, not a power of two", procs, n)
+		case n > procs:
+			t.Errorf("shardCount(%d) = %d, more shards than cores", procs, n)
+		case n*2 <= procs && n*2 <= maxShards:
+			t.Errorf("shardCount(%d) = %d, could have been %d", procs, n, n*2)
+		}
+	}
+}
+
+// TestShardedRWMutex checks that the lock is a lock: a writer excludes readers
+// on every shard, not just the one its key hashes to.
+func TestShardedRWMutex(t *testing.T) {
+	var m shardedRWMutex
+
+	// Every shard must be reachable, or the read side is not really sharded.
+	seen := make(map[*paddedRWMutex]bool)
+	for i := 0; i < 1000; i++ {
+		shard := m.rlockKey([]byte(fmt.Sprintf("key%d", i)))
+		shard.RUnlock()
+		seen[shard] = true
+	}
+	if len(seen) != numShards {
+		t.Errorf("keys reached %d of %d shards", len(seen), numShards)
+	}
+
+	// With the write lock held, no shard may be read-lockable.
+	m.Lock()
+	for i := range m.shards[:numShards] {
+		if m.shards[i].TryRLock() {
+			m.shards[i].RUnlock()
+			m.Unlock()
+			t.Fatalf("shard %d was read-lockable while the write lock was held", i)
+		}
+	}
+	m.Unlock()
+
+	// And afterwards every shard is free again.
+	for i := range m.shards[:numShards] {
+		if !m.shards[i].TryRLock() {
+			t.Errorf("shard %d stayed locked after Unlock", i)
+		} else {
+			m.shards[i].RUnlock()
+		}
+	}
+}
+
+// TestShardedRWMutexExcludes has a writer and readers spread over the shards
+// share a counter that only the lock protects. Run with -race.
+func TestShardedRWMutexExcludes(t *testing.T) {
+	var m shardedRWMutex
+	guarded := 0
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			key := []byte(fmt.Sprintf("key%d", i))
+			for j := 0; j < 500; j++ {
+				if j%10 == 0 {
+					m.Lock()
+					guarded++
+					m.Unlock()
+					continue
+				}
+				shard := m.rlockKey(key)
+				_ = guarded
+				shard.RUnlock()
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if guarded != 8*50 {
+		t.Errorf("expected 400 guarded increments, got %d", guarded)
+	}
 }
