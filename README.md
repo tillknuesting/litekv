@@ -2,8 +2,8 @@
 
 LiteKV is a small key-value store written in Go. Records are appended to a log, an index maps each key
 to its newest record, and the whole store is one byte slice you can hold in memory, save yourself, or
-have written to disk as it changes. For a store too big to compact in one go, `DB` splits it across
-several logs and merges them in the background.
+have written to disk as it changes. For a store bigger than memory, `DB` splits it across several logs,
+keeps only the keys and the newest log in memory, and merges the rest in the background.
 
 The design is Bitcask, described by Justin Sheehy and David Smith at Basho Technologies in their 2010
 paper *Bitcask: A Log-Structured Hash Table for Fast Key/Value Data*, which credits Eric Brewer for the
@@ -205,6 +205,30 @@ to oldest, stopping at the first answer. That is what makes a record in a newer 
 and a tombstone in a newer log shadow a value in an older one. Merging keeps the number of logs small, so
 a lookup does not have many to ask.
 
+### Only the keys have to fit in memory
+
+A frozen log holds nothing but its index. Its records stay on the disk and are read back when a key asks
+for them, which is what lets a `DB` hold more than fits in memory — the arrangement Bitcask is built on,
+and why its own description says only that all the *keys* must fit. What a `DB` keeps in memory is every
+key, plus the one log still being written:
+
+| 16,000 records holding 15 MiB | in memory |
+| ----------------------------- | --------- |
+| one log                       | 20 MiB    |
+| segments                      | 2 MiB     |
+
+The cost is on the way back. A value in a frozen log is a read from the file rather than a look at
+memory, even when the operating system still has the page:
+
+| read of a 512-byte value | |
+| ------------------------ | ------- |
+| from memory              | 156 ns  |
+| from a frozen log        | 847 ns  |
+
+So a `DB` trades roughly five times the read latency for roughly a tenth of the memory. A
+`KeyValueStore` makes the opposite trade and keeps everything in memory, which is the right one while
+the store still fits.
+
 The worst wait a single write suffers, writing 128-byte values with half the writes landing on keys
 already stored:
 
@@ -324,20 +348,21 @@ which version wrote it.
 
 ## Limitations
 
-- **Every key must fit in memory.** The index holds each key and an offset, about 59 bytes per key on
-  top of the data itself. Ten million keys is roughly 600 MB of index whatever the values weigh.
-- **The whole store is in memory too.** `Data` holds every record, live or superseded, until compaction.
+- **Every key must fit in memory.** The index holds each key and an offset, about 59 bytes per key,
+  however large the values are. Ten million keys is roughly 600 MB of index, and no amount of paging
+  values out of memory changes that.
+- **A `KeyValueStore` holds every record in memory**, live or superseded, until compaction. A `DB` holds
+  only the keys and its active log, which is what to reach for once a store outgrows memory.
 - **No range or prefix queries.** The index is a hash map, so keys have no order. A radix tree that gave
   ordered traversal was measured and reverted: prefix queries went from a full scan to 214 ns, but point
   lookups cost 3 to 4.5x more, which was the wrong trade here. It is in the history at `9e3cf2c`.
 - **One writer at a time.** Writes take every shard of the lock, so they serialize with each other, and
   for a single `KeyValueStore` with compaction as well.
 - **Merging rewrites everything frozen.** A `DB` merges all its frozen logs into one rather than merging
-  them in tiers, so each merge costs what the store holds. It runs in the background, but on a large
-  store it is a lot of background.
-- **Segments do not save memory.** Every log is held in memory as well as on disk. Keeping only the keys
-  in memory and reading values from disk, as Bitcask does, would fix the two entries above this one, and
-  is the obvious next step.
+  them in tiers, so each merge costs what the store holds. It runs in the background and streams through
+  a buffer rather than gathering the result up, but on a large store it is a lot of background.
+- **A closed `DB` cannot read.** Its values are on the disk and closing shuts the files. A closed
+  `KeyValueStore` goes on answering, because its records are in memory.
 
 ## Running Tests
 

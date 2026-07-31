@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -19,10 +20,10 @@ func smallSegments(size int64) DBOptions {
 	return DBOptions{Sync: SyncNever, SegmentSize: size, MergeTrigger: 1 << 30}
 }
 
-// readable reports what the DB says about a key, treating a deleted key and one
+// liveValue reports what the DB says about a key, treating a deleted key and one
 // that was never written as the same: a merge drops tombstones, so which of the
 // two a caller sees depends on whether one has run.
-func readable(t *testing.T, db *DB, key string) (string, bool) {
+func liveValue(t *testing.T, db *DB, key string) (string, bool) {
 	t.Helper()
 
 	value, err := db.Read([]byte(key))
@@ -60,7 +61,7 @@ func TestDBBasics(t *testing.T) {
 
 	// Every key is findable wherever it landed.
 	for i := 0; i < 100; i++ {
-		value, ok := readable(t, db, fmt.Sprintf("key%03d", i))
+		value, ok := liveValue(t, db, fmt.Sprintf("key%03d", i))
 		if !ok || value != fmt.Sprintf("value%03d", i) {
 			t.Fatalf("key%03d: got '%s' (%v)", i, value, ok)
 		}
@@ -73,7 +74,7 @@ func TestDBBasics(t *testing.T) {
 	if err := db.Write([]byte("key000"), []byte("rewritten")); err != nil {
 		t.Fatal(err)
 	}
-	if value, _ := readable(t, db, "key000"); value != "rewritten" {
+	if value, _ := liveValue(t, db, "key000"); value != "rewritten" {
 		t.Errorf("key000: got '%s', want 'rewritten'", value)
 	}
 
@@ -81,7 +82,7 @@ func TestDBBasics(t *testing.T) {
 	if err := db.Delete([]byte("key001")); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := readable(t, db, "key001"); ok {
+	if _, ok := liveValue(t, db, "key001"); ok {
 		t.Error("key001 survived being deleted")
 	}
 	if _, err := db.Read([]byte("key001")); !errors.Is(err, ErrorKeyDeleted) {
@@ -161,11 +162,11 @@ func TestDBMerge(t *testing.T) {
 	}
 
 	for key, want := range map[string]string{"a": "a-39", "b": "b-39", "c": "c-final"} {
-		if value, ok := readable(t, db, key); !ok || value != want {
+		if value, ok := liveValue(t, db, key); !ok || value != want {
 			t.Errorf("%s: got '%s' (%v), want '%s'", key, value, ok, want)
 		}
 	}
-	if _, ok := readable(t, db, "d"); ok {
+	if _, ok := liveValue(t, db, "d"); ok {
 		t.Error("the deleted key came back after merging")
 	}
 
@@ -173,7 +174,7 @@ func TestDBMerge(t *testing.T) {
 	if err := db.Merge(); err != nil {
 		t.Fatalf("second Merge: %v", err)
 	}
-	if value, ok := readable(t, db, "c"); !ok || value != "c-final" {
+	if value, ok := liveValue(t, db, "c"); !ok || value != "c-final" {
 		t.Errorf("c after a second merge: got '%s' (%v)", value, ok)
 	}
 }
@@ -266,11 +267,11 @@ func TestDBMergeInterrupted(t *testing.T) {
 			defer db.Close()
 
 			for key, value := range want {
-				if got, ok := readable(t, db, key); !ok || got != value {
+				if got, ok := liveValue(t, db, key); !ok || got != value {
 					t.Errorf("key %q: got '%s' (%v), want '%s'", key, got, ok, value)
 				}
 			}
-			if _, ok := readable(t, db, "gone"); ok {
+			if _, ok := liveValue(t, db, "gone"); ok {
 				t.Error("the deleted key came back")
 			}
 		})
@@ -316,12 +317,12 @@ func TestDBReopen(t *testing.T) {
 		t.Errorf("reopened with %d segments, want %d", got, segments)
 	}
 	for key, value := range want {
-		if got, ok := readable(t, reopened, key); !ok || got != value {
+		if got, ok := liveValue(t, reopened, key); !ok || got != value {
 			t.Errorf("key %q: got '%s' (%v), want '%s'", key, got, ok, value)
 		}
 	}
 	for _, key := range []string{"key000", "key001"} {
-		if _, ok := readable(t, reopened, key); ok {
+		if _, ok := liveValue(t, reopened, key); ok {
 			t.Errorf("%s came back after reopening", key)
 		}
 	}
@@ -330,7 +331,7 @@ func TestDBReopen(t *testing.T) {
 	if err := reopened.Write([]byte("after"), []byte("reopening")); err != nil {
 		t.Fatal(err)
 	}
-	if value, ok := readable(t, reopened, "after"); !ok || value != "reopening" {
+	if value, ok := liveValue(t, reopened, "after"); !ok || value != "reopening" {
 		t.Errorf("after: got '%s' (%v)", value, ok)
 	}
 }
@@ -356,7 +357,7 @@ func TestDBOpenIgnoresStrayFiles(t *testing.T) {
 	}
 	defer reopened.Close()
 
-	if value, ok := readable(t, reopened, "a"); !ok || value != "1" {
+	if value, ok := liveValue(t, reopened, "a"); !ok || value != "1" {
 		t.Errorf("a: got '%s' (%v), want '1'", value, ok)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "0000000001.seg.merging")); !os.IsNotExist(err) {
@@ -427,7 +428,7 @@ func TestDBMergeDoesNotBlock(t *testing.T) {
 	close(stop)
 	wg.Wait()
 
-	if value, ok := readable(t, db, "constant"); !ok || value != "value" {
+	if value, ok := liveValue(t, db, "constant"); !ok || value != "value" {
 		t.Errorf("constant: got '%s' (%v) at the end", value, ok)
 	}
 }
@@ -452,9 +453,11 @@ func TestDBClosed(t *testing.T) {
 	if err := db.Delete([]byte("a")); !errors.Is(err, ErrorClosed) {
 		t.Errorf("Delete: expected '%v', got '%v'", ErrorClosed, err)
 	}
-	// Reads keep working, as they do on a closed store.
-	if value, err := db.Read([]byte("a")); err != nil || string(value) != "1" {
-		t.Errorf("Read after Close: got '%s' (%v), want '1'", value, err)
+	// A DB keeps the values of its frozen logs on the disk, so once the files
+	// are shut it cannot answer at all. A KeyValueStore, whose records are in
+	// memory, still can.
+	if _, err := db.Read([]byte("a")); !errors.Is(err, ErrorClosed) {
+		t.Errorf("Read after Close: expected '%v', got '%v'", ErrorClosed, err)
 	}
 	if err := db.Merge(); !errors.Is(err, ErrorClosed) {
 		t.Errorf("Merge: expected '%v', got '%v'", ErrorClosed, err)
@@ -483,7 +486,7 @@ func TestDBModel(t *testing.T) {
 	check := func(step string) {
 		t.Helper()
 		for key, want := range live {
-			if got, ok := readable(t, db, key); !ok || got != want {
+			if got, ok := liveValue(t, db, key); !ok || got != want {
 				t.Fatalf("%s: key %q: got '%s' (%v), want '%s'", step, key, got, ok, want)
 			}
 		}
@@ -491,7 +494,7 @@ func TestDBModel(t *testing.T) {
 			if _, ok := live[key]; ok {
 				continue
 			}
-			if _, ok := readable(t, db, key); ok {
+			if _, ok := liveValue(t, db, key); ok {
 				t.Fatalf("%s: key %q reads as live but should not", step, key)
 			}
 		}
@@ -515,7 +518,7 @@ func TestDBModel(t *testing.T) {
 			delete(live, key)
 
 		case n < 90:
-			got, ok := readable(t, db, key)
+			got, ok := liveValue(t, db, key)
 			want, isLive := live[key]
 			if ok != isLive || (ok && got != want) {
 				t.Fatalf("step %d: key %q: got '%s' (%v), want '%s' (%v)", step, key, got, ok, want, isLive)
@@ -564,6 +567,8 @@ func TestDBModel(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func nanotime() int64 { return time.Now().UnixNano() }
 
 func dirSize(t *testing.T, dir string) int64 {
 	t.Helper()
@@ -633,7 +638,7 @@ func TestDBDefaults(t *testing.T) {
 	if got := db.Segments(); got != 1 {
 		t.Errorf("%d segments for 20 small records, want 1", got)
 	}
-	if value, ok := readable(t, db, "key19"); !ok || value != "value" {
+	if value, ok := liveValue(t, db, "key19"); !ok || value != "value" {
 		t.Errorf("key19: got '%s' (%v)", value, ok)
 	}
 	if err := db.Sync(); err != nil {
@@ -691,17 +696,15 @@ func TestDBForEachStopsAndRefusesWhenClosed(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// Reading a closed DB still works; only writing is refused.
-	live := 0
-	if err := db.ForEach(func(key, value []byte) bool { live++; return true }); err != nil {
-		t.Errorf("ForEach on a closed DB: %v", err)
+	// A closed DB cannot read: the values it did not have in memory are behind
+	// files it has shut.
+	if err := db.ForEach(func(key, value []byte) bool { return true }); !errors.Is(err, ErrorClosed) {
+		t.Errorf("ForEach on a closed DB: expected '%v', got '%v'", ErrorClosed, err)
 	}
-	if live != 30 {
-		t.Errorf("ForEach on a closed DB saw %d keys, want 30", live)
+	if err := db.View([]byte("key00"), func([]byte) error { return nil }); !errors.Is(err, ErrorClosed) {
+		t.Errorf("View on a closed DB: expected '%v', got '%v'", ErrorClosed, err)
 	}
-	if err := db.View([]byte("key00"), func([]byte) error { return nil }); err != nil {
-		t.Errorf("View on a closed DB: %v", err)
-	}
+	// Len only looks at the indexes, which are still in memory.
 	if db.Len() != 30 {
 		t.Errorf("a closed DB reports %d keys, want 30", db.Len())
 	}
@@ -832,9 +835,149 @@ func TestCompactionStall(t *testing.T) {
 		t.Logf("%6d records: worst write is %8v with one log and compaction, %8v with segments",
 			records, singleWorst.Round(time.Microsecond), dbWorst.Round(time.Microsecond))
 
+		// Merging in the background only keeps out of a write's way if there is
+		// a core for it to run on. On one, it is the same work in the same
+		// place and the wait is whatever the scheduler decides, so there is
+		// nothing to hold it to.
+		if runtime.GOMAXPROCS(0) < 2 {
+			continue
+		}
 		if dbWorst > singleWorst {
 			t.Errorf("%d records: segments stalled a write for %v, worse than compacting one log at %v",
 				records, dbWorst, singleWorst)
 		}
 	}
+}
+
+// TestDBMemory is the point of keeping the frozen logs on the disk: what has to
+// fit in memory is the keys, not the values.
+func TestDBMemory(t *testing.T) {
+	if testing.Short() {
+		t.Skip("writes about 16 MB")
+	}
+
+	const (
+		records   = 16_000
+		valueSize = 1024
+	)
+	value := make([]byte, valueSize)
+	key := func(i int) []byte { return []byte(fmt.Sprintf("key%06d", i)) }
+
+	held := func(build func() (func() error, error)) uint64 {
+		runtime.GC()
+		runtime.GC()
+		var before runtime.MemStats
+		runtime.ReadMemStats(&before)
+
+		closer, err := build()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		runtime.GC()
+		runtime.GC()
+		var after runtime.MemStats
+		runtime.ReadMemStats(&after)
+
+		if err := closer(); err != nil {
+			t.Fatal(err)
+		}
+		return after.HeapAlloc - before.HeapAlloc
+	}
+
+	// One log: every record stays in memory as well as on the disk.
+	single := held(func() (func() error, error) {
+		kvs, err := Open(filepath.Join(t.TempDir(), "kv"), Options{Sync: SyncNever})
+		if err != nil {
+			return nil, err
+		}
+		for i := 0; i < records; i++ {
+			if err := kvs.Write(key(i), value); err != nil {
+				return nil, err
+			}
+		}
+		return kvs.Close, nil
+	})
+
+	// Segments: only the active one is in memory, plus every index.
+	segmented := held(func() (func() error, error) {
+		db, err := OpenDB(t.TempDir(), DBOptions{Sync: SyncNever, SegmentSize: 1 << 20, MergeTrigger: 1 << 30})
+		if err != nil {
+			return nil, err
+		}
+		for i := 0; i < records; i++ {
+			if err := db.Write(key(i), value); err != nil {
+				return nil, err
+			}
+		}
+		return db.Close, nil
+	})
+
+	stored := int64(records) * (valueSize + 9 + headerSize)
+	t.Logf("%d records holding %d MiB: one log keeps %d MiB in memory, segments keep %d MiB",
+		records, stored>>20, single>>20, segmented>>20)
+
+	if segmented >= single {
+		t.Errorf("segments held %d bytes, no better than one log at %d", segmented, single)
+	}
+}
+
+// TestDBReadCost is the other side of that trade: a value in a frozen log costs
+// a read from the file rather than a look at memory.
+func TestDBReadCost(t *testing.T) {
+	if testing.Short() {
+		t.Skip("writes a few MB")
+	}
+
+	const records = 4000
+	value := make([]byte, 512)
+	key := func(i int) []byte { return []byte(fmt.Sprintf("key%06d", i)) }
+
+	dir := t.TempDir()
+	db, err := OpenDB(dir, DBOptions{Sync: SyncNever, SegmentSize: 256 << 10, MergeTrigger: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	for i := 0; i < records; i++ {
+		if err := db.Write(key(i), value); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	single, err := Open(filepath.Join(t.TempDir(), "kv"), Options{Sync: SyncNever})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer single.Close()
+	for i := 0; i < records; i++ {
+		if err := single.Write(key(i), value); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	time := func(read func(i int) error) float64 {
+		start := nanotime()
+		for round := 0; round < 5; round++ {
+			for i := 0; i < records; i++ {
+				if err := read(i); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		return float64(nanotime()-start) / float64(records*5)
+	}
+
+	fromDisk := time(func(i int) error {
+		_, err := db.Read(key(i))
+		return err
+	})
+	fromMemory := time(func(i int) error {
+		_, err := single.Read(key(i))
+		return err
+	})
+
+	t.Logf("read of a 512-byte value: %.0f ns from a frozen log on disk, %.0f ns from memory",
+		fromDisk, fromMemory)
 }

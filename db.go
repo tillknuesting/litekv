@@ -1,6 +1,7 @@
 package litekv
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"os"
@@ -38,8 +39,8 @@ type DB struct {
 	dir  string
 	opts DBOptions
 
-	active *segment   // takes the writes
-	frozen []*segment // newest first, never written again
+	active *memSegment    // takes the writes, and is the only log held in memory
+	frozen []*diskSegment // newest first, never written again, records on the disk
 
 	nextID  uint64
 	merging bool
@@ -77,12 +78,6 @@ const (
 	segmentSuffix = ".seg"
 	mergeSuffix   = ".merging"
 )
-
-// segment is one log of the DB, with its own records and its own index.
-type segment struct {
-	id  uint64
-	kvs *KeyValueStore
-}
 
 func (o DBOptions) segmentSize() int64 {
 	if o.SegmentSize <= 0 {
@@ -129,25 +124,24 @@ func OpenDB(dir string, opts DBOptions) (*DB, error) {
 		return db, nil
 	}
 
-	// The newest log is the one to carry on writing to; the rest are frozen.
+	// The newest log is the one to carry on writing to, and is read into
+	// memory. The rest are indexed where they lie: their records stay on the
+	// disk and are read back a key at a time.
 	for i, id := range ids {
-		policy := DBOptions{Sync: SyncNever}
 		if i == len(ids)-1 {
-			policy = opts
+			if err := db.start(id); err != nil {
+				db.closeSegments()
+				return nil, err
+			}
+			continue
 		}
 
-		kvs, err := Open(db.path(id), Options{Sync: policy.Sync, Interval: policy.Interval})
+		frozen, err := openDiskSegment(id, db.path(id))
 		if err != nil {
 			db.closeSegments()
 			return nil, err
 		}
-
-		seg := &segment{id: id, kvs: kvs}
-		if i == len(ids)-1 {
-			db.active = seg
-		} else {
-			db.frozen = append([]*segment{seg}, db.frozen...) // newest first
-		}
+		db.frozen = append([]*diskSegment{frozen}, db.frozen...) // newest first
 	}
 
 	db.nextID = ids[len(ids)-1] + 1
@@ -166,7 +160,7 @@ func (db *DB) start(id uint64) error {
 		return err
 	}
 
-	db.active = &segment{id: id, kvs: kvs}
+	db.active = &memSegment{segID: id, kvs: kvs}
 	db.nextID = id + 1
 	return nil
 }
@@ -253,14 +247,19 @@ func (db *DB) Delete(key []byte) error {
 // tombstone, and ErrorKeyNotFound afterwards. Both mean the same thing to a
 // caller: there is no value.
 //
-// Reads keep working on a closed DB, as they do on a closed store: closing
-// releases the files, and the records are already in memory.
+// A closed DB reports ErrorClosed. Unlike a closed KeyValueStore, which can go
+// on answering from memory, a DB keeps the values of its frozen logs on the
+// disk, and closing shuts the files they are in.
 func (db *DB) Read(key []byte) ([]byte, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
+	if db.closed {
+		return nil, ErrorClosed
+	}
+
 	for _, seg := range db.searchOrder() {
-		value, err := seg.kvs.Read(key)
+		value, err := seg.read(key)
 		// Anything but "this log has never heard of the key" is the answer,
 		// including a tombstone: a newer log's delete shadows an older value.
 		if !errors.Is(err, ErrorKeyNotFound) {
@@ -278,8 +277,12 @@ func (db *DB) View(key []byte, fn func(value []byte) error) error {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
+	if db.closed {
+		return ErrorClosed
+	}
+
 	for _, seg := range db.searchOrder() {
-		err := seg.kvs.View(key, fn)
+		err := seg.view(key, fn)
 		if !errors.Is(err, ErrorKeyNotFound) {
 			return err
 		}
@@ -289,12 +292,15 @@ func (db *DB) View(key []byte, fn func(value []byte) error) error {
 }
 
 // searchOrder is the logs newest first. Callers must hold db.mu.
-func (db *DB) searchOrder() []*segment {
-	order := make([]*segment, 0, len(db.frozen)+1)
+func (db *DB) searchOrder() []readable {
+	order := make([]readable, 0, len(db.frozen)+1)
 	if db.active != nil {
 		order = append(order, db.active)
 	}
-	return append(order, db.frozen...)
+	for _, seg := range db.frozen {
+		order = append(order, seg)
+	}
+	return order
 }
 
 // ForEach calls fn with every live key and its value, skipping the records that
@@ -304,38 +310,41 @@ func (db *DB) ForEach(fn func(key, value []byte) bool) error {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
+	if db.closed {
+		return ErrorClosed
+	}
+
 	seen := make(map[string]bool)
 
+	var err error
 	for _, seg := range db.searchOrder() {
-		var err error
 		stopped := false
 
-		seg.kvs.RLock()
-		for key, pos := range seg.kvs.Index {
+		seg.eachKey(func(key string, pos int64) bool {
 			// The first log to hold a key is the one whose answer counts.
 			if seen[key] {
-				continue
+				return true
 			}
 			seen[key] = true
 
-			record, next, parseErr := parseRecordAt(seg.kvs.Data, pos)
-			if parseErr != nil {
-				err = parseErr
-				break
+			record, raw, readErr := seg.recordAt(pos)
+			if readErr != nil {
+				err = readErr
+				return false
 			}
-			if record.Crc != checksumSerialized(seg.kvs.Data[pos:next]) {
+			if record.Crc != checksumSerialized(raw) {
 				err = fmt.Errorf("record at offset %d: %w", pos, ErrorChecksumMismatch)
-				break
+				return false
 			}
 			if record.Type != RecordTypeNormal {
-				continue
+				return true
 			}
 			if !fn(record.Key, record.Value) {
 				stopped = true
-				break
+				return false
 			}
-		}
-		seg.kvs.RUnlock()
+			return true
+		})
 
 		if err != nil || stopped {
 			return err
@@ -353,11 +362,10 @@ func (db *DB) Len() int {
 
 	seen := make(map[string]bool)
 	for _, seg := range db.searchOrder() {
-		seg.kvs.RLock()
-		for key := range seg.kvs.Index {
+		seg.eachKey(func(key string, _ int64) bool {
 			seen[key] = true
-		}
-		seg.kvs.RUnlock()
+			return true
+		})
 	}
 
 	return len(seen)
@@ -374,8 +382,8 @@ func (db *DB) Segments() int {
 
 // rotateIfFull freezes the active log if it has grown past the segment size and
 // is still the one that was just written to.
-func (db *DB) rotateIfFull(written *segment) error {
-	if written.kvs.Size() < db.opts.segmentSize() {
+func (db *DB) rotateIfFull(written *memSegment) error {
+	if written.size() < db.opts.segmentSize() {
 		return nil
 	}
 
@@ -387,7 +395,15 @@ func (db *DB) rotateIfFull(written *segment) error {
 		return nil
 	}
 
-	db.frozen = append([]*segment{written}, db.frozen...)
+	// Freezing hands the records over to the disk: the store and the Data
+	// slice it was holding go, and what stays in memory is the index.
+	frozen, err := freeze(written, db.opts.Sync)
+	if err != nil {
+		db.mu.Unlock()
+		return err
+	}
+
+	db.frozen = append([]*diskSegment{frozen}, db.frozen...)
 	if err := db.start(db.nextID); err != nil {
 		db.mu.Unlock()
 		return err
@@ -396,10 +412,6 @@ func (db *DB) rotateIfFull(written *segment) error {
 	db.mergeInBackground()
 	db.mu.Unlock()
 
-	// Freezing a log does not sync it. The sync policy says when a record
-	// reaches the disk and rotation is no reason to override it: under
-	// SyncAlways it is already there, under SyncEvery the timer will see to it,
-	// and under SyncNever the caller asked for no syncs at all.
 	return nil
 }
 
@@ -451,7 +463,7 @@ func (db *DB) merge() error {
 	defer db.mergeMu.Unlock()
 
 	db.mu.RLock()
-	victims := append([]*segment(nil), db.frozen...) // newest first
+	victims := append([]*diskSegment(nil), db.frozen...) // newest first
 	closed := db.closed
 	db.mu.RUnlock()
 
@@ -461,24 +473,20 @@ func (db *DB) merge() error {
 
 	oldest := victims[len(victims)-1]
 
-	data, err := mergedRecords(victims)
-	if err != nil {
+	temp := db.path(oldest.id()) + mergeSuffix
+	if err := mergeInto(temp, victims); err != nil {
 		return err
 	}
 
-	temp := db.path(oldest.id) + mergeSuffix
-	if err := writeFileSynced(temp, data); err != nil {
-		return err
-	}
-
-	if err := os.Rename(temp, db.path(oldest.id)); err != nil {
+	if err := os.Rename(temp, db.path(oldest.id())); err != nil {
 		os.Remove(temp)
 		return err
 	}
 	syncDir(db.dir)
 
-	// Reading it back checks every checksum of what was just written.
-	merged, err := Open(db.path(oldest.id), Options{Sync: SyncNever})
+	// Indexing it back checks every checksum of what was just written, and
+	// leaves the records where they are: on the disk.
+	merged, err := openDiskSegment(oldest.id(), db.path(oldest.id()))
 	if err != nil {
 		return err
 	}
@@ -486,27 +494,27 @@ func (db *DB) merge() error {
 	db.mu.Lock()
 	replaced := make(map[uint64]bool, len(victims))
 	for _, seg := range victims {
-		replaced[seg.id] = true
+		replaced[seg.id()] = true
 	}
 
 	// Anything frozen while the merge ran is newer than the merged log and
 	// stays where it is.
-	var kept []*segment
+	var kept []*diskSegment
 	for _, seg := range db.frozen {
-		if !replaced[seg.id] {
+		if !replaced[seg.id()] {
 			kept = append(kept, seg)
 		}
 	}
-	db.frozen = append(kept, &segment{id: oldest.id, kvs: merged})
+	db.frozen = append(kept, merged)
 	db.mu.Unlock()
 
 	// Oldest first, so that what is left on disk is always answerable. None of
 	// these is worth syncing: the oldest has already been renamed over and the
 	// rest are about to be removed.
 	for i := len(victims) - 1; i >= 0; i-- {
-		victims[i].kvs.closeNoSync()
-		if victims[i].id != oldest.id {
-			os.Remove(db.path(victims[i].id))
+		victims[i].closeNoSync()
+		if victims[i].id() != oldest.id() {
+			os.Remove(db.path(victims[i].id()))
 		}
 	}
 	syncDir(db.dir)
@@ -514,79 +522,78 @@ func (db *DB) merge() error {
 	return nil
 }
 
-// mergedRecords returns the records to keep from the given logs, which are
-// newest first: the newest version of every key that is not deleted, in the
-// order the surviving records were originally written.
-func mergedRecords(victims []*segment) ([]byte, error) {
+// mergeInto writes the records worth keeping from the given logs, which are
+// newest first, into a new file at path: the newest version of every key that
+// is not deleted, in the order the surviving records were written.
+//
+// The records are streamed through a buffer rather than gathered up, so merging
+// a store costs no more memory than merging a small one.
+func mergeInto(path string, victims []*diskSegment) error {
 	type locator struct {
-		seg *segment
+		seg *diskSegment
 		pos int64
 	}
 
 	// Newest first, so the first log to hold a key is the one that decides.
 	live := make(map[string]locator)
 	for _, seg := range victims {
-		seg.kvs.RLock()
-		for key, pos := range seg.kvs.Index {
+		seg.eachKey(func(key string, pos int64) bool {
 			if _, ok := live[key]; !ok {
 				live[key] = locator{seg: seg, pos: pos}
 			}
-		}
-		seg.kvs.RUnlock()
-	}
-
-	var size int64
-	for _, seg := range victims {
-		size += seg.kvs.Size()
-	}
-	data := make([]byte, 0, size)
-
-	// Oldest first, so the merged log keeps the order the records were written
-	// in and merging the same logs twice produces the same bytes.
-	var err error
-	for i := len(victims) - 1; i >= 0; i-- {
-		seg := victims[i]
-
-		seg.kvs.RLock()
-		scanErr := seg.kvs.scan(func(pos, next int64, r Record) bool {
-			// Deleted keys are dropped outright: every log that could hold the
-			// value the tombstone hides is part of this merge.
-			if r.Type != RecordTypeNormal {
-				return true
-			}
-			if loc, ok := live[string(r.Key)]; ok && loc.seg == seg && loc.pos == pos {
-				data = append(data, seg.kvs.Data[pos:next]...)
-			}
 			return true
 		})
-		seg.kvs.RUnlock()
-
-		if scanErr != nil {
-			err = scanErr
-			break
-		}
 	}
 
-	return data, err
-}
-
-func writeFileSynced(path string, data []byte) error {
 	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
 
-	if _, err := file.Write(data); err != nil {
-		file.Close()
-		os.Remove(path)
-		return err
-	}
-	if err := file.Sync(); err != nil {
+	failed := func(err error) error {
 		file.Close()
 		os.Remove(path)
 		return err
 	}
 
+	writer := bufio.NewWriterSize(file, 64<<10)
+
+	// Oldest first, so the merged log keeps the order the records were written
+	// in and merging the same logs twice produces the same bytes.
+	for i := len(victims) - 1; i >= 0; i-- {
+		seg := victims[i]
+
+		var writeErr error
+		scanErr := seg.scan(func(pos int64, raw []byte, r Record) bool {
+			// Deleted keys are dropped outright: every log that could hold the
+			// value a tombstone hides is part of this merge.
+			if r.Type != RecordTypeNormal {
+				return true
+			}
+			if loc, ok := live[string(r.Key)]; !ok || loc.seg != seg || loc.pos != pos {
+				return true
+			}
+			if _, err := writer.Write(raw); err != nil {
+				writeErr = err
+				return false
+			}
+			return true
+		})
+
+		if scanErr != nil {
+			return failed(scanErr)
+		}
+		if writeErr != nil {
+			return failed(writeErr)
+		}
+	}
+
+	if err := writer.Flush(); err != nil {
+		return failed(err)
+	}
+	if err := file.Sync(); err != nil {
+		return failed(err)
+	}
 	return file.Close()
 }
 
@@ -609,17 +616,17 @@ func (db *DB) Sync() error {
 		return nil
 	}
 
-	var err error
-	for _, seg := range db.searchOrder() {
-		if serr := seg.kvs.Sync(); err == nil {
-			err = serr
-		}
+	// Only the active log can be holding anything unsynced; a frozen one is
+	// never written.
+	if db.active == nil {
+		return nil
 	}
-	return err
+	return db.active.sync()
 }
 
 // Close waits for a running merge and closes every log. A closed DB refuses
-// writes, and goes on serving reads from memory.
+// everything: the values of its frozen logs are on the disk, and their files
+// are shut. Len and Segments still report what it was holding.
 func (db *DB) Close() error {
 	db.mu.Lock()
 	if db.closed {
@@ -646,10 +653,10 @@ func (db *DB) closeSegments() error {
 	var err error
 
 	if db.active != nil {
-		err = db.active.kvs.Close()
+		err = db.active.close()
 	}
 	for _, seg := range db.frozen {
-		if cerr := seg.kvs.Close(); err == nil {
+		if cerr := seg.close(); err == nil {
 			err = cerr
 		}
 	}

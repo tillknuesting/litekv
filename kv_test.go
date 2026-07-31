@@ -293,33 +293,45 @@ func TestKeyValueStore_CompactPreservesOrder(t *testing.T) {
 }
 
 func TestKeyValueStore_RebuildIndex(t *testing.T) {
-	// TODO: Refactor test to consider more cases
 	kvs := &KeyValueStore{}
-
 	kvs.Write([]byte("foo"), []byte("bar"))
 	kvs.Write([]byte("foo2"), []byte("bar2"))
 	kvs.Write([]byte("foo3"), []byte("bar3"))
+	kvs.Write([]byte("foo"), []byte("updated"))
+	kvs.Delete([]byte("foo3"))
 
-	fmt.Println("kvs.Index", kvs.Index)
+	before := make(map[string]int64, len(kvs.Index))
+	for key, pos := range kvs.Index {
+		before[key] = pos
+	}
 
-	kvsTemp := kvs.Index
 	kvs.Index = nil
+	if err := kvs.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
 
-	kvs.RebuildIndex()
+	if len(kvs.Index) != len(before) {
+		t.Errorf("rebuilt %d keys, want %d", len(kvs.Index), len(before))
+	}
+	for key, want := range before {
+		got, ok := kvs.Index[key]
+		if !ok {
+			t.Errorf("key %q is missing after the rebuild", key)
+		} else if got != want {
+			t.Errorf("key %q: offset %d after the rebuild, was %d", key, got, want)
+		}
+	}
 
-	if kvs.Index == nil {
-		t.Errorf("Index is nil")
-	} else if len(kvsTemp) != len(kvsTemp) {
-		t.Errorf("Index is not equal to kvsTemp")
-	} else if kvs.Index["foo"] != kvsTemp["foo"] {
-		t.Errorf("Index is not equal to kvsTemp")
-	} else if kvs.Index["foo2"] != kvsTemp["foo2"] {
-		t.Errorf("Index is not equal to kvsTemp")
+	// Every key has to point at its newest record, tombstones included.
+	value, err := kvs.Read([]byte("foo"))
+	if err != nil || string(value) != "updated" {
+		t.Errorf("foo: got '%s' (%v), want 'updated'", value, err)
+	}
+	if _, err := kvs.Read([]byte("foo3")); !errors.Is(err, ErrorKeyDeleted) {
+		t.Errorf("foo3: expected '%v', got '%v'", ErrorKeyDeleted, err)
 	}
 }
 
-// TestKeyValueStore_BinaryFormatUnchanged pins the on-disk layout, so that a
-// store written by an older version of the library still reads back.
 func TestKeyValueStore_BinaryFormatUnchanged(t *testing.T) {
 	const golden = "0923b16f000300000003000000666f6f626172" + // write foo=bar
 		"e5c4912e0001000000000000006b" + // write k=
