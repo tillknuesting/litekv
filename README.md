@@ -1,7 +1,7 @@
 # LiteKV
 LiteKV is a simple, lightweight, and efficient in-memory key-value store written in Go.
 It supports basic operations like reading, writing, deleting, and updating key-value pairs,
-as well as advanced features like exporting and importing index, rebuilding index,
+as well as prefix queries over an ordered index, exporting and importing that index, rebuilding it,
 and compacting the store. LiteKV uses an append-only data structure,
 which provides better write performance and data durability.
 
@@ -43,6 +43,44 @@ or inconsistencies in the data. Keys and values are limited to 4 GiB by the uint
 `Write` returns `ErrorRecordTooLarge` for anything larger. Every decode validates the declared lengths
 against the bytes actually present, so a truncated or damaged store produces an error rather than a
 panic or an outsized allocation.
+
+### Index
+
+The index is a radix tree mapping each key to the offset of its newest record. It holds no key bytes of
+its own: every key is already in the data, so a node records where its slice of the key lives rather
+than copying it, which is why indexing a key allocates no key bytes and why the tree survives the
+reallocation an append can cause. The consequence is that a tree only means anything alongside the exact
+data its offsets came from, so replacing `Data` means calling `RebuildIndex`.
+
+The tree is there for `PrefixScan`. It is not a faster hash table, and replacing the map with it cost
+speed on the operations a map is good at:
+
+| operation                   | map      | radix tree | |
+| --------------------------- | -------- | ---------- | --- |
+| prefix query, 10 of 100k keys | 984 µs | 179 ns     | **5500x faster** |
+| index lookup, 100k keys     | 10.0 ns  | 48.6 ns    | 4.9x slower |
+| index lookup, random keys   | 10.2 ns  | 109.6 ns   | 10.7x slower |
+| `Read`, 16-byte value       | 37.4 ns  | 62.6 ns    | 1.7x slower |
+| `Write`, existing key       | 58.1 ns  | 50.8 ns    | 1.14x faster |
+| `Write`, new key            | 69.1 ns  | 86.3 ns    | 1.25x slower |
+
+A hash table computes one hash and probes one bucket, whichever key it is given. A radix tree walks down
+one node per branching point in the key, and each step is a dependent load the processor cannot start
+until the previous one lands, so the cost is cache misses that no amount of tuning removes. That is the
+trade: point lookups get slower, and prefix queries stop costing a full scan of the store. Keys that
+diverge early, like random ones, make the tree deepest and the gap widest.
+
+Memory per key, 100k keys, counting the key copies a map has to make and the tree does not:
+
+| keys                             | map     | radix tree |
+| -------------------------------- | ------- | ---------- |
+| `user:00000001:profile` (21 B)   | 59 B    | 82 B       |
+| `/var/log/service-3/17.log` (24 B) | 67 B  | 93 B       |
+| 90-byte paths sharing 80 bytes   | 131 B   | 82 B       |
+| 20 random bytes                  | 59 B    | 89 B       |
+
+The tree only comes out ahead once keys are long enough that the prefixes it shares outweigh the 48 bytes
+a node costs. For short keys it is the larger of the two.
 
 LiteKV uses byte slices as the underlying data format for storing key-value pairs. Byte slices offer
 versatility and flexibility, making it easier to perform various operations such as saving data to disk or using POSIX shared memory.
@@ -128,6 +166,17 @@ err := kvs.View([]byte("foo"), func(value []byte) error {
     return err
 })
 ```
+
+To find every key under a prefix, in ascending byte order:
+```go
+err := kvs.PrefixScan([]byte("user:"), func(key, value []byte) bool {
+    fmt.Printf("%s = %s\n", key, value)
+    return true // return false to stop early
+})
+```
+Superseded and deleted records are skipped, so `PrefixScan` shows what `Read` would return. Its cost is
+proportional to the number of keys that match, not to the number the store holds. The key and value
+alias the store's data and are only valid until the callback returns.
 
 To walk the store without printing it:
 ```go
