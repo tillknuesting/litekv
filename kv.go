@@ -92,19 +92,18 @@ func (e *CorruptAtError) Error() string {
 func (e *CorruptAtError) Is(target error) bool { return target == ErrorCorruptData }
 
 // KeyValueStore is a simple key-value store implementation.
-// It utilizes a byte slice (Data) to store serialized records and a radix tree (Index) to map keys to their position in the Data byte slice.
+// It utilizes a byte slice (Data) to store serialized records and a map (Index) to map keys to their position in the Data byte slice.
 // The KeyValueStore struct also embeds a reader-writer lock to ensure thread safety during concurrent read and write operations.
 //
 // Data and Index are exported so that the store can be backed by a file or by
 // POSIX shared memory. Callers that touch them directly must hold the embedded
-// lock, and must call RebuildIndex after replacing Data: the Index refers to
-// the key bytes by their position in Data rather than holding a copy of them.
+// lock, and must call RebuildIndex after replacing Data.
 //
 // The zero value is ready to use, and a store must not be copied once used.
 type KeyValueStore struct {
-	shardedRWMutex        // Embed the lock to ensure thread safety during concurrent read and write operations.
-	Data           []byte // A byte slice that holds the serialized records.
-	Index          Tree   // A radix tree that maps keys to their position in the Data byte slice.
+	shardedRWMutex                  // Embed the lock to ensure thread safety during concurrent read and write operations.
+	Data           []byte           // A byte slice that holds the serialized records.
+	Index          map[string]int64 // A map that maps keys (as strings) to their position in the Data byte slice.
 }
 
 // maxShards bounds the read side of the store's lock.
@@ -225,11 +224,12 @@ func (kvs *KeyValueStore) Write(key, value []byte) error {
 	kvs.Lock()
 	defer kvs.Unlock()
 
-	// Append first: the index refers to the key bytes where they land in Data
-	// rather than keeping a copy of them.
-	pos := int64(len(kvs.Data))
+	if kvs.Index == nil {
+		kvs.Index = make(map[string]int64)
+	}
+
+	kvs.Index[string(key)] = int64(len(kvs.Data))
 	kvs.Data = record.appendTo(kvs.Data)
-	kvs.Index.Insert(kvs.Data, pos+headerSize, len(key), pos)
 	return nil
 }
 
@@ -275,7 +275,7 @@ func (kvs *KeyValueStore) View(key []byte, fn func(value []byte) error) error {
 // it lands on. The returned slice aliases Data. Callers must hold at least a
 // read lock.
 func (kvs *KeyValueStore) lookup(key []byte) ([]byte, error) {
-	pos, exists := kvs.Index.Lookup(kvs.Data, key)
+	pos, exists := kvs.Index[string(key)]
 	if !exists {
 		return nil, ErrorKeyNotFound
 	}
@@ -323,9 +323,12 @@ func (kvs *KeyValueStore) Delete(key []byte) error {
 	kvs.Lock()
 	defer kvs.Unlock()
 
-	pos := int64(len(kvs.Data))
+	if kvs.Index == nil {
+		kvs.Index = make(map[string]int64)
+	}
+
+	kvs.Index[string(key)] = int64(len(kvs.Data))
 	kvs.Data = record.appendTo(kvs.Data)
-	kvs.Index.Insert(kvs.Data, pos+headerSize, len(key), pos)
 	return nil
 }
 
@@ -476,34 +479,15 @@ func (kvs *KeyValueStore) keyAt(pos int64) []byte {
 	return kvs.Data[pos+headerSize : pos+headerSize+keyLen]
 }
 
-// SaveIndex serializes the KeyValueStore's Index (the keys and their position in the Data byte slice)
+// SaveIndex serializes the KeyValueStore's Index (a map of keys to their position in the Data byte slice)
 // using the gob package, and returns the serialized Index as a byte slice.
 // This method can be used to persist the Index to disk or another storage medium, for later restoration.
-//
-// The serialized form is a map of key to offset, unchanged from when the Index
-// itself was a map, so an index saved by an older version still loads.
 func (kvs *KeyValueStore) SaveIndex() ([]byte, error) {
 	kvs.RLock()
 	defer kvs.RUnlock()
 
-	index := make(map[string]int64, kvs.Index.Len())
-
-	var walkErr error
-	kvs.Index.WalkPrefix(kvs.Data, nil, func(pos int64) bool {
-		record, _, err := parseRecordAt(kvs.Data, pos)
-		if err != nil {
-			walkErr = err
-			return false
-		}
-		index[string(record.Key)] = pos
-		return true
-	})
-	if walkErr != nil {
-		return nil, walkErr
-	}
-
 	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(index); err != nil {
+	if err := gob.NewEncoder(&buf).Encode(kvs.Index); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
@@ -527,10 +511,6 @@ func (kvs *KeyValueStore) LoadIndex(data []byte) error {
 	kvs.Lock()
 	defer kvs.Unlock()
 
-	// Check every entry before building anything: an entry that does not point
-	// at a record holding that key would index key bytes the tree cannot find
-	// again, on top of turning reads into wrong answers.
-	var tree Tree
 	for key, pos := range index {
 		record, _, err := parseRecordAt(kvs.Data, pos)
 		if err != nil {
@@ -539,10 +519,9 @@ func (kvs *KeyValueStore) LoadIndex(data []byte) error {
 		if string(record.Key) != key {
 			return fmt.Errorf("index entry %q points at record %q: %w", key, record.Key, ErrorKeyMismatch)
 		}
-		tree.Insert(kvs.Data, pos+headerSize, len(key), pos)
 	}
 
-	kvs.Index = tree
+	kvs.Index = index
 	return nil
 }
 
@@ -585,6 +564,27 @@ func (kvs *KeyValueStore) latestOffsets() (map[string]int64, error) {
 	return latest, nil
 }
 
+// findLatestRecords returns the newest live record for each key in the store.
+// The Key and Value of each returned record alias the Data slice.
+// Callers must hold at least a read lock.
+func (kvs *KeyValueStore) findLatestRecords() (map[string]*Record, error) {
+	latest, err := kvs.latestOffsets()
+	if err != nil {
+		return nil, err
+	}
+
+	records := make(map[string]*Record, len(latest))
+	for key, pos := range latest {
+		record, _, err := parseRecordAt(kvs.Data, pos)
+		if err != nil {
+			return nil, err
+		}
+		records[key] = &record
+	}
+
+	return records, nil
+}
+
 // Compact iterates through the KeyValueStore's Data byte slice, identifies the latest record for each key,
 // and rebuilds the Data slice and Index, dropping superseded records and deleted keys.
 // This method is useful for reducing the storage size and improving the performance of the KeyValueStore.
@@ -611,7 +611,7 @@ func (kvs *KeyValueStore) Compact() error {
 	}
 
 	data := make([]byte, 0, total)
-	var index Tree
+	index := make(map[string]int64, len(latest))
 
 	// Walk the Data slice a second time instead of ranging over the map, so that
 	// the compacted layout does not depend on Go's map iteration order. Surviving
@@ -623,9 +623,8 @@ func (kvs *KeyValueStore) Compact() error {
 		if survivor, ok := latest[string(r.Key)]; !ok || survivor != pos {
 			return true
 		}
-		moved := int64(len(data))
+		index[string(r.Key)] = int64(len(data))
 		data = append(data, kvs.Data[pos:next]...)
-		index.Insert(data, moved+headerSize, len(r.Key), moved)
 		return true
 	})
 	if err != nil {
@@ -649,14 +648,16 @@ func (kvs *KeyValueStore) RebuildIndex() error {
 	kvs.Lock()
 	defer kvs.Unlock()
 
-	// Forwards, so that a later record supersedes an earlier one with the same
-	// key. Re-indexing a key already in the tree costs a walk and no allocation,
-	// so duplicates need no special handling.
-	var index Tree
-	err := kvs.scan(func(pos, _ int64, r Record) bool {
-		index.Insert(kvs.Data, pos+headerSize, len(r.Key), pos)
-		return true
-	})
+	offs, err := kvs.offsets()
+
+	// Backwards, so that each key is inserted once: see offsets.
+	index := make(map[string]int64)
+	for i := len(offs) - 1; i >= 0; i-- {
+		key := kvs.keyAt(offs[i])
+		if _, seen := index[string(key)]; !seen {
+			index[string(key)] = offs[i]
+		}
+	}
 
 	kvs.Index = index
 	return err
@@ -696,39 +697,6 @@ func (kvs *KeyValueStore) ForEach(fn func(key, value []byte, deleted bool) bool)
 	return kvs.scan(func(_, _ int64, r Record) bool {
 		return fn(r.Key, r.Value, r.Type == RecordTypeDeleted)
 	})
-}
-
-// PrefixScan calls fn for every live key that starts with prefix, in ascending
-// byte order, stopping early if fn returns false. An empty prefix visits every
-// live key. Superseded records and deleted keys are skipped, so what fn sees is
-// what Read would return.
-//
-// This is what the radix tree buys over the map that used to index the store:
-// the cost is proportional to the number of keys that match rather than to the
-// number of keys held. The key and value passed to fn alias the Data slice and
-// are only valid until fn returns.
-func (kvs *KeyValueStore) PrefixScan(prefix []byte, fn func(key, value []byte) bool) error {
-	kvs.RLock()
-	defer kvs.RUnlock()
-
-	var err error
-	kvs.Index.WalkPrefix(kvs.Data, prefix, func(pos int64) bool {
-		record, next, parseErr := parseRecordAt(kvs.Data, pos)
-		if parseErr != nil {
-			err = parseErr
-			return false
-		}
-		if record.Crc != checksumSerialized(kvs.Data[pos:next]) {
-			err = fmt.Errorf("record at offset %d: %w", pos, ErrorChecksumMismatch)
-			return false
-		}
-		if record.Type != RecordTypeNormal {
-			return true
-		}
-		return fn(record.Key, record.Value)
-	})
-
-	return err
 }
 
 // PrintAllKeyValuePairs iterates through the KeyValueStore's Data byte slice, deserializes each record,

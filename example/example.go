@@ -104,21 +104,4 @@ func main() {
 	if err != nil {
 		log.Fatalln(err)
 	}
-
-	// Find every key under a prefix. The index is a radix tree, so this costs
-	// what the matches cost rather than a walk of the whole store.
-	for _, key := range []string{"user:1", "user:2", "session:1"} {
-		if err := kvs.Write([]byte(key), []byte("v-"+key)); err != nil {
-			log.Fatalln(err)
-		}
-	}
-
-	fmt.Println("Keys under user::")
-	err = kvs.PrefixScan([]byte("user:"), func(key, value []byte) bool {
-		fmt.Printf("  %s = %s\n", key, value)
-		return true
-	})
-	if err != nil {
-		log.Fatalln(err)
-	}
 }

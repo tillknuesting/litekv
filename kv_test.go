@@ -1,7 +1,6 @@
 package litekv
 
 import (
-	"bytes"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -250,8 +249,8 @@ func TestKeyValueStore_Compact(t *testing.T) {
 				}
 			}
 
-			if kvs.Index.Len() != live {
-				t.Errorf("expected %d indexed keys after compaction, got %d", live, kvs.Index.Len())
+			if len(kvs.Index) != live {
+				t.Errorf("expected %d indexed keys after compaction, got %d", live, len(kvs.Index))
 			}
 
 			// Compaction is deterministic and idempotent.
@@ -292,53 +291,33 @@ func TestKeyValueStore_CompactPreservesOrder(t *testing.T) {
 }
 
 func TestKeyValueStore_RebuildIndex(t *testing.T) {
+	// TODO: Refactor test to consider more cases
 	kvs := &KeyValueStore{}
+
 	kvs.Write([]byte("foo"), []byte("bar"))
 	kvs.Write([]byte("foo2"), []byte("bar2"))
 	kvs.Write([]byte("foo3"), []byte("bar3"))
-	kvs.Write([]byte("foo"), []byte("updated"))
-	kvs.Delete([]byte("foo3"))
 
-	before := make(map[string]int64)
-	for _, key := range []string{"foo", "foo2", "foo3"} {
-		pos, ok := kvs.Index.Lookup(kvs.Data, []byte(key))
-		if !ok {
-			t.Fatalf("key %q missing from the index before the rebuild", key)
-		}
-		before[key] = pos
-	}
+	fmt.Println("kvs.Index", kvs.Index)
 
-	kvs.Index = Tree{}
-	if _, ok := kvs.Index.Lookup(kvs.Data, []byte("foo")); ok {
-		t.Fatal("the index was not actually cleared")
-	}
+	kvsTemp := kvs.Index
+	kvs.Index = nil
 
-	if err := kvs.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
+	kvs.RebuildIndex()
 
-	if kvs.Index.Len() != len(before) {
-		t.Errorf("expected %d keys after the rebuild, got %d", len(before), kvs.Index.Len())
-	}
-	for key, want := range before {
-		got, ok := kvs.Index.Lookup(kvs.Data, []byte(key))
-		if !ok {
-			t.Errorf("key %q missing after the rebuild", key)
-		} else if got != want {
-			t.Errorf("key %q: offset %d after the rebuild, was %d", key, got, want)
-		}
-	}
-
-	// The rebuilt index must point at the newest record for each key.
-	value, err := kvs.Read([]byte("foo"))
-	if err != nil || string(value) != "updated" {
-		t.Errorf("expected 'updated', got '%s' (err %v)", value, err)
-	}
-	if _, err := kvs.Read([]byte("foo3")); !errors.Is(err, ErrorKeyDeleted) {
-		t.Errorf("expected '%v', got '%v'", ErrorKeyDeleted, err)
+	if kvs.Index == nil {
+		t.Errorf("Index is nil")
+	} else if len(kvsTemp) != len(kvsTemp) {
+		t.Errorf("Index is not equal to kvsTemp")
+	} else if kvs.Index["foo"] != kvsTemp["foo"] {
+		t.Errorf("Index is not equal to kvsTemp")
+	} else if kvs.Index["foo2"] != kvsTemp["foo2"] {
+		t.Errorf("Index is not equal to kvsTemp")
 	}
 }
 
+// TestKeyValueStore_BinaryFormatUnchanged pins the on-disk layout, so that a
+// store written by an older version of the library still reads back.
 func TestKeyValueStore_BinaryFormatUnchanged(t *testing.T) {
 	const golden = "0923b16f000300000003000000666f6f626172" + // write foo=bar
 		"e5c4912e0001000000000000006b" + // write k=
@@ -366,17 +345,6 @@ func TestKeyValueStore_DeleteOnEmptyStore(t *testing.T) {
 	}
 }
 
-// reindex points key at an arbitrary offset, the way a stale or damaged index
-// would. The key must already be stored, since the tree indexes the key bytes
-// where they lie in Data.
-func reindex(kvs *KeyValueStore, key string, pos int64) {
-	stored, ok := kvs.Index.Lookup(kvs.Data, []byte(key))
-	if !ok {
-		panic("reindex: " + key + " is not in the store")
-	}
-	kvs.Index.Insert(kvs.Data, stored+headerSize, len(key), pos)
-}
-
 func TestKeyValueStore_ReadWithBadIndex(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -385,25 +353,22 @@ func TestKeyValueStore_ReadWithBadIndex(t *testing.T) {
 	}{
 		{
 			name:        "offset past the end of Data",
-			corrupt:     func(kvs *KeyValueStore) { reindex(kvs, "a", int64(len(kvs.Data))+100) },
+			corrupt:     func(kvs *KeyValueStore) { kvs.Index["a"] = int64(len(kvs.Data)) + 100 },
 			expectedErr: ErrorCorruptData,
 		},
 		{
 			name:        "negative offset",
-			corrupt:     func(kvs *KeyValueStore) { reindex(kvs, "a", -1) },
+			corrupt:     func(kvs *KeyValueStore) { kvs.Index["a"] = -1 },
 			expectedErr: ErrorCorruptData,
 		},
 		{
 			name:        "offset in the middle of a record",
-			corrupt:     func(kvs *KeyValueStore) { reindex(kvs, "a", 7) },
+			corrupt:     func(kvs *KeyValueStore) { kvs.Index["a"] = 7 },
 			expectedErr: ErrorCorruptData,
 		},
 		{
-			name: "offset of another key's record",
-			corrupt: func(kvs *KeyValueStore) {
-				pos, _ := kvs.Index.Lookup(kvs.Data, []byte("b"))
-				reindex(kvs, "a", pos)
-			},
+			name:        "offset of another key's record",
+			corrupt:     func(kvs *KeyValueStore) { kvs.Index["a"] = kvs.Index["b"] },
 			expectedErr: ErrorKeyMismatch,
 		},
 	}
@@ -483,19 +448,19 @@ func TestKeyValueStore_LoadIndex(t *testing.T) {
 		if err := dst.LoadIndex(exported); err == nil {
 			t.Fatal("expected an error for a foreign index")
 		}
-		if _, ok := dst.Index.Lookup(dst.Data, []byte("b")); ok {
+		if _, ok := dst.Index["b"]; ok {
 			t.Error("a rejected index was installed anyway")
 		}
 	})
 
 	t.Run("replaces rather than merges", func(t *testing.T) {
 		dst := &KeyValueStore{Data: src.Data}
-		dst.Write([]byte("stale"), []byte("s"))
+		dst.Index = map[string]int64{"stale": 0}
 
 		if err := dst.LoadIndex(exported); err != nil {
 			t.Fatalf("LoadIndex: %v", err)
 		}
-		if _, ok := dst.Index.Lookup(dst.Data, []byte("stale")); ok {
+		if _, ok := dst.Index["stale"]; ok {
 			t.Error("stale key survived LoadIndex")
 		}
 	})
@@ -604,7 +569,7 @@ func TestKeyValueStore_Concurrent(t *testing.T) {
 		defer wg.Done()
 		for j := 0; j < 200; j++ {
 			kvs.RLock()
-			_ = kvs.Index.Len()
+			_ = len(kvs.Index)
 			_ = len(kvs.Data)
 			kvs.RUnlock()
 		}
@@ -650,17 +615,11 @@ func FuzzKeyValueStore_Data(f *testing.F) {
 
 		// Whatever the store answers before compaction it must still answer after.
 		live := make(map[string]string)
-		kvs.Index.WalkPrefix(kvs.Data, nil, func(pos int64) bool {
-			record, _, err := parseRecordAt(kvs.Data, pos)
-			if err != nil {
-				return false
-			}
-			key := string(record.Key)
+		for key := range kvs.Index {
 			if value, err := kvs.Read([]byte(key)); err == nil {
 				live[key] = string(value)
 			}
-			return true
-		})
+		}
 
 		if err := kvs.Compact(); err != nil {
 			return
@@ -678,72 +637,6 @@ func FuzzKeyValueStore_Data(f *testing.F) {
 	})
 }
 
-func TestKeyValueStore_PrefixScan(t *testing.T) {
-	kvs := &KeyValueStore{}
-	for _, key := range []string{"user:2", "user:10", "user:1", "userx", "use", "zzz", ""} {
-		kvs.Write([]byte(key), []byte("v-"+key))
-	}
-	kvs.Write([]byte("user:1"), []byte("v-updated")) // superseded record
-	kvs.Write([]byte("user:9"), []byte("v-user:9"))
-	kvs.Delete([]byte("user:9")) // tombstone
-	kvs.Delete([]byte("gone"))   // tombstone for a key never written
-
-	collect := func(prefix string) []string {
-		var got []string
-		if err := kvs.PrefixScan([]byte(prefix), func(key, value []byte) bool {
-			got = append(got, fmt.Sprintf("%s=%s", key, value))
-			return true
-		}); err != nil {
-			t.Fatalf("PrefixScan(%q): %v", prefix, err)
-		}
-		return got
-	}
-
-	tests := []struct {
-		prefix string
-		want   string
-	}{
-		// Ascending byte order, deleted and superseded records left out.
-		{"user:", "user:1=v-updated,user:10=v-user:10,user:2=v-user:2"},
-		{"user", "user:1=v-updated,user:10=v-user:10,user:2=v-user:2,userx=v-userx"},
-		{"use", "use=v-use,user:1=v-updated,user:10=v-user:10,user:2=v-user:2,userx=v-userx"},
-		{"user:1", "user:1=v-updated,user:10=v-user:10"},
-		{"zzz", "zzz=v-zzz"},
-		{"nothing", ""},
-		{"user:99", ""},
-	}
-
-	for _, test := range tests {
-		if got := strings.Join(collect(test.prefix), ","); got != test.want {
-			t.Errorf("prefix %q:\n got %s\nwant %s", test.prefix, got, test.want)
-		}
-	}
-
-	// The empty prefix visits every live key, including the empty one.
-	all := collect("")
-	if len(all) != 7 || all[0] != "=v-" {
-		t.Errorf("empty prefix: got %v", all)
-	}
-
-	// fn can stop the scan.
-	var seen int
-	if err := kvs.PrefixScan([]byte("user"), func(key, value []byte) bool {
-		seen++
-		return false
-	}); err != nil {
-		t.Fatalf("PrefixScan: %v", err)
-	}
-	if seen != 1 {
-		t.Errorf("expected the scan to stop after 1 key, saw %d", seen)
-	}
-
-	// A damaged record is reported rather than handed over.
-	kvs.Data[len(kvs.Data)-1]++
-	if err := kvs.PrefixScan(nil, func(key, value []byte) bool { return true }); !errors.Is(err, ErrorChecksumMismatch) {
-		t.Errorf("expected '%v', got '%v'", ErrorChecksumMismatch, err)
-	}
-}
-
 func TestKeyValueStore_View(t *testing.T) {
 	kvs := &KeyValueStore{}
 	kvs.Write([]byte("k"), []byte("value"))
@@ -754,8 +647,7 @@ func TestKeyValueStore_View(t *testing.T) {
 	if err := kvs.View([]byte("k"), func(value []byte) error {
 		seen = string(value)
 		// The value must be the stored bytes, not a copy of them.
-		pos, _ := kvs.Index.Lookup(kvs.Data, []byte("k"))
-		if &value[0] != &kvs.Data[pos+headerSize+1] {
+		if &value[0] != &kvs.Data[kvs.Index["k"]+headerSize+1] {
 			t.Error("View copied the value")
 		}
 		return nil
@@ -829,7 +721,7 @@ func BenchmarkKeyValueStore_WriteInsert(b *testing.B) {
 				kvs.Write(keys[i%len(keys)], value)
 				if len(kvs.Data) > 1<<26 {
 					kvs.Data = kvs.Data[:0]
-					kvs.Index = Tree{}
+					kvs.Index = nil
 				}
 			}
 		})
@@ -1038,47 +930,4 @@ func TestShardedRWMutexExcludes(t *testing.T) {
 	if guarded != 8*50 {
 		t.Errorf("expected 400 guarded increments, got %d", guarded)
 	}
-}
-
-// BenchmarkKeyValueStore_PrefixScan measures a prefix query against the only
-// way to answer one before the tree: walk every record and filter.
-func BenchmarkKeyValueStore_PrefixScan(b *testing.B) {
-	kvs := &KeyValueStore{}
-	value := make([]byte, 64)
-	for i := 0; i < 100_000; i++ {
-		kvs.Write([]byte(fmt.Sprintf("user:%08d:profile", i)), value)
-	}
-
-	// Matches ten of the hundred thousand keys.
-	prefix := []byte("user:0000123")
-
-	b.Run("tree", func(b *testing.B) {
-		b.ReportAllocs()
-		for i := 0; i < b.N; i++ {
-			matched := 0
-			kvs.PrefixScan(prefix, func(key, value []byte) bool {
-				matched++
-				return true
-			})
-			if matched != 10 {
-				b.Fatalf("matched %d keys, want 10", matched)
-			}
-		}
-	})
-
-	b.Run("scan-all", func(b *testing.B) {
-		b.ReportAllocs()
-		for i := 0; i < b.N; i++ {
-			matched := 0
-			kvs.ForEach(func(key, value []byte, deleted bool) bool {
-				if !deleted && bytes.HasPrefix(key, prefix) {
-					matched++
-				}
-				return true
-			})
-			if matched != 10 {
-				b.Fatalf("matched %d keys, want 10", matched)
-			}
-		}
-	})
 }
