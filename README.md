@@ -81,6 +81,70 @@ can raise `maxShards`, and a single-reader one can set it to 1.
 A hot key is still a hot shard: keys are spread by hash, so many readers of the *same* key contend
 exactly as before.
 
+### Durability
+
+The Data slice is the whole store, and nothing here is required: the zero value is an in-memory store
+that touches no disk, and `Data` is yours to save and restore however you like. There are three ways to
+work with it.
+
+Keep it in memory and handle persistence yourself:
+```go
+kvs := &litekv.KeyValueStore{}
+...
+os.WriteFile("store.kv", kvs.Data, 0o644) // whenever you want
+
+raw, _ := os.ReadFile("store.kv")
+restored := &litekv.KeyValueStore{Data: raw}
+discarded, err := restored.Recover() // rebuilds the index, drops a damaged tail
+```
+
+Let the store keep a file for you, so every write lands on disk as it happens:
+```go
+kvs, err := litekv.Open("store.kv", litekv.Options{Sync: litekv.SyncEvery, Interval: time.Second})
+defer kvs.Close()
+```
+
+Or mirror writes to something of your own — a network log, an encrypted file, shared memory — by
+implementing three methods:
+```go
+type Log interface {
+    WriteAt(p []byte, off int64) (int, error)
+    Truncate(size int64) error
+    Sync() error
+}
+
+kvs.Attach(myLog, litekv.Options{Sync: litekv.SyncNever})
+```
+An `*os.File` satisfies `Log` as it is. The store only appends, calls `WriteAt` with the offset of the
+end of the log, and holds its write lock while it does, so an implementation need not be safe for
+concurrent use. `Detach` puts the store back to memory only.
+
+#### When a write is really written
+
+`write()` returning is not durability — it means the operating system has your bytes, not the disk. That
+is the choice `SyncPolicy` makes, and it is expensive:
+
+| policy       | per write | survives a process crash | survives losing power |
+| ------------ | --------- | ------------------------ | --------------------- |
+| `SyncAlways` | 3.8 ms    | yes                      | yes                   |
+| `SyncEvery`  | 7.0 µs    | yes                      | all but the last interval |
+| `SyncNever`  | 5.5 µs    | yes                      | no promises           |
+| in memory    | 153 ns    | no                       | no                    |
+
+`SyncAlways` is the default, because losing an acknowledged write should be something you ask for rather
+than something that happens quietly. It is also 685x slower than not syncing, and every reader waits for
+it, since the sync happens under the write lock — there is no way to acknowledge a durable write without
+waiting for the disk. Those numbers are from an SSD on macOS, where `Sync` is a full barrier; an SD card
+in a Raspberry Pi is worse.
+
+A crash can leave a record half written at the end of the log. `Open` recovers, dropping everything from
+the first record that fails to decode or fails its checksum and truncating the file to match. Under
+`SyncAlways` such a record cannot have been acknowledged, because the acknowledgement waits for the sync;
+under the other policies it may have been, and that is exactly what they trade away.
+
+`Compact` rewrites the file as well as the memory, through a temporary file and a rename, so an
+interrupted compaction leaves either the whole old log or the whole new one.
+
 ### Recovering a damaged store
 
 `Verify` checks every record against its checksum. `RebuildIndex` reconstructs the index from `Data`;

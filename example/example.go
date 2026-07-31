@@ -3,6 +3,9 @@ package main
 import (
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
+	"time"
 
 	"github.com/tillknuesting/litekv"
 )
@@ -104,4 +107,63 @@ func main() {
 	if err != nil {
 		log.Fatalln(err)
 	}
+
+	durability()
+}
+
+// durability shows the two ways a store outlives the process: hand the Data
+// slice around yourself, or let the store keep a file.
+func durability() {
+	dir, err := os.MkdirTemp("", "litekv")
+	if err != nil {
+		log.Fatalln(err)
+	}
+	defer os.RemoveAll(dir)
+
+	path := filepath.Join(dir, "store.kv")
+
+	// A store that keeps a file. SyncEvery trades a bounded window of writes
+	// for not waiting on the disk every time; the default, SyncAlways, waits.
+	kvs, err := litekv.Open(path, litekv.Options{Sync: litekv.SyncEvery, Interval: time.Second})
+	if err != nil {
+		log.Fatalln(err)
+	}
+	if err := kvs.Write([]byte("persisted"), []byte("across restarts")); err != nil {
+		log.Fatalln(err)
+	}
+	// Close syncs whatever the timer has not.
+	if err := kvs.Close(); err != nil {
+		log.Fatalln(err)
+	}
+
+	reopened, err := litekv.Open(path, litekv.Options{})
+	if err != nil {
+		log.Fatalln(err)
+	}
+	defer reopened.Close()
+
+	v, err := reopened.Read([]byte("persisted"))
+	if err != nil {
+		log.Fatalln(err)
+	}
+	fmt.Println("after reopening, persisted =", string(v))
+
+	// The file is just the Data slice, so it can be loaded by hand instead.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	byHand := &litekv.KeyValueStore{Data: raw}
+	discarded, err := byHand.Recover()
+	if err != nil {
+		log.Fatalln(err)
+	}
+	fmt.Printf("loaded %d bytes by hand, discarded %d\n", len(raw), discarded)
+
+	v, err = byHand.Read([]byte("persisted"))
+	if err != nil {
+		log.Fatalln(err)
+	}
+	fmt.Println("read from the loaded slice:", string(v))
 }
