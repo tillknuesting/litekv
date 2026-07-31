@@ -560,27 +560,6 @@ func (kvs *KeyValueStore) latestOffsets() (map[string]int64, error) {
 	return latest, nil
 }
 
-// findLatestRecords returns the newest live record for each key in the store.
-// The Key and Value of each returned record alias the Data slice.
-// Callers must hold at least a read lock.
-func (kvs *KeyValueStore) findLatestRecords() (map[string]*Record, error) {
-	latest, err := kvs.latestOffsets()
-	if err != nil {
-		return nil, err
-	}
-
-	records := make(map[string]*Record, len(latest))
-	for key, pos := range latest {
-		record, _, err := parseRecordAt(kvs.Data, pos)
-		if err != nil {
-			return nil, err
-		}
-		records[key] = &record
-	}
-
-	return records, nil
-}
-
 // Compact iterates through the KeyValueStore's Data byte slice, identifies the latest record for each key,
 // and rebuilds the Data slice and Index, dropping superseded records and deleted keys.
 // This method is useful for reducing the storage size and improving the performance of the KeyValueStore.

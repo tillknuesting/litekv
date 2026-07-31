@@ -697,3 +697,160 @@ func TestUnclosedStoreSurvives(t *testing.T) {
 		})
 	}
 }
+
+// failLog fails whichever operation it is told to.
+type failLog struct {
+	memLog
+	failTruncate bool
+	failSync     bool
+}
+
+func (f *failLog) Truncate(size int64) error {
+	if f.failTruncate {
+		return errLogFull
+	}
+	return f.memLog.Truncate(size)
+}
+
+func (f *failLog) Sync() error {
+	if f.failSync {
+		return errLogFull
+	}
+	return f.memLog.Sync()
+}
+
+func TestOpenErrors(t *testing.T) {
+	dir := t.TempDir()
+
+	t.Run("path is a directory", func(t *testing.T) {
+		if _, err := Open(dir, Options{}); err == nil {
+			t.Error("opening a directory as a store should fail")
+		}
+	})
+
+	t.Run("path does not exist", func(t *testing.T) {
+		if _, err := Open(filepath.Join(dir, "no", "such", "dir", "kv"), Options{}); err == nil {
+			t.Error("opening a store under a missing directory should fail")
+		}
+	})
+}
+
+func TestRecoverReportsLogFailure(t *testing.T) {
+	kvs := &KeyValueStore{}
+	kvs.Write([]byte("a"), []byte("1"))
+	kvs.Write([]byte("b"), []byte("2"))
+
+	log := &failLog{}
+	if err := kvs.Attach(log, Options{Sync: SyncNever}); err != nil {
+		t.Fatal(err)
+	}
+	if err := kvs.Rewrite(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Damage the last record, then refuse to truncate the log.
+	kvs.Data[len(kvs.Data)-1]++
+	log.failTruncate = true
+
+	discarded, err := kvs.Recover()
+	if !errors.Is(err, errLogFull) {
+		t.Errorf("expected the log's error, got '%v'", err)
+	}
+	if discarded == 0 {
+		t.Error("Recover reported nothing discarded despite the damage")
+	}
+	// The in-memory side was still recovered.
+	if _, err := kvs.Read([]byte("b")); !errors.Is(err, ErrorKeyNotFound) {
+		t.Errorf("the damaged record survived in memory: %v", err)
+	}
+}
+
+func TestCompactReportsLogFailure(t *testing.T) {
+	log := &failLog{}
+	kvs := &KeyValueStore{}
+	if err := kvs.Attach(log, Options{Sync: SyncNever}); err != nil {
+		t.Fatal(err)
+	}
+
+	kvs.Write([]byte("a"), []byte("1"))
+	kvs.Write([]byte("a"), []byte("2"))
+
+	log.failSync = true
+	if err := kvs.Compact(); !errors.Is(err, errLogFull) {
+		t.Errorf("expected the log's error, got '%v'", err)
+	}
+
+	// Compaction still happened in memory, and the store still answers.
+	if value, err := kvs.Read([]byte("a")); err != nil || string(value) != "2" {
+		t.Errorf("a: got '%s' (err %v), want '2'", value, err)
+	}
+}
+
+func TestRewriteOnClosedStore(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "kv")
+	kvs, err := Open(path, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kvs.Write([]byte("a"), []byte("1"))
+	kvs.Close()
+
+	if err := kvs.Rewrite(); !errors.Is(err, ErrorClosed) {
+		t.Errorf("expected '%v', got '%v'", ErrorClosed, err)
+	}
+	if err := kvs.Compact(); !errors.Is(err, ErrorClosed) {
+		t.Errorf("Compact on a closed store: expected '%v', got '%v'", ErrorClosed, err)
+	}
+}
+
+func TestRewriteFileFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "kv")
+
+	kvs, err := Open(path, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer kvs.Close()
+	kvs.Write([]byte("a"), []byte("1"))
+
+	// A directory that cannot be written to has nowhere for the temporary file
+	// the rewrite goes through.
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Skipf("cannot make the directory read only: %v", err)
+	}
+	defer os.Chmod(dir, 0o755)
+
+	if err := kvs.Rewrite(); err == nil {
+		t.Error("rewriting into a read-only directory should fail")
+	}
+
+	// The store is untouched and the old file is still there.
+	if value, err := kvs.Read([]byte("a")); err != nil || string(value) != "1" {
+		t.Errorf("a: got '%s' (err %v) after a failed rewrite", value, err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("the original file is gone: %v", err)
+	}
+}
+
+func TestDetachIsIdempotent(t *testing.T) {
+	kvs := &KeyValueStore{}
+	if err := kvs.Detach(); err != nil {
+		t.Errorf("detaching a store with no log: %v", err)
+	}
+
+	log := &memLog{}
+	kvs.Attach(log, Options{Sync: SyncNever})
+	if err := kvs.Detach(); err != nil {
+		t.Fatalf("Detach: %v", err)
+	}
+	if err := kvs.Detach(); err != nil {
+		t.Errorf("detaching twice: %v", err)
+	}
+
+	// A detached store can take a new log.
+	if err := kvs.Attach(&memLog{}, Options{Sync: SyncNever}); err != nil {
+		t.Errorf("attaching after Detach: %v", err)
+	}
+}
