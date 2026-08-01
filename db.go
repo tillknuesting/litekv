@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"iter"
 	"os"
 	"path/filepath"
 	"sort"
@@ -359,7 +360,7 @@ func (db *DB) Read(key []byte) ([]byte, error) {
 		return nil, ErrorClosed
 	}
 
-	for _, seg := range db.searchOrder() {
+	for seg := range db.searchOrder() {
 		value, err := seg.read(key)
 		// Anything but "this log has never heard of the key" is the answer,
 		// including a tombstone: a newer log's delete shadows an older value.
@@ -382,7 +383,7 @@ func (db *DB) View(key []byte, fn func(value []byte) error) error {
 		return ErrorClosed
 	}
 
-	for _, seg := range db.searchOrder() {
+	for seg := range db.searchOrder() {
 		err := seg.view(key, fn)
 		if !errors.Is(err, ErrorKeyNotFound) {
 			return err
@@ -392,16 +393,34 @@ func (db *DB) View(key []byte, fn func(value []byte) error) error {
 	return ErrorKeyNotFound
 }
 
-// searchOrder is the logs newest first. Callers must hold db.mu.
-func (db *DB) searchOrder() []readable {
-	order := make([]readable, 0, len(db.frozen)+1)
-	if db.active != nil {
-		order = append(order, db.active)
+// searchOrder yields the logs newest first, which is the order every lookup
+// goes in and the only thing deciding which version of a key wins. Callers must
+// hold db.mu for as long as they are ranging over it.
+//
+// It yields rather than returning a slice because building one allocated on
+// every read: 160 bytes and an allocation for a call that is otherwise a map
+// lookup and a copy, and for View, which exists precisely so that a read need
+// not allocate, it was the only allocation left. It also made a DB read worse
+// the more goroutines were reading, since what the allocator hands out on ten
+// cores it eventually has to collect on all of them.
+//
+// Nothing is cached here on purpose. The order has to track db.active and
+// db.frozen exactly, and a copy of it kept alongside them would be one more
+// thing to update in the four places those change — which is the shape of the
+// header-offset bug this package has already had twice.
+func (db *DB) searchOrder() iter.Seq[readable] {
+	return func(yield func(readable) bool) {
+		if db.active != nil {
+			if !yield(db.active) {
+				return
+			}
+		}
+		for _, seg := range db.frozen {
+			if !yield(seg) {
+				return
+			}
+		}
 	}
-	for _, seg := range db.frozen {
-		order = append(order, seg)
-	}
-	return order
 }
 
 // ForEach calls fn with every live key and its value, skipping the records that
@@ -418,7 +437,7 @@ func (db *DB) ForEach(fn func(key, value []byte) bool) error {
 	seen := make(map[string]bool)
 
 	var err error
-	for _, seg := range db.searchOrder() {
+	for seg := range db.searchOrder() {
 		stopped := false
 
 		seg.eachKey(func(key string, pos int64) bool {
@@ -462,7 +481,7 @@ func (db *DB) Len() int {
 	defer db.mu.RUnlock()
 
 	seen := make(map[string]bool)
-	for _, seg := range db.searchOrder() {
+	for seg := range db.searchOrder() {
 		seg.eachKey(func(key string, _ int64) bool {
 			seen[key] = true
 			return true

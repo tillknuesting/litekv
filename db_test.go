@@ -1093,10 +1093,11 @@ func TestDBReadsTheOldFormat(t *testing.T) {
 	}
 
 	// Old records have no timestamp and do not pretend otherwise.
+	// The lock is held across the walk, not just around taking the order:
+	// searchOrder reads the segment list as it yields rather than handing over
+	// a copy of it.
 	db.mu.RLock()
-	frozenOrActive := db.searchOrder()
-	db.mu.RUnlock()
-	for _, seg := range frozenOrActive {
+	for seg := range db.searchOrder() {
 		seg.eachKey(func(key string, pos int64) bool {
 			record, _, err := seg.recordAt(pos)
 			if err != nil {
@@ -1109,6 +1110,7 @@ func TestDBReadsTheOldFormat(t *testing.T) {
 			return true
 		})
 	}
+	db.mu.RUnlock()
 
 	// New records land beside the old ones, in the current layout.
 	for i := 0; i < 40; i++ {
