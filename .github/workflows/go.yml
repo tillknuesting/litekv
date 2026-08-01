@@ -32,9 +32,15 @@ jobs:
     - name: Test
       run: go test -race -v ./...
 
-    # A short run over both fuzz targets, enough to catch a corpus entry that
-    # has stopped passing. The long runs belong on a laptop, not in CI.
+    # A short run over each fuzz target, enough to catch a seed that has
+    # stopped passing. The long runs belong on a laptop, not in CI, and the
+    # corpus a long run builds up stays on that laptop: CI starts from the
+    # seeds in the code every time.
+    #
+    # Naming a target that does not exist is not an error to the go tool, only
+    # a warning, so a stale name here fuzzes nothing and says so quietly. Both
+    # of these are checked against the targets in the tests.
     - name: Fuzz
       run: |
-        go test -run xxx -fuzz FuzzTree -fuzztime 30s .
         go test -run xxx -fuzz FuzzKeyValueStore_Data -fuzztime 30s .
+        go test -run xxx -fuzz FuzzKeyValueStore_WriteReadDelete -fuzztime 30s .

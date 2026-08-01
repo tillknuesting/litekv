@@ -518,6 +518,12 @@ index rebuilds, and the cost of each sync policy.
 go test -run xxx -fuzz FuzzKeyValueStore_Data
 ```
 
+CI gives each target thirty seconds on every push, which catches a seed that has stopped passing but
+finds little on its own: the corpus a long run builds up lives in the local build cache, not in the
+repository, so CI starts from the seeds in the code every time. Finding anything new means running one
+for minutes on a laptop. A failure writes the input that caused it into `testdata/fuzz`, where it
+becomes a regression test and travels with the code.
+
 `FuzzKeyValueStore_Data` feeds arbitrary bytes in through the `Data` slice, which is how a store backed
 by a file or by shared memory is restored: no input may panic, hang, or make the store forget a key it
 had already returned. `FuzzKeyValueStore_WriteReadDelete` fuzzes the write path.
