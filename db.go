@@ -170,7 +170,7 @@ func (db *DB) pickMerge() (victims []*diskSegment, dropTombstones, ok bool) {
 // one with a record half written, which is recovered exactly as for a single
 // store, and can leave a half built merge behind, which is discarded.
 func OpenDB(dir string, opts DBOptions) (*DB, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := disk.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
 
@@ -237,7 +237,7 @@ func (db *DB) start(id uint64) error {
 
 // segmentIDs returns the ids of the logs in dir, oldest first.
 func segmentIDs(dir string) ([]uint64, error) {
-	entries, err := os.ReadDir(dir)
+	entries, err := disk.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -262,26 +262,35 @@ func segmentIDs(dir string) ([]uint64, error) {
 // removeStaleMerges clears what an interrupted merge left behind: its half
 // built log, and any hint whose log is no longer there.
 func (db *DB) removeStaleMerges() error {
-	matches, err := filepath.Glob(filepath.Join(db.dir, "*"+mergeSuffix))
+	entries, err := disk.ReadDir(db.dir)
 	if err != nil {
 		return err
-	}
-	for _, match := range matches {
-		if err := os.Remove(match); err != nil {
-			return err
-		}
 	}
 
-	hints, err := filepath.Glob(filepath.Join(db.dir, "*"+hintSuffix))
-	if err != nil {
-		return err
+	present := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		present[entry.Name()] = true
 	}
-	for _, hint := range hints {
-		segment := strings.TrimSuffix(hint, hintSuffix) + segmentSuffix
-		if _, err := os.Stat(segment); os.IsNotExist(err) {
-			if err := os.Remove(hint); err != nil {
-				return err
+
+	for _, entry := range entries {
+		name := entry.Name()
+
+		switch {
+		case strings.HasSuffix(name, mergeSuffix):
+			// Half of a merge, of a log or of a hint. Everything it was built
+			// from is still there, so it can simply go.
+		case strings.HasSuffix(name, hintSuffix):
+			// A hint whose log has gone describes nothing.
+			log := strings.TrimSuffix(name, hintSuffix) + segmentSuffix
+			if present[log] {
+				continue
 			}
+		default:
+			continue
+		}
+
+		if err := disk.Remove(filepath.Join(db.dir, name)); err != nil {
+			return err
 		}
 	}
 
@@ -616,12 +625,12 @@ func (db *DB) mergeLocked(victims []*diskSegment, dropTombstones bool) error {
 	// It has to go before the rename, or a crash in between would leave it
 	// beside a log it does not describe.
 	if err := removeHint(db.path(oldest.id())); err != nil {
-		os.Remove(temp)
+		disk.Remove(temp)
 		return err
 	}
 
-	if err := os.Rename(temp, db.path(oldest.id())); err != nil {
-		os.Remove(temp)
+	if err := disk.Rename(temp, db.path(oldest.id())); err != nil {
+		disk.Remove(temp)
 		return err
 	}
 	syncDir(db.dir)
@@ -659,7 +668,7 @@ func (db *DB) mergeLocked(victims []*diskSegment, dropTombstones bool) error {
 		victims[i].closeNoSync()
 		if victims[i].id() != oldest.id() {
 			removeHint(db.path(victims[i].id()))
-			os.Remove(db.path(victims[i].id()))
+			disk.Remove(db.path(victims[i].id()))
 		}
 	}
 	syncDir(db.dir)
@@ -694,14 +703,14 @@ func mergeInto(path string, victims []*diskSegment, dropTombstones bool) (map[st
 		})
 	}
 
-	file, err := openDisk(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	file, err := disk.Open(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return nil, 0, err
 	}
 
 	failed := func(err error) (map[string]int64, int64, error) {
 		file.Close()
-		os.Remove(path)
+		disk.Remove(path)
 		return nil, 0, err
 	}
 
@@ -748,7 +757,7 @@ func mergeInto(path string, victims []*diskSegment, dropTombstones bool) (map[st
 		return failed(err)
 	}
 	if err := file.Close(); err != nil {
-		os.Remove(path)
+		disk.Remove(path)
 		return nil, 0, err
 	}
 
@@ -759,7 +768,7 @@ func mergeInto(path string, victims []*diskSegment, dropTombstones bool) (map[st
 // merge already built rather than reading the log again, and writes the hint
 // that saves the next open from reading it either.
 func adoptMerged(id uint64, path string, index map[string]int64, size int64) (*diskSegment, error) {
-	file, err := openDisk(path, os.O_RDWR, 0o644)
+	file, err := disk.Open(path, os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
 	}
@@ -772,7 +781,7 @@ func adoptMerged(id uint64, path string, index map[string]int64, size int64) (*d
 // syncDir makes a rename in dir durable. Not every filesystem supports it, so a
 // failure is not fatal.
 func syncDir(dir string) {
-	if handle, err := openDisk(dir, os.O_RDONLY, 0); err == nil {
+	if handle, err := disk.Open(dir, os.O_RDONLY, 0); err == nil {
 		handle.Sync()
 		handle.Close()
 	}

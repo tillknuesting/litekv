@@ -119,7 +119,7 @@ type logState struct {
 // returning; under the other policies it may have been, and that is what they
 // trade away.
 func Open(path string, opts Options) (*KeyValueStore, error) {
-	file, err := openDisk(path, os.O_RDWR|os.O_CREATE, 0o644)
+	file, err := disk.Open(path, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return nil, err
 	}
@@ -312,30 +312,30 @@ func (kvs *KeyValueStore) rewrite() error {
 func (kvs *KeyValueStore) rewriteFile(state *logState) error {
 	temp := state.path + ".rewrite"
 
-	file, err := openDisk(temp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	file, err := disk.Open(temp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
 
 	if _, err := file.Write(kvs.Data); err != nil {
 		file.Close()
-		os.Remove(temp)
+		disk.Remove(temp)
 		return err
 	}
 	if err := file.Sync(); err != nil {
 		file.Close()
-		os.Remove(temp)
+		disk.Remove(temp)
 		return err
 	}
-	if err := os.Rename(temp, state.path); err != nil {
+	if err := disk.Rename(temp, state.path); err != nil {
 		file.Close()
-		os.Remove(temp)
+		disk.Remove(temp)
 		return err
 	}
 
 	// The rename is only durable once the directory holding it is synced. Not
 	// every filesystem supports that, so a failure here is not fatal.
-	if dir, err := openDisk(filepath.Dir(state.path), os.O_RDONLY, 0); err == nil {
+	if dir, err := disk.Open(filepath.Dir(state.path), os.O_RDONLY, 0); err == nil {
 		dir.Sync()
 		dir.Close()
 	}

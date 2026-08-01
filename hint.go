@@ -49,14 +49,14 @@ func writeHint(segmentPath string, segmentSize int64, index map[string]int64) er
 	path := hintPath(segmentPath)
 	temp := path + mergeSuffix
 
-	file, err := openDisk(temp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	file, err := disk.Open(temp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
 
 	failed := func(err error) error {
 		file.Close()
-		os.Remove(temp)
+		disk.Remove(temp)
 		return err
 	}
 
@@ -99,12 +99,12 @@ func writeHint(segmentPath string, segmentSize int64, index map[string]int64) er
 		return failed(err)
 	}
 	if err := file.Close(); err != nil {
-		os.Remove(temp)
+		disk.Remove(temp)
 		return err
 	}
 
-	if err := os.Rename(temp, path); err != nil {
-		os.Remove(temp)
+	if err := disk.Rename(temp, path); err != nil {
+		disk.Remove(temp)
 		return err
 	}
 	return nil
@@ -114,7 +114,7 @@ func writeHint(segmentPath string, segmentSize int64, index map[string]int64) er
 // whether it could. A false means nothing is wrong beyond having to read the
 // log itself: every reason to refuse a hint is a reason to ignore it.
 func loadHint(segmentPath string, segmentSize int64) (map[string]int64, bool) {
-	data, err := os.ReadFile(hintPath(segmentPath))
+	data, err := disk.ReadFile(hintPath(segmentPath))
 	if err != nil || len(data) < hintHeaderSize+4 {
 		return nil, false
 	}
@@ -178,7 +178,7 @@ func loadHint(segmentPath string, segmentSize int64) (map[string]int64, bool) {
 // describes is replaced: a hint left beside a different log is the one way a
 // wrong answer could survive all of this.
 func removeHint(segmentPath string) error {
-	err := os.Remove(hintPath(segmentPath))
+	err := disk.Remove(hintPath(segmentPath))
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}

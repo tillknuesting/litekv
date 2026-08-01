@@ -91,7 +91,7 @@ type diskSegment struct {
 // which is the difference between reading twenty bytes per key and reading the
 // whole log. Otherwise the log is read and a hint written for next time.
 func openDiskSegment(id uint64, path string) (*diskSegment, error) {
-	file, err := openDisk(path, os.O_RDWR, 0o644)
+	file, err := disk.Open(path, os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
 	}
@@ -158,7 +158,7 @@ func freeze(m *memSegment, policy SyncPolicy) (*diskSegment, error) {
 	// Open the log to read from before letting go of the store that was
 	// writing it. The other way round, a failure here would leave the store
 	// closed and the segment it was the active half of unwritable.
-	file, err := openDisk(path, os.O_RDWR, 0o644)
+	file, err := disk.Open(path, os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
 	}
