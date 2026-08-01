@@ -524,6 +524,13 @@ repository, so CI starts from the seeds in the code every time. Finding anything
 for minutes on a laptop. A failure writes the input that caused it into `testdata/fuzz`, where it
 becomes a regression test and travels with the code.
 
+There are four targets, and each one points at something that reads bytes it has no reason to trust.
+
 `FuzzKeyValueStore_Data` feeds arbitrary bytes in through the `Data` slice, which is how a store backed
 by a file or by shared memory is restored: no input may panic, hang, or make the store forget a key it
-had already returned. `FuzzKeyValueStore_WriteReadDelete` fuzzes the write path.
+had already returned. `FuzzSegmentBytes` does the same for the half that reads a log without holding it
+in memory, and holds the streaming indexer and the reader that fetches one record by offset to each
+other: an offset the one accepted, the other has to be able to read, with the key it was indexed under.
+`FuzzHint` feeds arbitrary bytes to the hint parser, where refusing is always allowed and accepting an
+offset outside the log is not, since a hint is taken at its word. `FuzzKeyValueStore_WriteReadDelete`
+fuzzes the write path.

@@ -115,7 +115,17 @@ func writeHint(segmentPath string, segmentSize int64, index map[string]int64) er
 // log itself: every reason to refuse a hint is a reason to ignore it.
 func loadHint(segmentPath string, segmentSize int64) (map[string]int64, bool) {
 	data, err := disk.ReadFile(hintPath(segmentPath))
-	if err != nil || len(data) < hintHeaderSize+4 {
+	if err != nil {
+		return nil, false
+	}
+	return parseHint(data, segmentSize)
+}
+
+// parseHint reads a hint out of the bytes of one, for a log of segmentSize.
+// Every way it can refuse is a way of saying "read the log instead", so it
+// checks everything and explains nothing.
+func parseHint(data []byte, segmentSize int64) (map[string]int64, bool) {
+	if len(data) < hintHeaderSize+4 {
 		return nil, false
 	}
 
