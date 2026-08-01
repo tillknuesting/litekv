@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"math/rand/v2"
 	"os"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1213,6 +1215,378 @@ func BenchmarkKeyValueStore_RebuildIndex(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		kvs.RebuildIndex()
+	}
+}
+
+// BenchmarkKeyValueStore_ReadUnderWrite is the workload nearly every real store
+// has and none of the benchmarks above had: reads on every core with writes
+// going on beside them.
+//
+// A read takes one shard and a write takes all four, so a write does not slow
+// readers down, it stops them. What that costs cannot be seen in either half
+// measured alone — ReadScaleParallel has no writer, WriteParallel has no
+// readers — and it is the number to have before deciding whether a background
+// writer is affordable. The zero-writer case is there to be subtracted.
+//
+// Writers rewrite a key of their own with a small value, the cheapest write
+// there is, so what is measured is the lock and not the copying.
+func BenchmarkKeyValueStore_ReadUnderWrite(b *testing.B) {
+	const readKeys = 4096
+
+	for _, writers := range []int{0, 1, 2} {
+		b.Run(fmt.Sprintf("writers=%d", writers), func(b *testing.B) {
+			// Readers share the first readKeys; each writer owns one past them,
+			// so a writer never changes the size of a value a reader is timing.
+			keys := makeKeys(readKeys + writers)
+			value := make([]byte, 1024)
+			kvs := &KeyValueStore{}
+			for _, key := range keys[:readKeys] {
+				if err := kvs.Write(key, value); err != nil {
+					b.Fatal(err)
+				}
+			}
+
+			// The store as readers must keep finding it. A writer that has
+			// grown the log past the bound puts this back instead of truncating
+			// to nothing, so no reader is ever left hunting for a key that a
+			// reset removed. It happens under the write lock, which no reader
+			// can hold at the same time, so none of them sees it half done.
+			golden := append([]byte(nil), kvs.Data...)
+			goldenIndex := maps.Clone(kvs.Index)
+
+			stop := make(chan struct{})
+			var wg sync.WaitGroup
+			for w := 0; w < writers; w++ {
+				wg.Add(1)
+				go func(w int) {
+					defer wg.Done()
+
+					small := make([]byte, 16)
+					written := 0
+					for {
+						select {
+						case <-stop:
+							return
+						default:
+						}
+
+						if err := kvs.Write(keys[readKeys+w], small); err != nil {
+							b.Error(err)
+							return
+						}
+						if written++; written%writeBoundChecks == 0 {
+							kvs.Lock()
+							if len(kvs.Data) > writeBoundBytes {
+								kvs.Data = append(kvs.Data[:0], golden...)
+								kvs.Index = maps.Clone(goldenIndex)
+							}
+							kvs.Unlock()
+						}
+					}
+				}(w)
+			}
+
+			var missed atomic.Int64
+			b.ReportAllocs()
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				i := rand.IntN(readKeys)
+				sink := 0
+				for pb.Next() {
+					err := kvs.View(keys[i%readKeys], func(v []byte) error {
+						sink += len(v)
+						return nil
+					})
+					if err != nil {
+						missed.Add(1)
+					}
+					i++
+				}
+			})
+			b.StopTimer()
+
+			close(stop)
+			wg.Wait()
+
+			// A read that found nothing was timing the wrong thing, and there
+			// should be none of them: the reset above holds the write lock for
+			// as long as the store is inconsistent. This is the assertion that
+			// the trick works.
+			if n := missed.Load(); n > 0 {
+				b.Errorf("%d reads found no record", n)
+			}
+			reportThroughput(b, len(value))
+		})
+	}
+}
+
+// BenchmarkKeyValueStore_WriteScale is the write side of ReadScale.
+//
+// WriteInsert cycles 4096 keys, so its index never grows and its map operations
+// always land in a table that is small and hot. A large store has neither, and
+// the question is whether a write pays the same fixed tax for missing out to
+// memory that a read was shown to. Writes here are updates, so the index stays
+// the size it was filled to and what changes between rows is only how far the
+// map has to reach.
+func BenchmarkKeyValueStore_WriteScale(b *testing.B) {
+	const recordBytes = headerSize + scaleKeyLen + 16
+
+	for _, count := range []int{1 << 10, 1 << 14, 1 << 17, 1 << 20} {
+		keys := makeKeys(count)
+		value := make([]byte, 16)
+		kvs := &KeyValueStore{
+			Data: make([]byte, 0, int64(count)*int64(recordBytes)),
+		}
+		for _, key := range keys {
+			if err := kvs.Write(key, value); err != nil {
+				b.Fatal(err)
+			}
+		}
+
+		b.Run(fmt.Sprint(count), func(b *testing.B) {
+			// Room for every record this run will append, taken before the
+			// clock starts. The alternative is append doubling a slice that is
+			// already hundreds of megabytes, which measures the allocator and
+			// briefly holds two copies of it. Truncating instead is not open
+			// here: the index points into what would be thrown away.
+			if need := len(kvs.Data) + b.N*recordBytes; cap(kvs.Data) < need {
+				grown := make([]byte, len(kvs.Data), need)
+				copy(grown, kvs.Data)
+				kvs.Data = grown
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := kvs.Write(keys[i%count], value); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+			reportThroughput(b, len(value))
+		})
+
+		runtime.GC()
+	}
+}
+
+// BenchmarkKeyValueStore_Delete is the tombstone path: the same append as a
+// write, with no value on it.
+func BenchmarkKeyValueStore_Delete(b *testing.B) {
+	keys := makeKeys(4096)
+	value := make([]byte, 16)
+	kvs := &KeyValueStore{}
+	for _, key := range keys {
+		if err := kvs.Write(key, value); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := kvs.Delete(keys[i%len(keys)]); err != nil {
+			b.Fatal(err)
+		}
+		if len(kvs.Data) > writeBoundBytes {
+			kvs.Data = kvs.Data[:0]
+			kvs.Index = nil
+		}
+	}
+}
+
+// BenchmarkKeyValueStore_ReadMissing is what a lookup costs when there is
+// nothing to return.
+//
+// Both answers come out of the index without touching the log — one finds no
+// entry, the other finds a tombstone — so both should be cheaper than the hit
+// that Read/16 measures. It is worth knowing by how much for anything that
+// probes for keys it expects to be absent.
+func BenchmarkKeyValueStore_ReadMissing(b *testing.B) {
+	keys := makeKeys(1024)
+	absent := makeKeys(2048)[1024:] // never written
+	value := make([]byte, 16)
+
+	kvs := &KeyValueStore{}
+	for _, key := range keys {
+		if err := kvs.Write(key, value); err != nil {
+			b.Fatal(err)
+		}
+	}
+	// The second half of the live keys becomes tombstones.
+	for _, key := range keys[512:] {
+		if err := kvs.Delete(key); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	for _, probe := range []struct {
+		name string
+		keys [][]byte
+		want error
+	}{
+		{"absent", absent, ErrorKeyNotFound},
+		{"deleted", keys[512:], ErrorKeyDeleted},
+	} {
+		b.Run(probe.name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := kvs.Read(probe.keys[i%len(probe.keys)]); !errors.Is(err, probe.want) {
+					b.Fatalf("got %v, want %v", err, probe.want)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkKeyValueStore_ForEach is the only way to walk the store, since the
+// index is a hash map and has no order to iterate. It reads every record,
+// superseded ones and tombstones included, so its cost is the size of the log
+// rather than the number of keys — which is the argument for compacting one
+// that is walked often.
+func BenchmarkKeyValueStore_ForEach(b *testing.B) {
+	keys := makeKeys(4096)
+	value := make([]byte, 256)
+	kvs := &KeyValueStore{}
+	for _, key := range keys {
+		if err := kvs.Write(key, value); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	var sink int
+	b.SetBytes(kvs.Size())
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := kvs.ForEach(func(_, v []byte, _ bool) bool {
+			sink += len(v)
+			return true
+		}); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkKeyValueStore_Verify checks every record against its checksum, which
+// is the whole log read and folded. It is what a store pays to find rot that a
+// read of an untouched key would not.
+func BenchmarkKeyValueStore_Verify(b *testing.B) {
+	keys := makeKeys(4096)
+	value := make([]byte, 256)
+	kvs := &KeyValueStore{}
+	for _, key := range keys {
+		if err := kvs.Write(key, value); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	b.SetBytes(kvs.Size())
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := kvs.Verify(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkKeyValueStore_Index is the saved index against the rebuilt one, which
+// is the question SaveIndex exists to answer, and the answer is not the obvious
+// one.
+//
+// The scan that loading is meant to save turns out not to be the expensive
+// thing it sounds like. RebuildIndex walks the log by asking each header how
+// long its record is and stepping over the value without reading it, so it
+// costs the number of records and not the number of bytes. Measured against
+// value sizes from 16 B to 64 KiB — a log from a quarter of a megabyte to 268
+// of them — it does not move: 392, 406, 393 and 398 µs.
+//
+// So both sides are proportional to the keys, and the sweep is over key count
+// for that reason. Loading loses at every one of them — 12% at 4096 keys, 14%
+// at 16384, 16% at 65536 — because a gob decode and a random-access check per
+// key costs more than stepping through headers a prefetcher can see coming.
+//
+// That is not the whole case for SaveIndex, and this benchmark cannot make it.
+// Data is in memory here, so rebuilding touches the header of every record for
+// free. Read back off a disk that has not cached it, rebuilding faults in a
+// page for every record it steps to, which for large values is a page per key
+// across the whole log, while loading reads one compact file end to end. That
+// is the same argument the hint files make for a DB, and on a Raspberry Pi's
+// SD card it is the argument that matters. Measuring it needs a cold page
+// cache, which nothing here has.
+func BenchmarkKeyValueStore_Index(b *testing.B) {
+	for _, count := range []int{1 << 12, 1 << 14, 1 << 16} {
+		keys := makeKeys(count)
+		value := make([]byte, 256)
+		kvs := &KeyValueStore{}
+		for _, key := range keys {
+			if err := kvs.Write(key, value); err != nil {
+				b.Fatal(err)
+			}
+		}
+
+		saved, err := kvs.SaveIndex()
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		b.Run(fmt.Sprintf("%dkeys/rebuild", count), func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := kvs.RebuildIndex(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+
+		b.Run(fmt.Sprintf("%dkeys/load", count), func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := kvs.LoadIndex(saved); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+
+		b.Run(fmt.Sprintf("%dkeys/save", count), func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := kvs.SaveIndex(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+
+		runtime.GC()
+	}
+}
+
+// BenchmarkKeyValueStore_Recover is what opening a store off a log costs when
+// the index has to be worked out again and every record checked on the way.
+// RebuildIndex is the same walk without the checksums, so the two together say
+// what the checking costs.
+func BenchmarkKeyValueStore_Recover(b *testing.B) {
+	keys := makeKeys(4096)
+	value := make([]byte, 256)
+	kvs := &KeyValueStore{}
+	for _, key := range keys {
+		if err := kvs.Write(key, value); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	b.SetBytes(kvs.Size())
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := kvs.Recover(); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

@@ -24,7 +24,8 @@ the store outgrows memory, or when compacting one log in one go has become a sta
 |                          | `KeyValueStore`      | `DB`                                     |
 | ------------------------ | -------------------- | ---------------------------------------- |
 | Records in memory        | all of them          | the active log only                      |
-| Read of a 512-byte value | 147 ns               | 824 ns from a frozen log                 |
+| Read of a 512-byte value | 157 ns               | 884 ns from a frozen log                 |
+| Concurrent reads         | scale with the cores | do not                                   |
 | Compaction               | stops the world      | merges in the background                 |
 | After `Close`            | still reads          | refuses: its values are behind shut files |
 | Data as a byte slice     | yes, `Data`          | no, it is several files                  |
@@ -128,10 +129,10 @@ does. That is the choice `SyncPolicy` makes, and it is not a cheap one:
 
 | policy       | per write | survives a process crash | survives losing power     |
 | ------------ | --------- | ------------------------ | ------------------------- |
-| `SyncAlways` | 3.7 ms    | yes                      | yes                       |
-| `SyncEvery`  | 2.1 µs    | yes                      | all but the last interval |
-| `SyncNever`  | 2.5 µs    | yes                      | no promises               |
-| in memory    | 119 ns    | no                       | no                        |
+| `SyncAlways` | 3.8 ms    | yes                      | yes                       |
+| `SyncEvery`  | 2.2 µs    | yes                      | all but the last interval |
+| `SyncNever`  | 2.1 µs    | yes                      | no promises               |
+| in memory    | 121 ns    | no                       | no                        |
 
 `Write` tells you whether your record is stored, and nothing else. Freezing a full log and merging are
 housekeeping that happens around it, and a failure at either does not mean the record was lost — so
@@ -245,12 +246,12 @@ memory, even when the operating system still has the page:
 
 | read of a 512-byte value | |
 | ------------------------ | ------- |
-| from the active log      | 147 ns  |
-| from a frozen log        | 824 ns  |
+| from the active log      | 157 ns  |
+| from a frozen log        | 884 ns  |
 
 So a `DB` trades roughly five times the read latency for roughly a tenth of the memory. The gap closes
-as values grow, since the copy starts to matter more than the call: 74 ns against 770 for 16 bytes, and
-684 against 1377 for 4 KiB. A
+as values grow, since the copy starts to matter more than the call: 79 ns against 811 for 16 bytes, and
+724 against 1483 for 4 KiB. A
 `KeyValueStore` makes the opposite trade and keeps everything in memory, which is the right one while
 the store still fits.
 
@@ -271,7 +272,7 @@ barrier per merge, whatever the store holds.
 
 Freezing a log is work a write occasionally has to stop for: the store lets go of what it was holding,
 opens the log to read from, and writes the index beside it. Averaged over the writes between one
-rotation and the next, at 64 KiB logs and 128-byte values, that is 10.5 µs a write against 2.2 µs for a
+rotation and the next, at 64 KiB logs and 128-byte values, that is 10.4 µs a write against 2.5 µs for a
 store whose logs never fill. The median write is untouched at about 2 µs — the cost is a handful of slow
 writes, not a tax on all of them.
 
@@ -386,8 +387,7 @@ is discarded — `Verify` first if you would rather look before anything is thro
 
 ## Saving the index
 
-Rebuilding the index means reading every record. For a large store you can save the index instead and
-load it back, which skips that scan:
+Rebuilding the index means visiting every record. You can save the index instead and load it back:
 
 ```go
 saved, err := kvs.SaveIndex()   // gob-encoded map of key to offset
@@ -397,6 +397,28 @@ err = kvs.LoadIndex(saved)      // after Data is in place
 `LoadIndex` replaces the index rather than merging into it, and checks every entry against `Data` first:
 an entry that does not point at a record holding that exact key fails with `ErrorKeyMismatch` or
 `ErrorCorruptData` and leaves the store untouched. Populate `Data` before calling it.
+
+With `Data` already in memory this does not pay, and it is worth being plain about why. Rebuilding does
+not read the records: it asks each header how long its record is and steps over the value without
+touching it, so it costs the number of records rather than the number of bytes — it does not move at all
+between 16-byte values and 64 KiB ones, a log from a quarter of a megabyte to 268 of them. Loading is
+proportional to the keys as well, and does more per key: a gob decode, then a random-access check of
+every entry against the log it claims to describe.
+
+| 256-byte values | rebuild | load    | save    |
+| --------------- | ------- | ------- | ------- |
+| 4,096 keys      | 418 µs  | 468 µs  | 228 µs  |
+| 16,384 keys     | 1.72 ms | 1.96 ms | 797 µs  |
+| 65,536 keys     | 10.5 ms | 12.2 ms | 3.18 ms |
+
+The case for saving an index is the store whose `Data` is not in memory yet. Rebuilding then faults in a
+page for every record it steps to, which for large values is a page per key across the whole log, while
+loading reads one compact file end to end. That is the argument the hint files make for a `DB`, and on
+an SD card it is the one that decides. It is not measured here: it needs a cold page cache, and nothing
+in the suite has one.
+
+`Recover` is the same walk with every checksum verified, and costs about what `RebuildIndex` does — 400
+µs against 418 for 4096 keys — so there is no speed to be had by rebuilding without the checking.
 
 ## Concurrency
 
@@ -436,7 +458,7 @@ cores:
 | 1       | 114 ns    | 8.8 M           |
 | 2       | 228 ns    | 4.4 M           |
 | 4       | 232 ns    | 4.3 M           |
-| 8       | 241 ns    | 4.1 M           |
+| 8       | 239 ns    | 4.2 M           |
 
 The whole step is from one writer to two, and it halves the throughput of the store; four and eight are
 barely worse than two. What costs is leaving the uncontended path rather than how crowded it gets: an
@@ -447,6 +469,34 @@ So one writer is not a limit to work around but the shape to build for. Handing 
 goroutine beats sharing the store between several, and it is the arrangement the rest of the design
 already assumes.
 
+A reader is not free either, once there is a writer. Readers spread over the shards and a writer takes
+all of them, so a write does not slow a read down, it stops it. Reading 1 KiB values on ten goroutines,
+against nothing else and then against one goroutine writing as fast as it can:
+
+| writers alongside | per read |
+| ----------------- | -------- |
+| none              | 47 ns    |
+| one               | 145 ns   |
+| two               | 147 ns   |
+
+One writer triples the cost of a read, and the second is free, which is the same shape as the table
+above and has the same cause. A background writer is not a rounding error on a read-heavy store, and it
+is worth deciding what rate it really needs to run at.
+
+None of this applies to `DB`, which has none of it. `DB` guards its segments with a plain
+`sync.RWMutex`, so its readers contend on the one counter this whole section is about avoiding:
+
+| 512-byte read | one goroutine | ten goroutines |
+| ------------- | ------------- | -------------- |
+| active log    | 157 ns        | 165 ns         |
+| frozen log    | 884 ns        | 5.2 µs         |
+
+The active log gains nothing from the cores; a frozen one gets six times worse. Why it degrades rather
+than merely failing to improve is not established — reads of a frozen log are system calls, and the
+suspicion is the runtime growing threads to hold them — so treat the number as measured and the reason
+as open. What is clear enough to act on is that the two halves of this library behave in opposite ways
+under load: a `KeyValueStore` reads faster the more goroutines it is given, and a `DB` reads slower.
+
 ## How it scales
 
 Every read figure above comes from a store of about a thousand keys, whose index is a few tens of
@@ -455,14 +505,14 @@ get it: the lookup becomes a hash and a walk out to main memory.
 
 | keys      | 16-byte value | 1 KiB value | 16 KiB value |
 | --------- | ------------- | ----------- | ------------ |
-| 1,024     | 49 ns         | 137 ns      | 1.58 µs      |
-| 16,384    | 66 ns         | 210 ns      | 1.75 µs      |
-| 131,072   | 186 ns        | 461 ns      |              |
-| 1,048,576 | 437 ns        | 606 ns      |              |
+| 1,024     | 51 ns         | 142 ns      | 1.62 µs      |
+| 16,384    | 66 ns         | 217 ns      | 1.81 µs      |
+| 131,072   | 198 ns        | 485 ns      |              |
+| 1,048,576 | 451 ns        | 622 ns      |              |
 
-Going from a thousand keys to a million costs about 390 ns at 16-byte values and about 470 at 1 KiB —
+Going from a thousand keys to a million costs about 400 ns at 16-byte values and about 480 at 1 KiB —
 near enough the same number of nanoseconds either way, because the miss is a fixed tax on finding the
-record rather than a multiplier on reading it. So it is 8.9x the cost of a small read and 4.4x of a
+record rather than a multiplier on reading it. So it is 8.8x the cost of a small read and 4.4x of a
 larger one: a store of big values hardly notices what a store of small ones cannot ignore. The blanks
 are combinations too large to build in memory to measure.
 
@@ -471,18 +521,50 @@ core can be waiting at the same time, so the misses overlap instead of queueing:
 
 | keys      | 16-byte value | 1 KiB value |
 | --------- | ------------- | ----------- |
-| 1,024     | 40 ns         | 46 ns       |
-| 1,048,576 | 61 ns         | 105 ns      |
+| 1,024     | 40 ns         | 47 ns       |
+| 1,048,576 | 62 ns         | 107 ns      |
 
-Ten goroutines are worth 1.2x at a thousand keys and 7.1x at a million. The store gets *more* out of the
+Ten goroutines are worth 1.3x at a thousand keys and 7.2x at a million. The store gets *more* out of the
 cores it is given the less of it fits in cache, which is the opposite of the write side above, and the
 two together are most of what there is to know before sizing one.
 
-As payload the same matrix spans three hundredfold, from 293 Mbit/s reading 16-byte values out of a
-million keys to 83 Gbit/s reading 16 KiB values out of a thousand, and 78 Gbit/s at a million keys with
-ten goroutines and 1 KiB values. Which is the argument against quoting any single throughput number for
-a key-value store, this one included: nothing about "how fast is it" survives contact with the question
-of how many keys, how large, and from how many goroutines.
+As payload the same matrix spans nearly three hundredfold, from 284 Mbit/s reading 16-byte values out
+of a million keys to 81 Gbit/s reading 16 KiB values out of a thousand, and 76 Gbit/s at a million keys
+with ten goroutines and 1 KiB values. Which is the argument against quoting any single throughput
+number for a key-value store, this one included: nothing about "how fast is it" survives contact with
+the question of how many keys, how large, and from how many goroutines.
+
+### What everything else costs
+
+At 4096 keys and 256-byte values, on the same machine:
+
+| operation                     | cost   |
+| ----------------------------- | ------ |
+| `Read` of a key never written | 17 ns  |
+| `View`, 16-byte value         | 42 ns  |
+| `Read` of a deleted key       | 47 ns  |
+| `Read`, 16-byte value         | 49 ns  |
+| `Write`, 16-byte value        | 113 ns |
+| `Delete`                      | 123 ns |
+| `ForEach` over the whole log  | 87 µs  |
+| `Verify`                      | 185 µs |
+| `Recover`                     | 400 µs |
+| `RebuildIndex`                | 418 µs |
+| `Compact`                     | 2.0 ms |
+
+Two of those are worth a second look. A key that was never written costs a third of one that was, since
+the answer comes out of the index and no record is ever touched. A deleted key costs what a live one
+does, because the tombstone saying so is a record like any other and has to be read to be recognised.
+So probing for keys you expect to be absent is cheap, and probing for keys you expect to be deleted is
+not — they are different answers with very different prices.
+
+`Delete` and a 16-byte `Write` cost the same to within a few nanoseconds, 123 against 126 measured over
+the same 4096 keys: a tombstone is an ordinary record, only a shorter one. Deleting does not reclaim
+anything, and until a compaction both the value and the tombstone are still in the log.
+
+`DB` pays more for the walk than a `KeyValueStore` does — 3.5 ms against 87 µs — and not only because
+its records are on a disk. `ForEach` there has to return each live key once across several logs, so it
+carries a set of the keys it has already seen and asks it about every record it passes.
 
 All of these are an Apple M4 with ten cores. What matters is the ratios; a Raspberry Pi will be slower
 throughout and will meet its SD card long before it meets any of these.
@@ -537,7 +619,7 @@ anything either.
 - **Every key must fit in memory.** The index holds each key and an offset, about 59 bytes per key,
   however large the values are. Ten million keys is roughly 600 MB of index, and no amount of paging
   values out of memory changes that.
-- **A read slows down as the index outgrows the cache**, by about 390 ns between a thousand keys and a
+- **A read slows down as the index outgrows the cache**, by about 400 ns between a thousand keys and a
   million. Most of the quoted read figures are from small stores and are the best case. See
   "How it scales"; the short version is that it hurts a store of small values and barely touches one of
   large values, and that concurrent readers get most of it back.
@@ -604,8 +686,9 @@ go test -bench=. ./...
 That is one sample of each, which is enough to see a number and not enough to trust one. For that:
 
 ```bash
-./benchmark.sh 10          # ten passes of everything, then benchstat
-./benchmark.sh 5 ReadScale # five passes of what matches a regexp
+go run ./benchrun                   # ten passes of everything, then benchstat
+go run ./benchrun -passes 5         # five of them
+go run ./benchrun -bench ReadScale  # only what matches a regexp
 ```
 
 It runs the whole suite start to finish, several times over, rather than repeating each benchmark ten

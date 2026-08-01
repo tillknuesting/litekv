@@ -1437,6 +1437,123 @@ func BenchmarkDB_Read(b *testing.B) {
 	}
 }
 
+// BenchmarkDB_View is Read without the copy, against both kinds of log.
+//
+// For a KeyValueStore this is most of the cost, since the record is already in
+// memory and the copy is the work. A frozen log is a read from a file, which
+// has to land somewhere, so View saves what it can and no more: the gap between
+// these and BenchmarkDB_Read is what a DB gets out of not copying, and it is
+// smaller than the one a KeyValueStore gets.
+func BenchmarkDB_View(b *testing.B) {
+	for _, size := range []int{16, 512, 4096} {
+		db, inMemory, onDisk := benchDB(b, size)
+
+		for _, probe := range []struct {
+			name string
+			key  []byte
+		}{
+			{"active", inMemory},
+			{"frozen", onDisk},
+		} {
+			b.Run(fmt.Sprintf("%d/%s", size, probe.name), func(b *testing.B) {
+				var sink int
+				b.SetBytes(int64(size))
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if err := db.View(probe.key, func(v []byte) error {
+						sink += len(v)
+						return nil
+					}); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+
+		db.Close()
+	}
+}
+
+// BenchmarkDB_ReadParallel is whether the two kinds of log scale differently
+// with cores, which they have every reason to.
+//
+// A read of the active log is a lock and a look at memory, as for a
+// KeyValueStore. A read of a frozen one is a pread on a file handle, which goes
+// out to the operating system and can overlap with other preads in a way that
+// holding a lock cannot. Read against the serial numbers in BenchmarkDB_Read.
+func BenchmarkDB_ReadParallel(b *testing.B) {
+	db, inMemory, onDisk := benchDB(b, 512)
+	defer db.Close()
+
+	for _, probe := range []struct {
+		name string
+		key  []byte
+	}{
+		{"active", inMemory},
+		{"frozen", onDisk},
+	} {
+		b.Run(probe.name, func(b *testing.B) {
+			b.SetBytes(512)
+			b.ReportAllocs()
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					if _, err := db.Read(probe.key); err != nil {
+						b.Error(err)
+						return
+					}
+				}
+			})
+		})
+	}
+}
+
+// BenchmarkDB_ForEach is the whole store walked once.
+//
+// It is not the KeyValueStore walk with more steps. That one hands back every
+// record in the log; this one has to return each live key exactly once across
+// several logs, so it keeps a set of the keys it has already seen and asks it
+// about every record it passes. The cost is the log plus a map the size of the
+// store, which is worth knowing before walking a large one.
+func BenchmarkDB_ForEach(b *testing.B) {
+	db, _, _ := benchDB(b, 512)
+	defer db.Close()
+
+	var sink int
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := db.ForEach(func(_, v []byte) bool {
+			sink += len(v)
+			return true
+		}); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkDB_Delete is a tombstone into the active log, which is an append
+// like any other write. It is here because a delete that has to be written down
+// is the part of this design people are surprised by.
+func BenchmarkDB_Delete(b *testing.B) {
+	db, err := OpenDB(b.TempDir(), DBOptions{
+		Sync: SyncNever, SegmentSize: 1 << 30, MergeTrigger: 1 << 30,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := db.Delete([]byte(fmt.Sprintf("key%08d", i))); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkDB_Write measures a write with logs rotating under it against one
 // with a log large enough that they never do, which is the cost of rotating.
 func BenchmarkDB_Write(b *testing.B) {

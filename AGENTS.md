@@ -144,7 +144,7 @@ Every number in the README came from a benchmark or a test in this repository,
 on a quiet machine, and the test that produced it is still there. If you change
 something that moves one of those numbers, re-run it and change the number.
 
-Use `./benchmark.sh 10` rather than `go test -bench . -count=10`. It runs the
+Use `go run ./benchrun` rather than `go test -bench . -count=10`. It runs the
 whole suite ten times over instead of running each benchmark ten times where it
 stands, which is what keeps the machine warming up over the session out of the
 individual results — see the drift entry below. It prints the load average it
