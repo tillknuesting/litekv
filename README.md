@@ -11,6 +11,24 @@ idea, and shipped as the storage engine behind Riak. An append-only log holds th
 in-memory index holds an offset per key, so a write never seeks, a read is one lookup and one read, a
 crash costs at most the record being written, and every key has to fit in memory.
 
+## Which of the two
+
+`KeyValueStore` is one log. Every record is in memory and so is the index, reads are a map lookup and a
+slice, and it can keep a file or not. Reach for it while the store fits in memory, which is most of the
+time, and for anything that wants the records as a byte slice it can hand around.
+
+`DB` is the same design split across several logs. Only the keys and the log currently being written are
+in memory; the rest of the records stay on the disk and are read back a key at a time. Reach for it when
+the store outgrows memory, or when compacting one log in one go has become a stall you notice.
+
+|                          | `KeyValueStore`      | `DB`                                     |
+| ------------------------ | -------------------- | ---------------------------------------- |
+| Records in memory        | all of them          | the active log only                      |
+| Read of a 512-byte value | 156 ns               | 847 ns from a frozen log                 |
+| Compaction               | stops the world      | merges in the background                 |
+| After `Close`            | still reads          | refuses: its values are behind shut files |
+| Data as a byte slice     | yes, `Data`          | no, it is several files                  |
+
 ## Getting Started
 
 LiteKV needs Go 1.26 or newer, which is what `go.mod` asks for. Nothing in the library needs a recent
@@ -303,6 +321,11 @@ The one thing a hint changes is when damage is noticed. A log covered by one is 
 checksums at startup, so a record that has rotted since it was written is found by the read that wants it,
 or by `Verify`, rather than by opening the store.
 
+Merging keeps out of a write's way only if there is a core for it to run on. On a single core machine it
+is the same work in the same place, and a write waits for whatever the scheduler decides — measured at 9
+to 19 ms against the 4 ms it costs with cores to spare. Segments still bound what a merge rewrites and
+still keep the memory down; what they stop buying is the quiet.
+
 ### What a crash leaves behind
 
 The merged log is written beside the others, renamed over the *oldest* of them, and only then are the
@@ -445,6 +468,8 @@ anything either.
 - **Merging still rewrites.** Merging by size bounds the cost at about log₄ of the store rather than
   letting it grow with it, but every record is still rewritten a few times over its life. An append-only
   workload should turn merging off rather than pay for it.
+- **Background merging wants a spare core.** With one, merging is the same work in the same place as the
+  writes, and the stall it was meant to remove comes back.
 - **A closed `DB` cannot read.** Its values are on the disk and closing shuts the files. A closed
   `KeyValueStore` goes on answering, because its records are in memory.
 
