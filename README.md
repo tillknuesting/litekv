@@ -24,7 +24,7 @@ the store outgrows memory, or when compacting one log in one go has become a sta
 |                          | `KeyValueStore`      | `DB`                                     |
 | ------------------------ | -------------------- | ---------------------------------------- |
 | Records in memory        | all of them          | the active log only                      |
-| Read of a 512-byte value | 120 ns               | 839 ns from a frozen log                 |
+| Read of a 512-byte value | 120 ns               | 589 ns from a frozen log                 |
 | Concurrent reads         | scale with the cores | do not                                   |
 | Compaction               | stops the world      | merges in the background                 |
 | After `Close`            | still reads          | refuses: its values are behind shut files |
@@ -247,11 +247,12 @@ memory, even when the operating system still has the page:
 | read of a 512-byte value | |
 | ------------------------ | ------- |
 | from the active log      | 120 ns  |
-| from a frozen log        | 839 ns  |
+| from a frozen log        | 589 ns  |
 
-So a `DB` trades roughly seven times the read latency for roughly a tenth of the memory. The gap closes
-as values grow, since the copy starts to matter more than the call: 50 ns against 768 for 16 bytes, and
-667 against 1423 for 4 KiB. A
+So a `DB` trades roughly five times the read latency for roughly a tenth of the memory. The gap closes
+as values grow, since the copy starts to matter more than the call: 49 ns against 502 for 16 bytes, and
+665 against 1439 for 4 KiB — the last of those is a record just over the page a frozen read asks for, so
+it is the one size here that still takes two trips to the disk. A
 `KeyValueStore` makes the opposite trade and keeps everything in memory, which is the right one while
 the store still fits.
 
@@ -488,16 +489,23 @@ None of this applies to `DB`, which has none of it. `DB` guards its segments wit
 
 | 512-byte read | one goroutine | ten goroutines |
 | ------------- | ------------- | -------------- |
-| active log    | 120 ns        | 152 ns         |
-| frozen log    | 839 ns        | 5.2 µs         |
+| active log    | 120 ns        | 154 ns         |
+| frozen log    | 589 ns        | 3.5 µs         |
 
-The active log is slower on ten cores than on one; a frozen one is six times slower. The cause is not
-the segment list, which used to be rebuilt and allocated on every read and now is not: that made a
-read of the active log a third faster and moved this table not at all. Nothing locks the file either,
-since a frozen read is a pread and needs no lock. What is left is the system calls themselves, two per
-read, and ten goroutines' worth of them forcing the runtime to shuffle threads across calls that block.
-That is a suspicion with a mechanism but no measurement behind it, so treat the number as established
-and the reason as open. What is clear enough to act on is that the two halves of this library behave in opposite ways
+The active log is slower on ten cores than on one; a frozen one is six times slower. What causes it is
+the system calls, and that is measured rather than supposed. A frozen read used to take two of them, a
+header and then the rest of the record; asking for a page up front, so that anything smaller arrives
+whole, took this row from 5.2 µs to 3.5 and the serial read from 839 ns to 589.
+
+Two other explanations were tried and are wrong. It is not the segment list, which used to be rebuilt
+and allocated on every read: removing that made a read of the active log a third faster and moved this
+table not at all. And nothing locks the file, since a pread needs no lock.
+
+What is left is that a system call blocks whatever else it does, and ten goroutines' worth of blocked
+calls leave the runtime shuffling threads to cover them. Halving the calls took a third off; removing
+the rest would mean not going to the disk, which is what a frozen log is for. So reading a `DB` hard
+from many goroutines is slower than reading it from one, and that is the design rather than a defect
+left in it. What is clear enough to act on is that the two halves of this library behave in opposite ways
 under load: a `KeyValueStore` reads faster the more goroutines it is given, and a `DB` reads slower.
 
 ## How it scales
@@ -565,7 +573,7 @@ not — they are different answers with very different prices.
 the same 4096 keys: a tombstone is an ordinary record, only a shorter one. Deleting does not reclaim
 anything, and until a compaction both the value and the tombstone are still in the log.
 
-`DB` pays more for the walk than a `KeyValueStore` does — 3.3 ms against 87 µs — and not only because
+`DB` pays more for the walk than a `KeyValueStore` does — 2.4 ms against 87 µs — and not only because
 its records are on a disk. `ForEach` there has to return each live key once across several logs, so it
 carries a set of the keys it has already seen and asks it about every record it passes.
 

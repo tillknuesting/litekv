@@ -882,10 +882,20 @@ func TestHintPartialWrite(t *testing.T) {
 // for is an error rather than a wrong answer. This is the claim that a
 // half-read record cannot be mistaken for a whole one.
 func TestShortReadIsReported(t *testing.T) {
-	// A record is read in two goes: its header, then the rest of it. Failing
-	// the first and failing the second are different paths through the reader.
-	for _, allowed := range []int{0, 1} {
-		t.Run(fmt.Sprintf("after %d reads", allowed), func(t *testing.T) {
+	// A read asks for a page and takes a second go only if the record turns out
+	// to be longer than one. Failing the first read and failing the second are
+	// different paths through the reader, and which of them a record takes is
+	// decided by whether it fits in readAhead — so the size here is what puts
+	// the test on the path it means to be on.
+	for _, test := range []struct {
+		name    string
+		allowed int
+		value   int
+	}{
+		{"first read", 0, 40},
+		{"second read", 1, readAhead + 40},
+	} {
+		t.Run(test.name, func(t *testing.T) {
 			dir := t.TempDir()
 			watcher := &watchedDisk{}
 			watcher.install(t)
@@ -896,8 +906,9 @@ func TestShortReadIsReported(t *testing.T) {
 			}
 			defer db.Close()
 
+			allowed := test.allowed
 			for i := 0; i < 60; i++ {
-				if err := db.Write([]byte(fmt.Sprintf("key%02d", i)), []byte(strings.Repeat("v", 40))); err != nil {
+				if err := db.Write([]byte(fmt.Sprintf("key%02d", i)), []byte(strings.Repeat("v", test.value))); err != nil {
 					t.Fatal(err)
 				}
 			}

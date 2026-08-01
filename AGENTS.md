@@ -133,6 +133,14 @@ matters is the ratios.
 |                                            | inside the write lock. Not worth it for large values     |
 | Custom open-addressed hash index           | ties Go's map on speed at half the memory; not adopted   |
 |                                            | because a map is zero code and already fast              |
+| Caching the DB search order beside the     | not tried on purpose: it has to track active and frozen  |
+| segments                                   | exactly, they change in four places, and the copy would   |
+|                                            | be a fifth. searchOrder yields instead, which allocates   |
+|                                            | nothing and cannot go stale                              |
+| Blaming the DB's parallel read collapse on | wrong. Removing it made a serial active read a third      |
+| the per-read allocation                    | faster and moved the parallel table not at all. It was    |
+|                                            | the two system calls a frozen read made; a page of        |
+|                                            | read-ahead took 5.2 µs to 3.5                            |
 
 The index is a Go map on purpose. If you are about to replace it, read the
 "Limitations" section of the README first, then measure against the map before

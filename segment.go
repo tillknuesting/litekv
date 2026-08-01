@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"sync"
 )
 
 // A DB is made of segments of two kinds.
@@ -238,6 +239,21 @@ func (d *diskSegment) scan(fn func(pos int64, raw []byte, r Record) bool) error 
 	})
 }
 
+// readAhead is how much readRecordAt asks the disk for before it knows how much
+// it needs. A page: big enough that most records arrive whole on the first call,
+// small enough that a buffer per concurrent reader costs nothing to keep.
+const readAhead = 4 << 10
+
+// readBuffers holds those pages between reads, since allocating one per read to
+// throw away would cost more than the call it saves. Nothing handed to a caller
+// ever points into one.
+var readBuffers = sync.Pool{
+	New: func() any {
+		buf := make([]byte, readAhead)
+		return &buf
+	},
+}
+
 // readRecordAt reads one record from a file. The lengths it declares are
 // checked against what is actually there, so a damaged file gives an error
 // rather than an enormous allocation.
@@ -246,19 +262,29 @@ func readRecordAt(file io.ReaderAt, size, pos int64) (Record, []byte, error) {
 		return Record{}, nil, &CorruptAtError{Offset: pos}
 	}
 
-	// Read as much header as there could be, which for a short record at the
-	// end of the log is less than the largest layout takes.
-	probe := int64(headerSize)
+	// Ask for a page rather than for a header. Reading the header first and the
+	// record afterwards is two system calls, and a frozen read is mostly system
+	// call: at 512-byte values it was 839 ns, and the second pread was most of
+	// what the first one did not account for. A record that fits in the page is
+	// now one call. One that does not costs the two it always did.
+	//
+	// A short record at the end of the log has less than a page behind it, and
+	// may have less than the largest header layout takes, which decodeHeader
+	// checks for.
+	probe := int64(readAhead)
 	if remaining := size - pos; remaining < probe {
 		probe = remaining
 	}
 
-	header := make([]byte, probe)
-	if _, err := file.ReadAt(header, pos); err != nil {
+	bufp := readBuffers.Get().(*[]byte)
+	defer readBuffers.Put(bufp)
+	buf := (*bufp)[:probe]
+
+	if _, err := file.ReadAt(buf, pos); err != nil {
 		return Record{}, nil, err
 	}
 
-	fixed, ok := decodeHeader(header)
+	fixed, ok := decodeHeader(buf)
 	if !ok {
 		return Record{}, nil, &CorruptAtError{Offset: pos}
 	}
@@ -269,10 +295,17 @@ func readRecordAt(file io.ReaderAt, size, pos int64) (Record, []byte, error) {
 		return Record{}, nil, &CorruptAtError{Offset: pos}
 	}
 
+	// The record is copied out of the shared buffer rather than handed out as a
+	// slice of it, because the buffer goes back to the pool and the value does
+	// not: callers keep it. It also keeps a 60-byte value from pinning a page.
 	raw := make([]byte, total)
-	copy(raw, header[:headerLen])
-	if _, err := file.ReadAt(raw[headerLen:], pos+headerLen); err != nil {
-		return Record{}, nil, err
+	if total <= uint64(len(buf)) {
+		copy(raw, buf)
+	} else {
+		copy(raw, buf)
+		if _, err := file.ReadAt(raw[len(buf):], pos+int64(len(buf))); err != nil {
+			return Record{}, nil, err
+		}
 	}
 
 	record, _, err := parseRecordAt(raw, 0)
