@@ -254,6 +254,8 @@ func segmentIDs(dir string) ([]uint64, error) {
 	return ids, nil
 }
 
+// removeStaleMerges clears what an interrupted merge left behind: its half
+// built log, and any hint whose log is no longer there.
 func (db *DB) removeStaleMerges() error {
 	matches, err := filepath.Glob(filepath.Join(db.dir, "*"+mergeSuffix))
 	if err != nil {
@@ -264,6 +266,20 @@ func (db *DB) removeStaleMerges() error {
 			return err
 		}
 	}
+
+	hints, err := filepath.Glob(filepath.Join(db.dir, "*"+hintSuffix))
+	if err != nil {
+		return err
+	}
+	for _, hint := range hints {
+		segment := strings.TrimSuffix(hint, hintSuffix) + segmentSuffix
+		if _, err := os.Stat(segment); os.IsNotExist(err) {
+			if err := os.Remove(hint); err != nil {
+				return err
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -575,7 +591,16 @@ func (db *DB) mergeLocked(victims []*diskSegment, dropTombstones bool) error {
 	oldest := victims[len(victims)-1]
 
 	temp := db.path(oldest.id()) + mergeSuffix
-	if err := mergeInto(temp, victims, dropTombstones); err != nil {
+	index, size, err := mergeInto(temp, victims, dropTombstones)
+	if err != nil {
+		return err
+	}
+
+	// The hint beside the log about to be replaced describes what is there now.
+	// It has to go before the rename, or a crash in between would leave it
+	// beside a log it does not describe.
+	if err := removeHint(db.path(oldest.id())); err != nil {
+		os.Remove(temp)
 		return err
 	}
 
@@ -585,9 +610,9 @@ func (db *DB) mergeLocked(victims []*diskSegment, dropTombstones bool) error {
 	}
 	syncDir(db.dir)
 
-	// Indexing it back checks every checksum of what was just written, and
-	// leaves the records where they are: on the disk.
-	merged, err := openDiskSegment(oldest.id(), db.path(oldest.id()))
+	// The merge knows where it put every record, so there is nothing to read
+	// back: the index it built is the index of the new log.
+	merged, err := adoptMerged(oldest.id(), db.path(oldest.id()), index, size)
 	if err != nil {
 		return err
 	}
@@ -617,6 +642,7 @@ func (db *DB) mergeLocked(victims []*diskSegment, dropTombstones bool) error {
 	for i := len(victims) - 1; i >= 0; i-- {
 		victims[i].closeNoSync()
 		if victims[i].id() != oldest.id() {
+			removeHint(db.path(victims[i].id()))
 			os.Remove(db.path(victims[i].id()))
 		}
 	}
@@ -635,7 +661,7 @@ func (db *DB) mergeLocked(victims []*diskSegment, dropTombstones bool) error {
 //
 // The records are streamed through a buffer rather than gathered up, so merging
 // a store costs no more memory than merging a small one.
-func mergeInto(path string, victims []*diskSegment, dropTombstones bool) error {
+func mergeInto(path string, victims []*diskSegment, dropTombstones bool) (map[string]int64, int64, error) {
 	type locator struct {
 		seg *diskSegment
 		pos int64
@@ -654,14 +680,18 @@ func mergeInto(path string, victims []*diskSegment, dropTombstones bool) error {
 
 	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
-		return err
+		return nil, 0, err
 	}
 
-	failed := func(err error) error {
+	failed := func(err error) (map[string]int64, int64, error) {
 		file.Close()
 		os.Remove(path)
-		return err
+		return nil, 0, err
 	}
+
+	// Where every record lands in the new log, which is its index.
+	merged := make(map[string]int64, len(live))
+	var written int64
 
 	writer := bufio.NewWriterSize(file, 64<<10)
 
@@ -682,6 +712,8 @@ func mergeInto(path string, victims []*diskSegment, dropTombstones bool) error {
 				writeErr = err
 				return false
 			}
+			merged[string(r.Key)] = written
+			written += int64(len(raw))
 			return true
 		})
 
@@ -699,7 +731,26 @@ func mergeInto(path string, victims []*diskSegment, dropTombstones bool) error {
 	if err := file.Sync(); err != nil {
 		return failed(err)
 	}
-	return file.Close()
+	if err := file.Close(); err != nil {
+		os.Remove(path)
+		return nil, 0, err
+	}
+
+	return merged, written, nil
+}
+
+// adoptMerged opens a log the merge has just written, taking the index the
+// merge already built rather than reading the log again, and writes the hint
+// that saves the next open from reading it either.
+func adoptMerged(id uint64, path string, index map[string]int64, size int64) (*diskSegment, error) {
+	file, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+
+	writeHint(path, size, index)
+
+	return &diskSegment{segID: id, path: path, file: file, index: index, bytes: size}, nil
 }
 
 // syncDir makes a rename in dir durable. Not every filesystem supports it, so a

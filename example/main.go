@@ -146,7 +146,9 @@ func main() {
 	// ---------------------------------------------------------- segments
 	// A DB spreads the store over several logs. One takes the writes; the rest
 	// are frozen, keep only their keys in memory, and are merged in the
-	// background instead of the store being compacted all at once.
+	// background instead of the store being compacted all at once. Each frozen
+	// log gets its index written beside it, so opening does not have to read
+	// the records again to find out where the keys are.
 	fmt.Println("\n== split across segments ==")
 
 	// Tiny segments, so a handful of records is enough to see them rotate. A

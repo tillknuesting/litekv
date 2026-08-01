@@ -87,6 +87,10 @@ type diskSegment struct {
 
 // openDiskSegment indexes the segment at path without holding its records in
 // memory, and truncates a tail that a crash left half written.
+//
+// The index comes from the hint file beside it when there is a usable one,
+// which is the difference between reading twenty bytes per key and reading the
+// whole log. Otherwise the log is read and a hint written for next time.
 func openDiskSegment(id uint64, path string) (*diskSegment, error) {
 	file, err := os.OpenFile(path, os.O_RDWR, 0o644)
 	if err != nil {
@@ -97,6 +101,10 @@ func openDiskSegment(id uint64, path string) (*diskSegment, error) {
 	if err != nil {
 		file.Close()
 		return nil, err
+	}
+
+	if index, ok := loadHint(path, info.Size()); ok {
+		return &diskSegment{segID: id, path: path, file: file, index: index, bytes: info.Size()}, nil
 	}
 
 	index, good, err := indexSegment(file, info.Size())
@@ -115,6 +123,10 @@ func openDiskSegment(id uint64, path string) (*diskSegment, error) {
 			return nil, err
 		}
 	}
+
+	// Reading the log the long way is worth writing down, so that opening it
+	// again does not. A hint that cannot be written is not worth failing over.
+	writeHint(path, good, index)
 
 	return &diskSegment{segID: id, path: path, file: file, index: index, bytes: good}, nil
 }
@@ -153,6 +165,10 @@ func freeze(m *memSegment, policy SyncPolicy) (*diskSegment, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// The index is already built, so writing it down here saves opening the
+	// store from ever having to read this log.
+	writeHint(path, size, index)
 
 	return &diskSegment{segID: m.segID, path: path, file: file, index: index, bytes: size}, nil
 }

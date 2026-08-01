@@ -273,6 +273,31 @@ merge that reaches the oldest log — anything older left out of the run could s
 tombstone hides, and dropping it would bring a deleted key back. `Merge` reaches every log by
 definition, so it drops them all.
 
+### Hint files
+
+Learning where the keys are means reading every record, which is work proportional to what is stored
+rather than to how many keys there are. So a frozen log gets its index written down beside it, as
+`0000000001.hint` next to `0000000001.seg`, and opening reads that instead:
+
+| 64,000 keys in 63 MiB | opening |
+| --------------------- | ------- |
+| with hints            | 4 ms    |
+| without               | 82 ms   |
+
+The hints came to 1.3 MiB, about 2% of the log, since a hint holds a key and an offset rather than a
+key and a value. On an SSD that is 20x; on a Raspberry Pi's SD card, where the difference is bytes
+actually read rather than bytes already cached, it is the difference between a store that opens and one
+you wait for.
+
+A hint is only ever a shortcut. It is rejected if it is damaged, truncated, not a hint at all, or
+describes a log of a different length than the one beside it — and any of those simply means reading the
+log the long way, then writing a fresh hint for next time. A store from before hints existed picks them
+up the first time it is opened, and a hint whose log has gone is removed.
+
+The one thing a hint changes is when damage is noticed. A log covered by one is not checked against its
+checksums at startup, so a record that has rotted since it was written is found by the read that wants it,
+or by `Verify`, rather than by opening the store.
+
 ### What a crash leaves behind
 
 The merged log is written beside the others, renamed over the *oldest* of them, and only then are the
@@ -379,6 +404,8 @@ which version wrote it.
 
 ## Limitations
 
+- **Opening still costs the keys.** Hints make it proportional to the number of keys rather than to the
+  bytes stored, but every key is still read and indexed before the store answers anything.
 - **Every key must fit in memory.** The index holds each key and an offset, about 59 bytes per key,
   however large the values are. Ten million keys is roughly 600 MB of index, and no amount of paging
   values out of memory changes that.
