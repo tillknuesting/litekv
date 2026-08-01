@@ -473,6 +473,13 @@ anything either.
 - **A closed `DB` cannot read.** Its values are on the disk and closing shuts the files. A closed
   `KeyValueStore` goes on answering, because its records are in memory.
 
+## Working on it
+
+`AGENTS.md` has the notes for that: the invariants that must not be broken and
+the test behind each, the mistakes this codebase has already made, what has been
+measured and rejected so it is not tried again, and how to check a change before
+pushing it.
+
 ## Running Tests
 
 ```bash
