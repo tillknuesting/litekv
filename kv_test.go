@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestKeyValueStore_Write(t *testing.T) {
@@ -332,18 +333,136 @@ func TestKeyValueStore_RebuildIndex(t *testing.T) {
 	}
 }
 
-func TestKeyValueStore_BinaryFormatUnchanged(t *testing.T) {
-	const golden = "0923b16f000300000003000000666f6f626172" + // write foo=bar
-		"e5c4912e0001000000000000006b" + // write k=
-		"3250a00a010300000000000000666f6f" // delete foo
+// TestBinaryFormat pins the layout of a record. The checksum and the timestamp
+// are blanked first, since they differ from one run to the next; what is left
+// is the shape: version, type, lengths, key, value.
+func TestBinaryFormat(t *testing.T) {
+	const golden = "00000000020000000000000000000300000003000000666f6f626172" +
+		"000000000200000000000000000001000000000000006b" +
+		"00000000020100000000000000000300000000000000666f6f"
 
 	kvs := &KeyValueStore{}
 	kvs.Write([]byte("foo"), []byte("bar"))
 	kvs.Write([]byte("k"), []byte(""))
 	kvs.Delete([]byte("foo"))
 
-	if got := hex.EncodeToString(kvs.Data); got != golden {
-		t.Errorf("binary format changed:\n got %s\nwant %s", got, golden)
+	data := append([]byte(nil), kvs.Data...)
+	kvs.scan(func(pos, next int64, r Record) bool {
+		for i := pos; i < pos+4; i++ {
+			data[i] = 0 // checksum
+		}
+		for i := pos + 6; i < pos+14; i++ {
+			data[i] = 0 // timestamp
+		}
+		return true
+	})
+
+	if got := hex.EncodeToString(data); got != golden {
+		t.Errorf("record layout changed:\n got %s\nwant %s", got, golden)
+	}
+}
+
+// TestReadsTheOldFormat is the promise that adding a version and a timestamp
+// did not orphan what was already written. These bytes are a store from before
+// either existed, where the byte after the checksum was the record type.
+func TestReadsTheOldFormat(t *testing.T) {
+	const old = "0923b16f000300000003000000666f6f626172" +
+		"e5c4912e0001000000000000006b" +
+		"3250a00a010300000000000000666f6f"
+
+	data, err := hex.DecodeString(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	kvs := &KeyValueStore{Data: data}
+
+	discarded, err := kvs.Recover()
+	if err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if discarded != 0 {
+		t.Errorf("Recover discarded %d bytes of an intact old store", discarded)
+	}
+	if err := kvs.Verify(); err != nil {
+		t.Errorf("Verify: %v", err)
+	}
+
+	if value, err := kvs.Read([]byte("k")); err != nil || len(value) != 0 {
+		t.Errorf("k: got '%s' (%v), want an empty value", value, err)
+	}
+	if _, err := kvs.Read([]byte("foo")); !errors.Is(err, ErrorKeyDeleted) {
+		t.Errorf("foo: expected '%v', got '%v'", ErrorKeyDeleted, err)
+	}
+
+	// Old records carry no timestamp, and say so rather than claiming one.
+	kvs.scan(func(pos, next int64, r Record) bool {
+		if r.Version != recordV0 {
+			t.Errorf("record at %d reports version %d, want %d", pos, r.Version, recordV0)
+		}
+		if !r.Written().IsZero() {
+			t.Errorf("record at %d claims to have been written at %v", pos, r.Written())
+		}
+		return true
+	})
+
+	// The store goes on working: new records are written in the new layout
+	// beside the old ones, and compaction keeps both readable.
+	if err := kvs.Write([]byte("new"), []byte("record")); err != nil {
+		t.Fatal(err)
+	}
+	if err := kvs.Compact(); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	if err := kvs.Verify(); err != nil {
+		t.Errorf("Verify after compaction: %v", err)
+	}
+	for key, want := range map[string]string{"k": "", "new": "record"} {
+		if value, err := kvs.Read([]byte(key)); err != nil || string(value) != want {
+			t.Errorf("%s: got '%s' (%v), want '%s'", key, value, err, want)
+		}
+	}
+}
+
+// TestTimestamps checks that a record remembers when it was written.
+func TestTimestamps(t *testing.T) {
+	kvs := &KeyValueStore{}
+
+	before := time.Now()
+	if err := kvs.Write([]byte("k"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	after := time.Now()
+
+	written, err := kvs.Modified([]byte("k"))
+	if err != nil {
+		t.Fatalf("Modified: %v", err)
+	}
+	if written.Before(before) || written.After(after) {
+		t.Errorf("written at %v, expected between %v and %v", written, before, after)
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	if err := kvs.Write([]byte("k"), []byte("v2")); err != nil {
+		t.Fatal(err)
+	}
+	again, err := kvs.Modified([]byte("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !again.After(written) {
+		t.Errorf("rewriting left the time at %v, was %v", again, written)
+	}
+
+	// A deleted key has a time of its own: when it was deleted.
+	if err := kvs.Delete([]byte("k")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kvs.Modified([]byte("k")); !errors.Is(err, ErrorKeyDeleted) {
+		t.Errorf("expected '%v', got '%v'", ErrorKeyDeleted, err)
+	}
+	if _, err := kvs.Modified([]byte("missing")); !errors.Is(err, ErrorKeyNotFound) {
+		t.Errorf("expected '%v', got '%v'", ErrorKeyNotFound, err)
 	}
 }
 
@@ -411,8 +530,8 @@ func TestKeyValueStore_CorruptLengthHeader(t *testing.T) {
 	kvs := &KeyValueStore{}
 	kvs.Write([]byte("k"), []byte("v"))
 
-	// Bytes 9..13 hold ValueLength. Claim the maximum.
-	binary.LittleEndian.PutUint32(kvs.Data[9:13], math.MaxUint32)
+	// Bytes 18..22 hold ValueLength. Claim the maximum.
+	binary.LittleEndian.PutUint32(kvs.Data[18:22], math.MaxUint32)
 
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
@@ -998,7 +1117,7 @@ func TestKeyValueStore_VerifyReportsBadFraming(t *testing.T) {
 	kvs.Write([]byte("k"), []byte("v"))
 
 	// A value length that runs past the end of the data.
-	binary.LittleEndian.PutUint32(kvs.Data[9:13], 1<<20)
+	binary.LittleEndian.PutUint32(kvs.Data[18:22], 1<<20)
 
 	err := kvs.Verify()
 	var corrupt *CorruptAtError

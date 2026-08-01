@@ -233,26 +233,44 @@ func (d *diskSegment) scan(fn func(pos int64, raw []byte, r Record) bool) error 
 // checked against what is actually there, so a damaged file gives an error
 // rather than an enormous allocation.
 func readRecordAt(file io.ReaderAt, size, pos int64) (Record, []byte, error) {
-	if pos < 0 || pos > size || size-pos < headerSize {
+	if pos < 0 || pos > size || size-pos < headerSizeV0 {
 		return Record{}, nil, &CorruptAtError{Offset: pos}
 	}
 
-	var header [headerSize]byte
-	if _, err := file.ReadAt(header[:], pos); err != nil {
+	// Read as much header as there could be, which for a short record at the
+	// end of the log is less than the largest layout takes.
+	probe := int64(headerSize)
+	if remaining := size - pos; remaining < probe {
+		probe = remaining
+	}
+
+	header := make([]byte, probe)
+	if _, err := file.ReadAt(header, pos); err != nil {
 		return Record{}, nil, err
 	}
 
-	keyLen := binary.LittleEndian.Uint32(header[5:9])
-	valueLen := binary.LittleEndian.Uint32(header[9:13])
+	headerLen, known := headerSizeFor(header[4])
+	if !known || int64(len(header)) < headerLen {
+		return Record{}, nil, &CorruptAtError{Offset: pos}
+	}
 
-	total := uint64(headerSize) + uint64(keyLen) + uint64(valueLen)
+	var keyLen, valueLen uint32
+	if headerLen == headerSizeV0 {
+		keyLen = binary.LittleEndian.Uint32(header[5:9])
+		valueLen = binary.LittleEndian.Uint32(header[9:13])
+	} else {
+		keyLen = binary.LittleEndian.Uint32(header[14:18])
+		valueLen = binary.LittleEndian.Uint32(header[18:22])
+	}
+
+	total := uint64(headerLen) + uint64(keyLen) + uint64(valueLen)
 	if total > uint64(size-pos) {
 		return Record{}, nil, &CorruptAtError{Offset: pos}
 	}
 
 	raw := make([]byte, total)
-	copy(raw, header[:])
-	if _, err := file.ReadAt(raw[headerSize:], pos+headerSize); err != nil {
+	copy(raw, header[:headerLen])
+	if _, err := file.ReadAt(raw[headerLen:], pos+headerLen); err != nil {
 		return Record{}, nil, err
 	}
 
@@ -272,19 +290,38 @@ func scanSegment(file io.ReaderAt, size int64, fn func(pos int64, raw []byte, r 
 	var pos int64
 
 	for pos < size {
-		if size-pos < headerSize {
+		if size-pos < headerSizeV0 {
 			return &CorruptAtError{Offset: pos}
 		}
 
-		buf = buf[:headerSize]
+		// The first layout's header is the shorter one, so read that much and
+		// then find out which layout this is.
+		buf = buf[:headerSizeV0]
 		if _, err := io.ReadFull(reader, buf); err != nil {
 			return &CorruptAtError{Offset: pos}
 		}
 
-		keyLen := binary.LittleEndian.Uint32(buf[5:9])
-		valueLen := binary.LittleEndian.Uint32(buf[9:13])
+		headerLen, known := headerSizeFor(buf[4])
+		if !known || size-pos < headerLen {
+			return &CorruptAtError{Offset: pos}
+		}
+		if headerLen > headerSizeV0 {
+			buf = buf[:headerLen]
+			if _, err := io.ReadFull(reader, buf[headerSizeV0:]); err != nil {
+				return &CorruptAtError{Offset: pos}
+			}
+		}
 
-		total := uint64(headerSize) + uint64(keyLen) + uint64(valueLen)
+		var keyLen, valueLen uint32
+		if headerLen == headerSizeV0 {
+			keyLen = binary.LittleEndian.Uint32(buf[5:9])
+			valueLen = binary.LittleEndian.Uint32(buf[9:13])
+		} else {
+			keyLen = binary.LittleEndian.Uint32(buf[14:18])
+			valueLen = binary.LittleEndian.Uint32(buf[18:22])
+		}
+
+		total := uint64(headerLen) + uint64(keyLen) + uint64(valueLen)
 		if total > uint64(size-pos) {
 			return &CorruptAtError{Offset: pos}
 		}
@@ -293,13 +330,13 @@ func scanSegment(file io.ReaderAt, size int64, fn func(pos int64, raw []byte, r 
 			// The header has already been taken from the reader, so put it
 			// into the new buffer straight from the file.
 			buf = make([]byte, total)
-			if _, err := file.ReadAt(buf[:headerSize], pos); err != nil {
+			if _, err := file.ReadAt(buf[:headerLen], pos); err != nil {
 				return err
 			}
 		}
 		buf = buf[:total]
 
-		if _, err := io.ReadFull(reader, buf[headerSize:]); err != nil {
+		if _, err := io.ReadFull(reader, buf[headerLen:]); err != nil {
 			return &CorruptAtError{Offset: pos}
 		}
 

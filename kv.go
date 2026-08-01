@@ -10,6 +10,7 @@ import (
 	"math"
 	"runtime"
 	"sync"
+	"time"
 )
 
 // RecordType is a custom uint8 type that represents the type of a record.
@@ -25,9 +26,44 @@ const (
 	RecordTypeDeleted
 )
 
-// headerSize is the size of the fixed-width part of a serialized record:
-// Crc (4) + Type (1) + KeyLength (4) + ValueLength (4).
-const headerSize = 13
+// Record versions, and the size of the fixed-width part of each.
+//
+// The byte after the checksum says which layout a record is in. In the first
+// format that byte was the record type, which is only ever 0 or 1, so a version
+// of 2 or more cannot be mistaken for one of those and the two can sit in the
+// same log. That is what lets a store written before versions existed go on
+// being read.
+const (
+	// recordV0 is the original layout: Crc (4), Type (1), KeyLength (4),
+	// ValueLength (4). It is read but no longer written.
+	recordV0     = 0
+	headerSizeV0 = 13
+
+	// recordV1 is the current layout: Crc (4), Version (1), Type (1),
+	// Timestamp (8), KeyLength (4), ValueLength (4).
+	recordV1     = 2
+	headerSizeV1 = 22
+
+	// recordVersion is what new records are written as.
+	recordVersion = recordV1
+
+	// headerSize is the largest header, which is what a reader has to have in
+	// hand before it knows which layout it is looking at.
+	headerSize = headerSizeV1
+)
+
+// headerSizeFor returns the fixed-width size of a record of this version, and
+// whether the version is one this package knows.
+func headerSizeFor(version uint8) (int64, bool) {
+	switch {
+	case version <= 1: // the type byte of the original layout
+		return headerSizeV0, true
+	case version == recordV1:
+		return headerSizeV1, true
+	default:
+		return 0, false
+	}
+}
 
 // maxFieldLen is the largest key or value that fits in the uint32 length fields.
 const maxFieldLen = math.MaxUint32
@@ -41,6 +77,25 @@ type Record struct {
 	Value       []byte     // Variable length: The value of the key-value pair.
 	KeyLength   uint32     // 4 bytes: The length of the key.
 	ValueLength uint32     // 4 bytes: The length of the value.
+
+	// Version is the layout this record was written in. Records read from a
+	// store written before versions existed report 0, and carry no timestamp.
+	Version uint8
+
+	// Timestamp is when the record was written, in nanoseconds since the Unix
+	// epoch, or zero for a record from before there were timestamps. It is the
+	// writer's clock, so it says when the store was told, not the order two
+	// stores did anything in.
+	Timestamp int64
+}
+
+// Written returns when the record was written, or the zero time for one from a
+// store written before records carried timestamps.
+func (r Record) Written() time.Time {
+	if r.Timestamp == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, r.Timestamp)
 }
 
 // Error is a custom error type that wraps a string. It is used for providing
@@ -221,7 +276,9 @@ func (kvs *KeyValueStore) Write(key, value []byte) error {
 	}
 
 	record := &Record{
+		Version:     recordVersion,
 		Type:        RecordTypeNormal,
+		Timestamp:   time.Now().UnixNano(),
 		Key:         key,
 		Value:       value,
 		KeyLength:   uint32(len(key)),
@@ -313,6 +370,36 @@ func (kvs *KeyValueStore) lookup(key []byte) ([]byte, error) {
 	return record.Value, nil
 }
 
+// Modified returns when the newest record for key was written. It reports
+// ErrorKeyDeleted for a key whose newest record is a tombstone, since that
+// record has a time of its own: when the key was deleted.
+//
+// A record written before the format carried timestamps reports the zero time.
+func (kvs *KeyValueStore) Modified(key []byte) (time.Time, error) {
+	defer kvs.rlockKey(key).RUnlock()
+
+	pos, exists := kvs.Index[string(key)]
+	if !exists {
+		return time.Time{}, ErrorKeyNotFound
+	}
+
+	record, next, err := parseRecordAt(kvs.Data, pos)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if record.Crc != checksumSerialized(kvs.Data[pos:next]) {
+		return time.Time{}, ErrorChecksumMismatch
+	}
+	if !bytes.Equal(record.Key, key) {
+		return time.Time{}, ErrorKeyMismatch
+	}
+	if record.Type != RecordTypeNormal {
+		return record.Written(), ErrorKeyDeleted
+	}
+
+	return record.Written(), nil
+}
+
 // Delete takes a key in the form of a byte slice and marks the associated record as deleted in the KeyValueStore instance.
 // It achieves this by creating a new Record with the RecordType set to RecordTypeDeleted and appending it to the Data byte slice.
 // It also updates the Index map to map the key to the position of the new deleted record.
@@ -325,7 +412,9 @@ func (kvs *KeyValueStore) Delete(key []byte) error {
 	}
 
 	record := &Record{
+		Version:   recordVersion,
 		Type:      RecordTypeDeleted,
+		Timestamp: time.Now().UnixNano(),
 		Key:       key,
 		KeyLength: uint32(len(key)),
 	}
@@ -349,12 +438,20 @@ func (kvs *KeyValueStore) Delete(key []byte) error {
 // serialized are cheaper to check with checksumSerialized.
 func (r *Record) calculateChecksum() uint32 {
 	crc := ^uint32(0)
+	crc = crcFoldByte(crc, recordVersion)
 	crc = crcFoldByte(crc, byte(r.Type))
+	crc = crcFoldUint64(crc, uint64(r.Timestamp))
 	crc = crcFoldUint32(crc, r.KeyLength)
 	crc = crcFoldUint32(crc, r.ValueLength)
 
 	crc = crc32.Update(^crc, crc32.IEEETable, r.Key)
 	return crc32.Update(crc, crc32.IEEETable, r.Value)
+}
+
+// crcFoldUint64 folds a little-endian uint64 into a pre-complemented CRC.
+func crcFoldUint64(crc uint32, v uint64) uint32 {
+	crc = crcFoldUint32(crc, uint32(v))
+	return crcFoldUint32(crc, uint32(v>>32))
 }
 
 // checksumSerialized calculates the checksum of a record that is already laid
@@ -380,14 +477,16 @@ func crcFoldUint32(crc uint32, v uint32) uint32 {
 }
 
 // appendTo serializes the Record and appends it to dst, returning the extended
-// slice. Fields are written in little-endian order: Crc, Type, KeyLength,
-// ValueLength, Key, Value.
+// slice, always in the current layout. Fields are written in little-endian
+// order: Crc, Version, Type, Timestamp, KeyLength, ValueLength, Key, Value.
 func (r *Record) appendTo(dst []byte) []byte {
-	var hdr [headerSize]byte
+	var hdr [headerSizeV1]byte
 	binary.LittleEndian.PutUint32(hdr[0:4], r.Crc)
-	hdr[4] = byte(r.Type)
-	binary.LittleEndian.PutUint32(hdr[5:9], r.KeyLength)
-	binary.LittleEndian.PutUint32(hdr[9:13], r.ValueLength)
+	hdr[4] = recordVersion
+	hdr[5] = byte(r.Type)
+	binary.LittleEndian.PutUint64(hdr[6:14], uint64(r.Timestamp))
+	binary.LittleEndian.PutUint32(hdr[14:18], r.KeyLength)
+	binary.LittleEndian.PutUint32(hdr[18:22], r.ValueLength)
 
 	dst = append(dst, hdr[:]...)
 	dst = append(dst, r.Key...)
@@ -395,9 +494,14 @@ func (r *Record) appendTo(dst []byte) []byte {
 	return dst
 }
 
-// size returns the number of bytes the record occupies in the Data slice.
+// size returns the number of bytes the record occupies in the Data slice, in
+// the layout it was read in.
 func (r *Record) size() int64 {
-	return headerSize + int64(len(r.Key)) + int64(len(r.Value))
+	header, ok := headerSizeFor(r.Version)
+	if !ok {
+		header = headerSizeV1
+	}
+	return header + int64(len(r.Key)) + int64(len(r.Value))
 }
 
 // parseRecordAt decodes the record starting at pos in data and returns it along
@@ -407,7 +511,7 @@ func (r *Record) size() int64 {
 // allocation. The returned Key and Value alias data and must be copied before
 // being handed to a caller or retained across a mutation of the store.
 func parseRecordAt(data []byte, pos int64) (Record, int64, error) {
-	if pos < 0 || pos > int64(len(data)) || int64(len(data))-pos < headerSize {
+	if pos < 0 || pos > int64(len(data)) || int64(len(data))-pos < headerSizeV0 {
 		return Record{}, 0, &CorruptAtError{Offset: pos}
 	}
 
@@ -415,18 +519,33 @@ func parseRecordAt(data []byte, pos int64) (Record, int64, error) {
 
 	var r Record
 	r.Crc = binary.LittleEndian.Uint32(buf[0:4])
-	r.Type = RecordType(buf[4])
-	r.KeyLength = binary.LittleEndian.Uint32(buf[5:9])
-	r.ValueLength = binary.LittleEndian.Uint32(buf[9:13])
+
+	header, known := headerSizeFor(buf[4])
+	if !known || int64(len(buf)) < header {
+		return Record{}, 0, &CorruptAtError{Offset: pos}
+	}
+
+	if header == headerSizeV0 {
+		r.Version = recordV0
+		r.Type = RecordType(buf[4])
+		r.KeyLength = binary.LittleEndian.Uint32(buf[5:9])
+		r.ValueLength = binary.LittleEndian.Uint32(buf[9:13])
+	} else {
+		r.Version = buf[4]
+		r.Type = RecordType(buf[5])
+		r.Timestamp = int64(binary.LittleEndian.Uint64(buf[6:14]))
+		r.KeyLength = binary.LittleEndian.Uint32(buf[14:18])
+		r.ValueLength = binary.LittleEndian.Uint32(buf[18:22])
+	}
 
 	// Widening to uint64 keeps the sum from overflowing on 32-bit platforms.
-	end := uint64(headerSize) + uint64(r.KeyLength) + uint64(r.ValueLength)
+	end := uint64(header) + uint64(r.KeyLength) + uint64(r.ValueLength)
 	if end > uint64(len(buf)) {
 		return Record{}, 0, &CorruptAtError{Offset: pos}
 	}
 
-	keyEnd := headerSize + uint64(r.KeyLength)
-	r.Key = buf[headerSize:keyEnd:keyEnd]
+	keyEnd := uint64(header) + uint64(r.KeyLength)
+	r.Key = buf[header:keyEnd:keyEnd]
 	r.Value = buf[keyEnd:end:end]
 
 	return r, pos + int64(end), nil
@@ -475,13 +594,6 @@ func (kvs *KeyValueStore) offsets() ([]int64, error) {
 	}
 
 	return offs, nil
-}
-
-// keyAt returns the key of the record starting at pos, aliasing the Data slice.
-// pos must have come from a successful scan, so the record is known to decode.
-func (kvs *KeyValueStore) keyAt(pos int64) []byte {
-	keyLen := int64(binary.LittleEndian.Uint32(kvs.Data[pos+5 : pos+9]))
-	return kvs.Data[pos+headerSize : pos+headerSize+keyLen]
 }
 
 // SaveIndex serializes the KeyValueStore's Index (a map of keys to their position in the Data byte slice)
@@ -549,14 +661,19 @@ func (kvs *KeyValueStore) latestOffsets() (map[string]int64, error) {
 	latest := make(map[string]int64)
 	for i := len(offs) - 1; i >= 0; i-- {
 		pos := offs[i]
-		key := kvs.keyAt(pos)
-		if _, seen := latest[string(key)]; seen {
+
+		record, _, err := parseRecordAt(kvs.Data, pos)
+		if err != nil {
+			return nil, err
+		}
+		if _, seen := latest[string(record.Key)]; seen {
 			continue
 		}
-		if RecordType(kvs.Data[pos+4]) == RecordTypeNormal {
-			latest[string(key)] = pos
+
+		if record.Type == RecordTypeNormal {
+			latest[string(record.Key)] = pos
 		} else {
-			latest[string(key)] = deleted
+			latest[string(record.Key)] = deleted
 		}
 	}
 
@@ -640,9 +757,12 @@ func (kvs *KeyValueStore) RebuildIndex() error {
 	// Backwards, so that each key is inserted once: see offsets.
 	index := make(map[string]int64)
 	for i := len(offs) - 1; i >= 0; i-- {
-		key := kvs.keyAt(offs[i])
-		if _, seen := index[string(key)]; !seen {
-			index[string(key)] = offs[i]
+		record, _, perr := parseRecordAt(kvs.Data, offs[i])
+		if perr != nil {
+			break
+		}
+		if _, seen := index[string(record.Key)]; !seen {
+			index[string(record.Key)] = offs[i]
 		}
 	}
 

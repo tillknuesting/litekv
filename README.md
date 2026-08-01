@@ -382,28 +382,49 @@ exactly as before.
 
 ## Binary Storage Format
 
-Each record is a 13-byte header followed by the key and the value:
+Each record is a 22-byte header followed by the key and the value:
 
-| Offset | Size | Field                                |
-| ------ | ---- | ------------------------------------ |
-| 0      | 4    | CRC-32 (IEEE), little-endian         |
-| 4      | 1    | Record type: 0 = normal, 1 = deleted |
-| 5      | 4    | Key length, little-endian uint32     |
-| 9      | 4    | Value length, little-endian uint32   |
-| 13     | *n*  | Key                                  |
-| 13+*n* | *m*  | Value                                |
+| Offset | Size | Field                                        |
+| ------ | ---- | -------------------------------------------- |
+| 0      | 4    | CRC-32 (IEEE), little-endian                 |
+| 4      | 1    | Record version                               |
+| 5      | 1    | Record type: 0 = normal, 1 = deleted         |
+| 6      | 8    | Timestamp, nanoseconds since the Unix epoch  |
+| 14     | 4    | Key length, little-endian uint32             |
+| 18     | 4    | Value length, little-endian uint32           |
+| 22     | *n*  | Key                                          |
+| 22+*n* | *m*  | Value                                        |
 
-The checksum covers the type, both lengths, the key and the value. Keys and values are limited to 4 GiB
-by the uint32 length fields, and `Write` returns `ErrorRecordTooLarge` for anything larger. Every decode
-validates the declared lengths against the bytes actually present, so a truncated or damaged store
-produces an error rather than a panic or an outsized allocation.
+The checksum covers everything after itself, so it does not depend on the layout of what follows. Keys
+and values are limited to 4 GiB by the uint32 length fields, and `Write` returns `ErrorRecordTooLarge`
+for anything larger. Every decode validates the declared lengths against the bytes actually present, so
+a truncated or damaged store produces an error rather than a panic or an outsized allocation.
 
-The format has no header and no version byte, which is worth knowing before you store anything you care
-about: it cannot be changed without breaking every file already written, and nothing in a file says
-which version wrote it.
+`Modified` reports when the newest record for a key was written:
+
+```go
+written, err := kvs.Modified([]byte("foo"))
+```
+
+### Records from before the version byte
+
+The first version of this format had a 13-byte header and no version or timestamp, with the record type
+where the version now sits. A type is only ever 0 or 1, so a version of 2 or more cannot be mistaken for
+one, and the two layouts sit in the same log without ambiguity.
+
+That means a store written before any of this still opens and still reads. Its records report version 0
+and the zero time from `Written`, since they have no timestamp to report and inventing one would be
+worse than admitting it. New records are written in the current layout beside them, and compaction
+copies both across untouched.
+
+What the version byte buys from here is that the next change to the format does not have to orphan
+anything either.
 
 ## Limitations
 
+- **A timestamp costs about 60 ns a write.** Reading the clock is 28 ns of it and the wider header the
+  rest, which took an in-memory write from roughly 50 ns to 110. It is invisible against a file, where
+  the write itself is microseconds, and it is the price of every record knowing when it was written.
 - **Opening still costs the keys.** Hints make it proportional to the number of keys rather than to the
   bytes stored, but every key is still read and indexed before the store answers anything.
 - **Every key must fit in memory.** The index holds each key and an offset, about 59 bytes per key,
