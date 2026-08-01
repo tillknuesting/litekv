@@ -1,6 +1,7 @@
 package litekv
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -1103,5 +1104,183 @@ func TestDBTiers(t *testing.T) {
 	// And the whole store is a handful of logs, not one per rotation.
 	if len(sizes) > 6 {
 		t.Errorf("%d frozen logs is more than a tiered store should settle at", len(sizes))
+	}
+}
+
+// appendV0 encodes a record in the original layout: a 13-byte header with the
+// type where the version now sits, and no timestamp. It is how a store written
+// before either existed looks on disk.
+func appendV0(dst []byte, recordType RecordType, key, value []byte) []byte {
+	start := len(dst)
+
+	var header [headerSizeV0]byte
+	header[4] = byte(recordType)
+	binary.LittleEndian.PutUint32(header[5:9], uint32(len(key)))
+	binary.LittleEndian.PutUint32(header[9:13], uint32(len(value)))
+
+	dst = append(dst, header[:]...)
+	dst = append(dst, key...)
+	dst = append(dst, value...)
+
+	// The checksum covers everything after itself, whatever the layout.
+	binary.LittleEndian.PutUint32(dst[start:start+4], checksumSerialized(dst[start:]))
+	return dst
+}
+
+// TestDBReadsTheOldFormat runs old records through the half of the library that
+// never holds them in memory: indexed off the disk, read back a record at a
+// time, hinted, and merged together with records in the current layout.
+func TestDBReadsTheOldFormat(t *testing.T) {
+	dir := t.TempDir()
+
+	// A segment as an older version of this library would have left it.
+	var old []byte
+	old = appendV0(old, RecordTypeNormal, []byte("alpha"), []byte("from the old format"))
+	old = appendV0(old, RecordTypeNormal, []byte("beta"), []byte("also old"))
+	old = appendV0(old, RecordTypeNormal, []byte("doomed"), []byte("about to go"))
+	old = appendV0(old, RecordTypeDeleted, []byte("doomed"), nil)
+	old = appendV0(old, RecordTypeNormal, []byte("alpha"), []byte("rewritten, still old"))
+	writeInto(t, dir, "0000000001"+segmentSuffix, old)
+
+	db, err := OpenDB(dir, smallSegments(400))
+	if err != nil {
+		t.Fatalf("OpenDB over an old segment: %v", err)
+	}
+
+	// Indexed by reading the file, since there is no hint for it yet.
+	for key, want := range map[string]string{"alpha": "rewritten, still old", "beta": "also old"} {
+		if got, ok := liveValue(t, db, key); !ok || got != want {
+			t.Errorf("%s: got '%s' (%v), want '%s'", key, got, ok, want)
+		}
+	}
+	if _, ok := liveValue(t, db, "doomed"); ok {
+		t.Error("a key deleted in the old format read as live")
+	}
+
+	// Old records have no timestamp and do not pretend otherwise.
+	db.mu.RLock()
+	frozenOrActive := db.searchOrder()
+	db.mu.RUnlock()
+	for _, seg := range frozenOrActive {
+		seg.eachKey(func(key string, pos int64) bool {
+			record, _, err := seg.recordAt(pos)
+			if err != nil {
+				t.Errorf("record for %q: %v", key, err)
+				return false
+			}
+			if record.Version == recordV0 && !record.Written().IsZero() {
+				t.Errorf("old record for %q claims a time", key)
+			}
+			return true
+		})
+	}
+
+	// New records land beside the old ones, in the current layout.
+	for i := 0; i < 40; i++ {
+		if err := db.Write([]byte(fmt.Sprintf("new%02d", i)), []byte("in the current format")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Write([]byte("alpha"), []byte("rewritten in the new format")); err != nil {
+		t.Fatal(err)
+	}
+
+	// A merge has to carry both layouts across.
+	if err := db.Merge(); err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+
+	want := map[string]string{
+		"alpha": "rewritten in the new format",
+		"beta":  "also old",
+		"new00": "in the current format",
+		"new39": "in the current format",
+	}
+	for key, value := range want {
+		if got, ok := liveValue(t, db, key); !ok || got != value {
+			t.Errorf("after merging, %s: got '%s' (%v), want '%s'", key, got, ok, value)
+		}
+	}
+	if _, ok := liveValue(t, db, "doomed"); ok {
+		t.Error("the deleted key came back through the merge")
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// And again from the hints written along the way.
+	reopened, err := OpenDB(dir, smallSegments(400))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+
+	for key, value := range want {
+		if got, ok := liveValue(t, reopened, key); !ok || got != value {
+			t.Errorf("after reopening, %s: got '%s' (%v), want '%s'", key, got, ok, value)
+		}
+	}
+}
+
+// TestScanSegmentMixedLayouts walks a file holding both layouts, which is what
+// a merge and a rebuild each have to do.
+func TestScanSegmentMixedLayouts(t *testing.T) {
+	var data []byte
+	data = appendV0(data, RecordTypeNormal, []byte("old1"), []byte("a"))
+
+	current := &KeyValueStore{}
+	current.Write([]byte("new1"), []byte(strings.Repeat("b", 5000))) // past the scan buffer
+	data = append(data, current.Data...)
+
+	data = appendV0(data, RecordTypeNormal, []byte("old2"), []byte("c"))
+	data = appendV0(data, RecordTypeDeleted, []byte("old1"), nil)
+
+	path := filepath.Join(t.TempDir(), "mixed"+segmentSuffix)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	var versions []uint8
+	var keys []string
+	err = scanSegment(file, int64(len(data)), func(pos int64, raw []byte, r Record) bool {
+		if r.Crc != checksumSerialized(raw) {
+			t.Errorf("record at %d fails its checksum", pos)
+		}
+		versions = append(versions, r.Version)
+		keys = append(keys, string(r.Key))
+		return true
+	})
+	if err != nil {
+		t.Fatalf("scanSegment: %v", err)
+	}
+
+	if strings.Join(keys, ",") != "old1,new1,old2,old1" {
+		t.Errorf("scanned %v, want [old1 new1 old2 old1]", keys)
+	}
+	if versions[0] != recordV0 || versions[1] != recordV1 || versions[2] != recordV0 {
+		t.Errorf("scanned versions %v", versions)
+	}
+
+	// And a record fetched by offset agrees with the walk.
+	index, good, err := indexSegment(file, int64(len(data)))
+	if err != nil {
+		t.Fatalf("indexSegment: %v", err)
+	}
+	if good != int64(len(data)) {
+		t.Errorf("indexed %d of %d bytes", good, len(data))
+	}
+	record, _, err := readRecordAt(file, int64(len(data)), index["new1"])
+	if err != nil {
+		t.Fatalf("readRecordAt: %v", err)
+	}
+	if len(record.Value) != 5000 || record.Version != recordV1 {
+		t.Errorf("new1 read back as version %d with %d bytes", record.Version, len(record.Value))
 	}
 }
