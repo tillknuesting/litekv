@@ -511,44 +511,89 @@ func (r *Record) size() int64 {
 // allocation. The returned Key and Value alias data and must be copied before
 // being handed to a caller or retained across a mutation of the store.
 func parseRecordAt(data []byte, pos int64) (Record, int64, error) {
-	if pos < 0 || pos > int64(len(data)) || int64(len(data))-pos < headerSizeV0 {
+	if pos < 0 || pos > int64(len(data)) {
 		return Record{}, 0, &CorruptAtError{Offset: pos}
 	}
 
 	buf := data[pos:]
 
-	var r Record
-	r.Crc = binary.LittleEndian.Uint32(buf[0:4])
-
-	header, known := headerSizeFor(buf[4])
-	if !known || int64(len(buf)) < header {
+	header, ok := decodeHeader(buf)
+	if !ok {
 		return Record{}, 0, &CorruptAtError{Offset: pos}
 	}
 
-	if header == headerSizeV0 {
-		r.Version = recordV0
-		r.Type = RecordType(buf[4])
-		r.KeyLength = binary.LittleEndian.Uint32(buf[5:9])
-		r.ValueLength = binary.LittleEndian.Uint32(buf[9:13])
-	} else {
-		r.Version = buf[4]
-		r.Type = RecordType(buf[5])
-		r.Timestamp = int64(binary.LittleEndian.Uint64(buf[6:14]))
-		r.KeyLength = binary.LittleEndian.Uint32(buf[14:18])
-		r.ValueLength = binary.LittleEndian.Uint32(buf[18:22])
-	}
-
 	// Widening to uint64 keeps the sum from overflowing on 32-bit platforms.
-	end := uint64(header) + uint64(r.KeyLength) + uint64(r.ValueLength)
+	end := uint64(header.size) + uint64(header.keyLength) + uint64(header.valueLength)
 	if end > uint64(len(buf)) {
 		return Record{}, 0, &CorruptAtError{Offset: pos}
 	}
 
-	keyEnd := uint64(header) + uint64(r.KeyLength)
-	r.Key = buf[header:keyEnd:keyEnd]
+	keyEnd := uint64(header.size) + uint64(header.keyLength)
+
+	r := header.record()
+	r.Key = buf[header.size:keyEnd:keyEnd]
 	r.Value = buf[keyEnd:end:end]
 
 	return r, pos + int64(end), nil
+}
+
+// recordHeader is the fixed part of a record, whichever layout it is in.
+type recordHeader struct {
+	crc         uint32
+	version     uint8
+	recordType  RecordType
+	timestamp   int64
+	keyLength   uint32
+	valueLength uint32
+	size        int64 // what the header itself takes
+}
+
+// record returns the header as a Record, with the key and value still to fill
+// in.
+func (h recordHeader) record() Record {
+	return Record{
+		Crc:         h.crc,
+		Version:     h.version,
+		Type:        h.recordType,
+		Timestamp:   h.timestamp,
+		KeyLength:   h.keyLength,
+		ValueLength: h.valueLength,
+	}
+}
+
+// decodeHeader reads the fixed part of a record from the front of buf. It
+// reports false if the version is not one this package knows, or if buf is
+// shorter than the layout it turns out to be.
+//
+// This is the only place the byte offsets of a record are written down. They
+// were in three places once, and adding a field left two of them reading the
+// wrong bytes while compiling perfectly well.
+func decodeHeader(buf []byte) (recordHeader, bool) {
+	if len(buf) < headerSizeV0 {
+		return recordHeader{}, false
+	}
+
+	size, known := headerSizeFor(buf[4])
+	if !known || int64(len(buf)) < size {
+		return recordHeader{}, false
+	}
+
+	h := recordHeader{crc: binary.LittleEndian.Uint32(buf[0:4]), size: size}
+
+	if size == headerSizeV0 {
+		h.version = recordV0
+		h.recordType = RecordType(buf[4])
+		h.keyLength = binary.LittleEndian.Uint32(buf[5:9])
+		h.valueLength = binary.LittleEndian.Uint32(buf[9:13])
+		return h, true
+	}
+
+	h.version = buf[4]
+	h.recordType = RecordType(buf[5])
+	h.timestamp = int64(binary.LittleEndian.Uint64(buf[6:14]))
+	h.keyLength = binary.LittleEndian.Uint32(buf[14:18])
+	h.valueLength = binary.LittleEndian.Uint32(buf[18:22])
+	return h, true
 }
 
 // scan walks the records in the Data slice in order and calls fn for each one

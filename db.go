@@ -46,6 +46,11 @@ type DB struct {
 	merging bool
 	closed  bool
 
+	// rotateErr is a rotation that could not be finished. The record that
+	// triggered it was stored either way, so it is not the writer's error to
+	// hear; Sync and Close report it instead.
+	rotateErr error
+
 	// mergeMu lets only one merge run at a time. Two at once would build the
 	// same file under the same temporary name and rename it out from under
 	// each other. It is taken before db.mu, never the other way round.
@@ -299,7 +304,11 @@ func (db *DB) Write(key, value []byte) error {
 	if err != nil {
 		return err
 	}
-	return db.rotateIfFull(active)
+
+	// The record is stored. Rotating is housekeeping, and a failure at it is
+	// not a reason to tell the caller their write did not happen.
+	db.rotateIfFull(active)
+	return nil
 }
 
 // Delete marks the key deleted, which is a record in the active log like any
@@ -318,7 +327,9 @@ func (db *DB) Delete(key []byte) error {
 	if err != nil {
 		return err
 	}
-	return db.rotateIfFull(active)
+
+	db.rotateIfFull(active)
+	return nil
 }
 
 // Read returns a copy of the value stored under key, asking the active log
@@ -463,37 +474,42 @@ func (db *DB) Segments() int {
 
 // rotateIfFull freezes the active log if it has grown past the segment size and
 // is still the one that was just written to.
-func (db *DB) rotateIfFull(written *memSegment) error {
+// rotateIfFull freezes the active log if it has grown past the segment size and
+// is still the one that was just written to.
+//
+// A failure here is remembered rather than returned. The record that prompted
+// the rotation is already stored, and a store that cannot rotate goes on
+// working with one log larger than it meant to have, which is worth carrying on
+// with and worth reporting. Sync and Close report it.
+func (db *DB) rotateIfFull(written *memSegment) {
 	if written.size() < db.opts.segmentSize() {
-		return nil
+		return
 	}
 
 	db.mu.Lock()
+	defer db.mu.Unlock()
 
 	// Another writer may have rotated already.
 	if db.closed || db.active != written {
-		db.mu.Unlock()
-		return nil
+		return
 	}
 
 	// Freezing hands the records over to the disk: the store and the Data
 	// slice it was holding go, and what stays in memory is the index.
 	frozen, err := freeze(written, db.opts.Sync)
 	if err != nil {
-		db.mu.Unlock()
-		return err
+		db.rotateErr = err
+		return
 	}
 
 	db.frozen = append([]*diskSegment{frozen}, db.frozen...)
 	if err := db.start(db.nextID); err != nil {
-		db.mu.Unlock()
-		return err
+		db.rotateErr = err
+		return
 	}
 
+	db.rotateErr = nil
 	db.mergeInBackground()
-	db.mu.Unlock()
-
-	return nil
 }
 
 // mergeInBackground starts a merge if enough logs have piled up and one is not
@@ -762,22 +778,37 @@ func syncDir(dir string) {
 	}
 }
 
-// Sync syncs every log that could still be holding unsynced records: the active
-// one, and any frozen one whose timer has not got to it yet.
+// Sync flushes every log to the disk: the active one, and the frozen ones,
+// which under SyncNever may be holding records the operating system has not
+// written out yet.
+//
+// It also reports a rotation that could not be finished, which Write does not,
+// since the record that prompted one is stored whether or not the rotation
+// that followed it worked.
 func (db *DB) Sync() error {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
+	db.mu.Lock()
+	defer db.mu.Unlock()
 
 	if db.closed {
 		return nil
 	}
 
-	// Only the active log can be holding anything unsynced; a frozen one is
-	// never written.
-	if db.active == nil {
-		return nil
+	err := db.rotateErr
+	db.rotateErr = nil
+
+	if db.active != nil {
+		if serr := db.active.sync(); err == nil {
+			err = serr
+		}
 	}
-	return db.active.sync()
+	// A frozen log is never written again, but under SyncNever it may never
+	// have been synced either, and asking for a sync means all of it.
+	for _, seg := range db.frozen {
+		if serr := seg.sync(); err == nil {
+			err = serr
+		}
+	}
+	return err
 }
 
 // Close waits for a running merge and closes every log. A closed DB refuses
@@ -806,12 +837,20 @@ func (db *DB) Close() error {
 // closeSegments closes every log, returning the first error. Callers must hold
 // db.mu for writing.
 func (db *DB) closeSegments() error {
-	var err error
+	err := db.rotateErr
+	db.rotateErr = nil
 
+	// Closing the active store syncs it; the frozen ones have to be asked,
+	// since closing a file does not flush it.
 	if db.active != nil {
-		err = db.active.close()
+		if cerr := db.active.close(); err == nil {
+			err = cerr
+		}
 	}
 	for _, seg := range db.frozen {
+		if serr := seg.sync(); err == nil {
+			err = serr
+		}
 		if cerr := seg.close(); err == nil {
 			err = cerr
 		}

@@ -115,6 +115,11 @@ does. That is the choice `SyncPolicy` makes, and it is not a cheap one:
 | `SyncNever`  | 5.5 µs    | yes                      | no promises               |
 | in memory    | 153 ns    | no                       | no                        |
 
+`Write` tells you whether your record is stored, and nothing else. Freezing a full log and merging are
+housekeeping that happens around it, and a failure at either does not mean the record was lost — so
+those are reported by `Sync` and `Close` instead, which are the calls that answer "is this store
+healthy".
+
 `SyncAlways` is the default, because losing an acknowledged write should be something you ask for rather
 than something that happens quietly. It is also 685x the cost of not syncing, and every reader waits for
 it, since the sync happens under the write lock — there is no way to acknowledge a durable write without

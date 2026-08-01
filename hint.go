@@ -157,7 +157,9 @@ func loadHint(segmentPath string, segmentSize int64) (map[string]int64, bool) {
 		}
 		// An offset that is not in the log would turn a read into an error
 		// rather than a value, so a hint claiming one is not to be trusted.
-		if pos < 0 || pos+headerSize > segmentSize {
+		// The bound is the smallest a record can be, which is the older and
+		// shorter of the two layouts.
+		if pos < 0 || pos+headerSizeV0 > segmentSize {
 			return nil, false
 		}
 

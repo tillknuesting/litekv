@@ -3,7 +3,6 @@ package litekv
 import (
 	"bufio"
 	"bytes"
-	"encoding/binary"
 	"errors"
 	"io"
 	"os"
@@ -156,13 +155,17 @@ func freeze(m *memSegment, policy SyncPolicy) (*diskSegment, error) {
 		return nil, errors.New("litekv: cannot freeze a segment with no file")
 	}
 
-	// The records are on the disk, so the store and its Data slice can go.
-	if err := m.kvs.closeNoSync(); err != nil {
+	// Open the log to read from before letting go of the store that was
+	// writing it. The other way round, a failure here would leave the store
+	// closed and the segment it was the active half of unwritable.
+	file, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
 		return nil, err
 	}
 
-	file, err := os.OpenFile(path, os.O_RDWR, 0o644)
-	if err != nil {
+	// The records are on the disk, so the store and its Data slice can go.
+	if err := m.kvs.closeNoSync(); err != nil {
+		file.Close()
 		return nil, err
 	}
 
@@ -174,6 +177,12 @@ func freeze(m *memSegment, policy SyncPolicy) (*diskSegment, error) {
 }
 
 func (d *diskSegment) id() uint64 { return d.segID }
+
+// sync flushes a frozen log. It is never written, but it may never have been
+// synced either: SyncNever means what it says, and the records of a log frozen
+// under it are only as durable as the operating system has got round to making
+// them.
+func (d *diskSegment) sync() error { return d.file.Sync() }
 
 func (d *diskSegment) close() error       { return d.file.Close() }
 func (d *diskSegment) closeNoSync() error { return d.file.Close() }
@@ -249,19 +258,11 @@ func readRecordAt(file io.ReaderAt, size, pos int64) (Record, []byte, error) {
 		return Record{}, nil, err
 	}
 
-	headerLen, known := headerSizeFor(header[4])
-	if !known || int64(len(header)) < headerLen {
+	fixed, ok := decodeHeader(header)
+	if !ok {
 		return Record{}, nil, &CorruptAtError{Offset: pos}
 	}
-
-	var keyLen, valueLen uint32
-	if headerLen == headerSizeV0 {
-		keyLen = binary.LittleEndian.Uint32(header[5:9])
-		valueLen = binary.LittleEndian.Uint32(header[9:13])
-	} else {
-		keyLen = binary.LittleEndian.Uint32(header[14:18])
-		valueLen = binary.LittleEndian.Uint32(header[18:22])
-	}
+	headerLen, keyLen, valueLen := fixed.size, fixed.keyLength, fixed.valueLength
 
 	total := uint64(headerLen) + uint64(keyLen) + uint64(valueLen)
 	if total > uint64(size-pos) {
@@ -312,14 +313,11 @@ func scanSegment(file io.ReaderAt, size int64, fn func(pos int64, raw []byte, r 
 			}
 		}
 
-		var keyLen, valueLen uint32
-		if headerLen == headerSizeV0 {
-			keyLen = binary.LittleEndian.Uint32(buf[5:9])
-			valueLen = binary.LittleEndian.Uint32(buf[9:13])
-		} else {
-			keyLen = binary.LittleEndian.Uint32(buf[14:18])
-			valueLen = binary.LittleEndian.Uint32(buf[18:22])
+		fixed, ok := decodeHeader(buf)
+		if !ok {
+			return &CorruptAtError{Offset: pos}
 		}
+		keyLen, valueLen := fixed.keyLength, fixed.valueLength
 
 		total := uint64(headerLen) + uint64(keyLen) + uint64(valueLen)
 		if total > uint64(size-pos) {

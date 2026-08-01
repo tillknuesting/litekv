@@ -1284,3 +1284,143 @@ func TestScanSegmentMixedLayouts(t *testing.T) {
 		t.Errorf("new1 read back as version %d with %d bytes", record.Version, len(record.Value))
 	}
 }
+
+// TestDBRotationFailureLeavesStoreUsable checks that a rotation that cannot
+// finish does not take the store with it. Freezing hands the records from the
+// store that was writing them to a handle that reads them, and if it let go of
+// the first before it had the second, a failure there would leave the active
+// log closed and every later write refused.
+func TestDBRotationFailureLeavesStoreUsable(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := OpenDB(dir, smallSegments(200))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Write([]byte("before"), []byte("the trouble")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Take away the permission freezing needs to open the log for reading.
+	db.mu.RLock()
+	active := filepath.Join(dir, fmt.Sprintf("%010d%s", db.active.segID, segmentSuffix))
+	db.mu.RUnlock()
+
+	if err := os.Chmod(active, 0o000); err != nil {
+		t.Skipf("cannot make the log unreadable: %v", err)
+	}
+	defer os.Chmod(active, 0o644)
+
+	// Enough to want a rotation, which cannot be finished.
+	for i := 0; i < 20; i++ {
+		if err := db.Write([]byte(fmt.Sprintf("key%02d", i)), []byte(strings.Repeat("x", 40))); err != nil {
+			t.Fatalf("the write itself failed: %v", err)
+		}
+	}
+
+	// The records went in regardless, and the store still takes writes.
+	if value, ok := liveValue(t, db, "before"); !ok || value != "the trouble" {
+		t.Errorf("before: got '%s' (%v) after a failed rotation", value, ok)
+	}
+	if value, ok := liveValue(t, db, "key19"); !ok || value != strings.Repeat("x", 40) {
+		t.Errorf("key19: got '%s' (%v) after a failed rotation", value, ok)
+	}
+	if err := db.Write([]byte("after"), []byte("the trouble")); err != nil {
+		t.Errorf("the store stopped taking writes after a failed rotation: %v", err)
+	}
+
+	// But the failure is not swallowed: Sync says what went wrong.
+	if err := db.Sync(); err == nil {
+		t.Error("Sync did not report the rotation that failed")
+	}
+	// And having been reported once, it is not repeated.
+	if err := db.Sync(); err != nil {
+		t.Errorf("Sync reported the same rotation failure twice: %v", err)
+	}
+}
+
+// TestHintCoversAnOldFormatLog checks that a hint is accepted for a log whose
+// last record is in the older, shorter layout. The bound on where a record may
+// start is the smallest a record can be, and using the larger one quietly
+// rejected every such hint.
+func TestHintCoversAnOldFormatLog(t *testing.T) {
+	dir := t.TempDir()
+
+	// A log ending in an old-format record, which is nine bytes shorter than
+	// the current layout's header.
+	var old []byte
+	old = appendV0(old, RecordTypeNormal, []byte("alpha"), []byte("one"))
+	old = appendV0(old, RecordTypeNormal, []byte("omega"), []byte("t"))
+	writeInto(t, dir, "0000000001"+segmentSuffix, old)
+
+	// A second log, so the first is frozen rather than the active one. Only a
+	// frozen log gets a hint; the active one is read into memory anyway.
+	var newer []byte
+	newer = appendV0(newer, RecordTypeNormal, []byte("later"), []byte("record"))
+	writeInto(t, dir, "0000000002"+segmentSuffix, newer)
+
+	// Opening reads it the long way and writes a hint.
+	db, err := OpenDB(dir, smallSegments(400))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	hints, _ := hintFiles(t, dir)
+	if len(hints) == 0 {
+		t.Fatal("no hint was written for the old-format log")
+	}
+
+	// Damage a record so that reading the log the long way would stop early.
+	// If the hint is taken, the store opens whole regardless.
+	file, err := os.OpenFile(filepath.Join(dir, "0000000001"+segmentSuffix), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt([]byte{'!'}, headerSizeV0+1); err != nil {
+		t.Fatal(err)
+	}
+	file.Close()
+
+	reopened, err := OpenDB(dir, smallSegments(400))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+
+	if got := reopened.Len(); got != 3 {
+		t.Errorf("%d keys after reopening, want 3: the hint was refused", got)
+	}
+	if value, ok := liveValue(t, reopened, "omega"); !ok || value != "t" {
+		t.Errorf("omega: got '%s' (%v), want 't'", value, ok)
+	}
+}
+
+func TestDBSyncCoversEveryLog(t *testing.T) {
+	db, err := OpenDB(t.TempDir(), DBOptions{Sync: SyncNever, SegmentSize: 200, MergeTrigger: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 60; i++ {
+		if err := db.Write([]byte(fmt.Sprintf("key%02d", i)), []byte(strings.Repeat("v", 30))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if db.Segments() < 3 {
+		t.Fatalf("%d segments; the test wants several frozen ones", db.Segments())
+	}
+
+	// Under SyncNever nothing has been synced yet, so this has to reach the
+	// frozen logs as well as the active one.
+	if err := db.Sync(); err != nil {
+		t.Errorf("Sync: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+}
