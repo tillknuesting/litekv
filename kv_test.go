@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/rand/v2"
 	"os"
 	"runtime"
 	"strings"
@@ -858,6 +859,242 @@ func BenchmarkKeyValueStore_WriteInsert(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+// writeBoundBytes is the size at which a concurrent write benchmark starts its
+// log over, and writeBoundChecks how many writes a goroutine makes between
+// looking. Left alone, a run of these appends for its whole duration — several
+// gigabytes a second across eight goroutines — and what gets measured is append
+// growing a slice. Checking rarely keeps the extra lock acquisition down to
+// about a hundredth of a percent of them.
+const (
+	writeBoundBytes  = 1 << 26 // 64 MiB, as the serial write benchmarks use
+	writeBoundChecks = 8192
+)
+
+// BenchmarkKeyValueStore_WriteParallel is the other half of the lock.
+//
+// A read takes one shard, so reads of different keys run beside each other and
+// scale; ReadScaleParallel is that. A write takes every shard, so writes
+// exclude each other and a second writer has nothing to do but wait. This puts
+// a number on that, which until now was read off the lock rather than measured.
+//
+// What to look for is not whether it gets faster, which it cannot: b.N is split
+// between the writers, so ns/op is the cost of one write however many are
+// running, and perfect serialisation would hold it flat while each waits its
+// turn. Anything above flat is the handover — four mutexes moving between cores
+// — and that is paid on top of the serialisation, not instead of it.
+//
+// The single-writer case is the baseline and should land on WriteUpdate/16.
+func BenchmarkKeyValueStore_WriteParallel(b *testing.B) {
+	for _, writers := range []int{1, 2, 4, 8} {
+		b.Run(fmt.Sprintf("writers=%d", writers), func(b *testing.B) {
+			// A key each, so what is contended is the lock and not one bucket
+			// of the map.
+			keys := makeKeys(writers)
+			value := make([]byte, 16)
+			kvs := &KeyValueStore{}
+
+			var wg sync.WaitGroup
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for w := 0; w < writers; w++ {
+				wg.Add(1)
+				go func(w int) {
+					defer wg.Done()
+
+					written := 0
+					for i := w; i < b.N; i += writers {
+						if err := kvs.Write(keys[w], value); err != nil {
+							// Not Fatal: this is not the goroutine that ran the
+							// benchmark, and only that one may call it.
+							b.Error(err)
+							return
+						}
+
+						// Under the same lock a write takes, so a reset can
+						// never land between a record and the index entry
+						// pointing at it.
+						if written++; written%writeBoundChecks == 0 {
+							kvs.Lock()
+							if len(kvs.Data) > writeBoundBytes {
+								kvs.Data = kvs.Data[:0]
+								clear(kvs.Index)
+							}
+							kvs.Unlock()
+						}
+					}
+				}(w)
+			}
+
+			wg.Wait()
+			b.StopTimer()
+			reportThroughput(b, len(value))
+		})
+	}
+}
+
+// scaleKeyLen is the width of a key from makeKeys, which is what a record costs
+// before its value.
+const scaleKeyLen = len("key:0000000000000000")
+
+// scaleMaxBytes bounds a store built by the scaling benchmarks. The whole cross
+// product is not affordable in memory — a million 16 KiB values is 17 GiB — so
+// a size past this is skipped, which is what leaves the staircase ragged at the
+// large end. Raise it if the machine has the room and the corner matters.
+const scaleMaxBytes = 5 << 28 // 1.25 GiB
+
+// buildScaleStore fills a store with count keys of size-byte values and returns
+// it with the keys and a random order to probe them in.
+//
+// The Data slice is allocated once, at the size it will end up: growing it by
+// append doubles it as it goes, which for a gigabyte store means transiently
+// holding two of them and measuring the allocator on the way there.
+//
+// The probe order is a precomputed permutation. Reading keys in the order they
+// were written lets the prefetcher hide the very misses these benchmarks exist
+// to expose, and building the order inside the timed loop would measure the
+// generator instead.
+func buildScaleStore(b *testing.B, count, size int) (*KeyValueStore, [][]byte, []int) {
+	b.Helper()
+
+	keys := makeKeys(count)
+	value := make([]byte, size)
+	kvs := &KeyValueStore{
+		Data: make([]byte, 0, int64(count)*int64(headerSize+scaleKeyLen+size)),
+	}
+	for _, key := range keys {
+		if err := kvs.Write(key, value); err != nil {
+			b.Fatal(err)
+		}
+	}
+	return kvs, keys, rand.Perm(count)
+}
+
+// reportThroughput adds the payload rate to a benchmark's results, in bytes a
+// second as the rest of the suite reports it and in Mbit/s beside it. The
+// second is the unit for comparing against a link rather than against a disk:
+// gigabit ethernet is 1000 Mbit/s, and a Raspberry Pi's SD card a few hundred.
+//
+// It counts value bytes handed to the caller, not bytes touched to find them,
+// and at small values it is mostly a restatement of the call overhead — a
+// 50 ns lookup of a 16-byte value "does" 2.6 Gbit/s, which says nothing about
+// bandwidth. It only begins to describe bandwidth once the value is large
+// enough to dominate the lookup. Call it with the timer stopped, so that
+// b.Elapsed covers exactly the loop.
+func reportThroughput(b *testing.B, bytesPerOp int) {
+	b.Helper()
+
+	b.SetBytes(int64(bytesPerOp))
+	seconds := b.Elapsed().Seconds()
+	if seconds > 0 {
+		b.ReportMetric(float64(bytesPerOp)*8*float64(b.N)/seconds/1e6, "Mbit/s")
+	}
+}
+
+// BenchmarkKeyValueStore_ReadScale is the read that does not fit in cache.
+//
+// Every other read benchmark here holds 1024 keys. That index is a few tens of
+// kilobytes, it never leaves L2, and what it reports is the best case. A store
+// with a million keys has an index of tens of megabytes, and a lookup there is
+// a hash and a walk out to main memory. The distance between the two ends of
+// this benchmark is what to expect as a store grows, and it is the number to
+// quote at anyone sizing one.
+//
+// The two axes are separate costs and worth reading separately. Growing the key
+// count grows the index, and misses looking the record up. Growing the value
+// grows Data, and misses reading the record out once found — plus the copy, so
+// this is also where the throughput figures mean anything. Only the corner where
+// both are large says what a real store of that size does, and it is the corner
+// nothing else here covers: Read/65536 has large values behind a tiny index.
+//
+// View is used so that nothing is allocated in the loop.
+//
+// The rows in the middle are the least trustworthy numbers in this suite. Where
+// the store is on its way out of L2 — around 16k to 131k keys, depending on the
+// value — a row is tight within a session and moves 10 to 20% between them:
+// 178 ns, 156 ns and 186 ns for 131072keys/16B on three consecutive runs of the
+// same code. The ends are steady to a few percent. Compare a middle row only
+// against another from the same session, and do not go looking for what changed
+// between two of them, because on past evidence it was nothing.
+func BenchmarkKeyValueStore_ReadScale(b *testing.B) {
+	for _, count := range []int{1 << 10, 1 << 14, 1 << 17, 1 << 20} {
+		for _, size := range []int{16, 1024, 16384} {
+			if int64(count)*int64(headerSize+scaleKeyLen+size) > scaleMaxBytes {
+				continue
+			}
+
+			// Built out here rather than inside b.Run, which calls its function
+			// again for every attempt at b.N: a million keys would be written
+			// for each of them and the benchmark would be mostly setup.
+			kvs, keys, probe := buildScaleStore(b, count, size)
+
+			b.Run(fmt.Sprintf("%dkeys/%dB", count, size), func(b *testing.B) {
+				var sink int
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if err := kvs.View(keys[probe[i%count]], func(v []byte) error {
+						sink += len(v)
+						return nil
+					}); err != nil {
+						b.Fatal(err)
+					}
+				}
+				b.StopTimer()
+				reportThroughput(b, size)
+			})
+
+			// A gigabyte store is dropped here rather than whenever the
+			// collector next looks, so that two of them are never live at once.
+			// Nothing above is read again, so all of it is already unreachable.
+			runtime.GC()
+		}
+	}
+}
+
+// BenchmarkKeyValueStore_ReadScaleParallel is the same walk on every core.
+//
+// It answers a question the serial one leaves open: whether a store that has
+// stopped fitting in cache still scales. The sharded lock spreads readers, and
+// a lookup that misses to memory leaves the core idle while it waits, which is
+// room for another core to be doing the same. Read against the serial numbers
+// above, not against ReadParallel, which holds 1024 keys and measures the lock
+// rather than the memory.
+func BenchmarkKeyValueStore_ReadScaleParallel(b *testing.B) {
+	for _, count := range []int{1 << 10, 1 << 20} {
+		for _, size := range []int{16, 1024} {
+			if int64(count)*int64(headerSize+scaleKeyLen+size) > scaleMaxBytes {
+				continue
+			}
+
+			kvs, keys, probe := buildScaleStore(b, count, size)
+
+			b.Run(fmt.Sprintf("%dkeys/%dB", count, size), func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				b.RunParallel(func(pb *testing.PB) {
+					// Each goroutine starts at its own point in the
+					// permutation, so they are not all queued behind the same
+					// cache line.
+					i := rand.IntN(count)
+					sink := 0
+					for pb.Next() {
+						kvs.View(keys[probe[i%count]], func(v []byte) error {
+							sink += len(v)
+							return nil
+						})
+						i++
+					}
+				})
+				b.StopTimer()
+				reportThroughput(b, size)
+			})
+
+			runtime.GC()
+		}
 	}
 }
 

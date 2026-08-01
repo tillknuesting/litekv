@@ -13,3 +13,7 @@
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
+
+# Raw benchmark samples from benchmark.sh. Machine-specific and regenerable; to
+# keep one as a baseline to compare against, git add -f it under a real name.
+bench/

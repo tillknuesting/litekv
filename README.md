@@ -131,7 +131,7 @@ does. That is the choice `SyncPolicy` makes, and it is not a cheap one:
 | `SyncAlways` | 3.7 ms    | yes                      | yes                       |
 | `SyncEvery`  | 2.1 µs    | yes                      | all but the last interval |
 | `SyncNever`  | 2.5 µs    | yes                      | no promises               |
-| in memory    | 158 ns    | no                       | no                        |
+| in memory    | 119 ns    | no                       | no                        |
 
 `Write` tells you whether your record is stored, and nothing else. Freezing a full log and merging are
 housekeeping that happens around it, and a failure at either does not mean the record was lost — so
@@ -427,6 +427,66 @@ and a single-reader one can set it to 1.
 A hot key is still a hot shard: keys are spread by hash, so many readers of the *same* key contend
 exactly as before.
 
+Writers get nothing from any of this, and adding them costs. A write takes every shard, so writers
+exclude each other, and splitting the same work over more of them only moves four mutexes between more
+cores:
+
+| writers | per write | writes a second |
+| ------- | --------- | --------------- |
+| 1       | 114 ns    | 8.8 M           |
+| 2       | 228 ns    | 4.4 M           |
+| 4       | 232 ns    | 4.3 M           |
+| 8       | 241 ns    | 4.1 M           |
+
+The whole step is from one writer to two, and it halves the throughput of the store; four and eight are
+barely worse than two. What costs is leaving the uncontended path rather than how crowded it gets: an
+acquisition that stops winning its compare-and-swap parks the goroutine and wakes it through the
+runtime, four times over, and once every writer is doing that another one merely joins the queue.
+
+So one writer is not a limit to work around but the shape to build for. Handing writes to a single
+goroutine beats sharing the store between several, and it is the arrangement the rest of the design
+already assumes.
+
+## How it scales
+
+Every read figure above comes from a store of about a thousand keys, whose index is a few tens of
+kilobytes and never leaves L2. That is the best case, and a store which has outgrown the cache does not
+get it: the lookup becomes a hash and a walk out to main memory.
+
+| keys      | 16-byte value | 1 KiB value | 16 KiB value |
+| --------- | ------------- | ----------- | ------------ |
+| 1,024     | 49 ns         | 137 ns      | 1.58 µs      |
+| 16,384    | 66 ns         | 210 ns      | 1.75 µs      |
+| 131,072   | 186 ns        | 461 ns      |              |
+| 1,048,576 | 437 ns        | 606 ns      |              |
+
+Going from a thousand keys to a million costs about 390 ns at 16-byte values and about 470 at 1 KiB —
+near enough the same number of nanoseconds either way, because the miss is a fixed tax on finding the
+record rather than a multiplier on reading it. So it is 8.9x the cost of a small read and 4.4x of a
+larger one: a store of big values hardly notices what a store of small ones cannot ignore. The blanks
+are combinations too large to build in memory to measure.
+
+Cores take most of it back. A lookup waiting on memory leaves its core with nothing to do, and another
+core can be waiting at the same time, so the misses overlap instead of queueing:
+
+| keys      | 16-byte value | 1 KiB value |
+| --------- | ------------- | ----------- |
+| 1,024     | 40 ns         | 46 ns       |
+| 1,048,576 | 61 ns         | 105 ns      |
+
+Ten goroutines are worth 1.2x at a thousand keys and 7.1x at a million. The store gets *more* out of the
+cores it is given the less of it fits in cache, which is the opposite of the write side above, and the
+two together are most of what there is to know before sizing one.
+
+As payload the same matrix spans three hundredfold, from 293 Mbit/s reading 16-byte values out of a
+million keys to 83 Gbit/s reading 16 KiB values out of a thousand, and 78 Gbit/s at a million keys with
+ten goroutines and 1 KiB values. Which is the argument against quoting any single throughput number for
+a key-value store, this one included: nothing about "how fast is it" survives contact with the question
+of how many keys, how large, and from how many goroutines.
+
+All of these are an Apple M4 with ten cores. What matters is the ratios; a Raspberry Pi will be slower
+throughout and will meet its SD card long before it meets any of these.
+
 ## Binary Storage Format
 
 Each record is a 22-byte header followed by the key and the value:
@@ -477,13 +537,19 @@ anything either.
 - **Every key must fit in memory.** The index holds each key and an offset, about 59 bytes per key,
   however large the values are. Ten million keys is roughly 600 MB of index, and no amount of paging
   values out of memory changes that.
+- **A read slows down as the index outgrows the cache**, by about 390 ns between a thousand keys and a
+  million. Most of the quoted read figures are from small stores and are the best case. See
+  "How it scales"; the short version is that it hurts a store of small values and barely touches one of
+  large values, and that concurrent readers get most of it back.
 - **A `KeyValueStore` holds every record in memory**, live or superseded, until compaction. A `DB` holds
   only the keys and its active log, which is what to reach for once a store outgrows memory.
 - **No range or prefix queries.** The index is a hash map, so keys have no order. A radix tree that gave
   ordered traversal was measured and reverted: prefix queries went from a full scan to 214 ns, but point
   lookups cost 3 to 4.5x more, which was the wrong trade here. It is in the history at `9e3cf2c`.
-- **One writer at a time.** Writes take every shard of the lock, so they serialize with each other, and
-  for a single `KeyValueStore` with compaction as well.
+- **One writer at a time, and a second one costs.** Writes take every shard of the lock, so they
+  serialize with each other, and for a single `KeyValueStore` with compaction as well. Two goroutines
+  writing do not merely fail to go faster, they halve the store's throughput — 114 ns a write becomes
+  228 — and more of them change little after that. Write from one goroutine.
 - **Merging still rewrites.** Merging by size bounds the cost at about log₄ of the store rather than
   letting it grow with it, but every record is still rewritten a few times over its life. An append-only
   workload should turn merging off rather than pay for it.
@@ -535,8 +601,27 @@ restart. Coverage is around 93%; what is left is I/O failures that need a filesy
 go test -bench=. ./...
 ```
 
+That is one sample of each, which is enough to see a number and not enough to trust one. For that:
+
+```bash
+./benchmark.sh 10          # ten passes of everything, then benchstat
+./benchmark.sh 5 ReadScale # five passes of what matches a regexp
+```
+
+It runs the whole suite start to finish, several times over, rather than repeating each benchmark ten
+times where it stands. The difference is not pedantry: `go test -count=10` finishes one benchmark before
+starting the next, so a machine that warms up over the session gives its early benchmarks a cold clock
+and its later ones a hot one, and the drift lands as a bias inside each result. Alternating spreads every
+benchmark's samples across the whole session, so the same drift lands as noise in all of them, where
+benchstat can see it and say so. It keeps the raw samples, so two runs can be compared:
+
+```bash
+benchstat bench/old.txt bench/new.txt
+```
+
 For a `KeyValueStore`: reads and writes at 16 bytes, 1 KiB and 64 KiB, reading with and without copying,
-the parallel read paths, compaction, and index rebuilds.
+the parallel read paths, reads across four orders of magnitude of key count and three of value size,
+writes from one to eight goroutines, compaction, and index rebuilds.
 
 For a `DB`: reading from the active log against reading from a frozen one, writing with logs rotating
 under it against writing with a log large enough that they never do, merging, and opening with the hints

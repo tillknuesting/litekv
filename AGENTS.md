@@ -101,7 +101,12 @@ is remembered in `db.rotateErr` and reported by `Sync` and `Close`.
   assert a latency.
 - **Benchmarks that measure the allocator.** The original suite appended
   gigabyte values in a `b.N` loop without resetting, so it measured `append` and
-  ran a small machine out of memory.
+  ran a small machine out of memory. It came back: `WriteDurability/memory` was
+  still unbounded and still appending about a gigabyte a sample, which is why it
+  read 158 ns alone and 190 ns after a benchmark that had built a large store,
+  and why it was the noisiest number in the suite at ±12%. Bounded, it is 119 ns
+  at ±1%, and agrees with `WriteUpdate/16` next door, which it never had. If a
+  write benchmark has no `len(kvs.Data) > 1<<26` in it, that is a bug.
 - **`HeapAlloc` deltas under-report.** They once claimed a 100k-entry map costs
   10.9 bytes a key. Count the structure, or use `TotalAlloc` over a preallocated
   build.
@@ -138,6 +143,19 @@ writing anything.
 Every number in the README came from a benchmark or a test in this repository,
 on a quiet machine, and the test that produced it is still there. If you change
 something that moves one of those numbers, re-run it and change the number.
+
+Use `./benchmark.sh 10` rather than `go test -bench . -count=10`. It runs the
+whole suite ten times over instead of running each benchmark ten times where it
+stands, which is what keeps the machine warming up over the session out of the
+individual results — see the drift entry below. It prints the load average it
+started under, and leaves the raw samples in `bench/` for benchstat to compare.
+
+Not every number is equally solid, and the suite says which. Where a store is on
+its way out of L2 — the middle rows of `ReadScale`, around 16k to 131k keys —
+a row is tight within a session and moves 10 to 20% between them. Three
+consecutive runs of untouched code gave 178, 156 and 186 ns for the same row.
+Compare those only within a session, and do not go hunting for what changed
+between two of them.
 
 For anything about durability or ordering, use the seam in `fs.go`. It records
 every open, write, sync, truncate, close, rename, remove, list and read in

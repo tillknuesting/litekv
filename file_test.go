@@ -645,6 +645,18 @@ func BenchmarkWriteDurability(b *testing.B) {
 			if err := kvs.Write(key, value); err != nil {
 				b.Fatal(err)
 			}
+			// Bounded like the other in-memory write benchmarks. Without this
+			// the log grows for the whole run — about a gigabyte a second at
+			// this speed — and what is measured stops being the write and
+			// becomes append growing the slice. It also made the result depend
+			// on the heap it inherited from whatever ran before it in the same
+			// process: 158 ns alone, 190 ns after a benchmark that had built a
+			// gigabyte store. The file-backed cases above cannot do this, since
+			// Data has to keep matching the log, and do not need to: they are
+			// slow enough that the log stays small.
+			if len(kvs.Data) > 1<<26 {
+				kvs.Data = kvs.Data[:0]
+			}
 		}
 	})
 }
