@@ -24,7 +24,7 @@ the store outgrows memory, or when compacting one log in one go has become a sta
 |                          | `KeyValueStore`      | `DB`                                     |
 | ------------------------ | -------------------- | ---------------------------------------- |
 | Records in memory        | all of them          | the active log only                      |
-| Read of a 512-byte value | 156 ns               | 847 ns from a frozen log                 |
+| Read of a 512-byte value | 147 ns               | 824 ns from a frozen log                 |
 | Compaction               | stops the world      | merges in the background                 |
 | After `Close`            | still reads          | refuses: its values are behind shut files |
 | Data as a byte slice     | yes, `Data`          | no, it is several files                  |
@@ -128,10 +128,10 @@ does. That is the choice `SyncPolicy` makes, and it is not a cheap one:
 
 | policy       | per write | survives a process crash | survives losing power     |
 | ------------ | --------- | ------------------------ | ------------------------- |
-| `SyncAlways` | 3.8 ms    | yes                      | yes                       |
-| `SyncEvery`  | 7.0 µs    | yes                      | all but the last interval |
-| `SyncNever`  | 5.5 µs    | yes                      | no promises               |
-| in memory    | 153 ns    | no                       | no                        |
+| `SyncAlways` | 3.7 ms    | yes                      | yes                       |
+| `SyncEvery`  | 2.1 µs    | yes                      | all but the last interval |
+| `SyncNever`  | 2.5 µs    | yes                      | no promises               |
+| in memory    | 158 ns    | no                       | no                        |
 
 `Write` tells you whether your record is stored, and nothing else. Freezing a full log and merging are
 housekeeping that happens around it, and a failure at either does not mean the record was lost — so
@@ -139,7 +139,7 @@ those are reported by `Sync` and `Close` instead, which are the calls that answe
 healthy".
 
 `SyncAlways` is the default, because losing an acknowledged write should be something you ask for rather
-than something that happens quietly. It is also 685x the cost of not syncing, and every reader waits for
+than something that happens quietly. It is also more than a thousand times the cost of not syncing, and every reader waits for
 it, since the sync happens under the write lock — there is no way to acknowledge a durable write without
 waiting for the disk. Those numbers come from an SSD on macOS, where `Sync` is a full barrier; an SD card
 in a Raspberry Pi is worse. `Sync` forces a flush at any time, whatever the policy.
@@ -245,10 +245,12 @@ memory, even when the operating system still has the page:
 
 | read of a 512-byte value | |
 | ------------------------ | ------- |
-| from memory              | 156 ns  |
-| from a frozen log        | 847 ns  |
+| from the active log      | 147 ns  |
+| from a frozen log        | 824 ns  |
 
-So a `DB` trades roughly five times the read latency for roughly a tenth of the memory. A
+So a `DB` trades roughly five times the read latency for roughly a tenth of the memory. The gap closes
+as values grow, since the copy starts to matter more than the call: 74 ns against 770 for 16 bytes, and
+684 against 1377 for 4 KiB. A
 `KeyValueStore` makes the opposite trade and keeps everything in memory, which is the right one while
 the store still fits.
 
@@ -264,6 +266,18 @@ The single log's wait is the compaction itself and grows with what is stored. Th
 grow, and what is left is not lock contention at all: it is the one sync that makes the merge crash safe,
 which on macOS is a full device barrier and stalls other writes at the operating system. That is one
 barrier per merge, whatever the store holds.
+
+### What rotation costs
+
+Freezing a log is work a write occasionally has to stop for: the store lets go of what it was holding,
+opens the log to read from, and writes the index beside it. Averaged over the writes between one
+rotation and the next, at 64 KiB logs and 128-byte values, that is 10.5 µs a write against 2.2 µs for a
+store whose logs never fill. The median write is untouched at about 2 µs — the cost is a handful of slow
+writes, not a tax on all of them.
+
+`SegmentSize` is the knob. Larger logs rotate less and hold more in memory while they are the active one;
+smaller ones rotate more and keep memory down. Nothing here is proportional to how much the store already
+holds, which is the point of the arrangement.
 
 ### Merging by size
 
@@ -311,6 +325,11 @@ The hints came to 1.3 MiB, about 2% of the log, since a hint holds a key and an 
 key and a value. On an SSD that is 20x; on a Raspberry Pi's SD card, where the difference is bytes
 actually read rather than bytes already cached, it is the difference between a store that opens and one
 you wait for.
+
+Writing a hint does not wait for the disk. Every way an unsynced hint can come back wrong is a way of it
+being ignored — bytes that never landed fail its checksum, a rename that never landed leaves no hint —
+and both cost a scan of the log and nothing else. Syncing them was four fifths of the time spent writing
+to a store whose logs rotate, for something whose loss costs only that scan.
 
 A hint is only ever a shortcut. It is rejected if it is damaged, truncated, not a hint at all, or
 describes a log of a different length than the one beside it — and any of those simply means reading the
@@ -516,8 +535,14 @@ restart. Coverage is around 93%; what is left is I/O failures that need a filesy
 go test -bench=. ./...
 ```
 
-Benchmarks cover reads and writes at 16 bytes, 1 KiB and 64 KiB, the parallel read paths, compaction,
-index rebuilds, and the cost of each sync policy.
+For a `KeyValueStore`: reads and writes at 16 bytes, 1 KiB and 64 KiB, reading with and without copying,
+the parallel read paths, compaction, and index rebuilds.
+
+For a `DB`: reading from the active log against reading from a frozen one, writing with logs rotating
+under it against writing with a log large enough that they never do, merging, and opening with the hints
+against opening without them.
+
+And the cost of each sync policy, which is the one number worth knowing before choosing one.
 
 ## Fuzz Testing
 

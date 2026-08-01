@@ -13,8 +13,7 @@ import (
 // handing back an offset that is not in the log, since a hint is taken at its
 // word and every read afterwards trusts it.
 func FuzzHint(f *testing.F) {
-	var index map[string]int64
-	index = map[string]int64{"alpha": 0, "beta": 40}
+	index := map[string]int64{"alpha": 0, "beta": 40}
 
 	dir := f.TempDir()
 	segment := dir + "/0000000001" + segmentSuffix

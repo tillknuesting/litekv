@@ -569,8 +569,6 @@ func TestDBModel(t *testing.T) {
 	}
 }
 
-func nanotime() int64 { return time.Now().UnixNano() }
-
 func dirSize(t *testing.T, dir string) int64 {
 	t.Helper()
 
@@ -918,66 +916,6 @@ func TestDBMemory(t *testing.T) {
 	if segmented >= single {
 		t.Errorf("segments held %d bytes, no better than one log at %d", segmented, single)
 	}
-}
-
-// TestDBReadCost is the other side of that trade: a value in a frozen log costs
-// a read from the file rather than a look at memory.
-func TestDBReadCost(t *testing.T) {
-	if testing.Short() {
-		t.Skip("writes a few MB")
-	}
-
-	const records = 4000
-	value := make([]byte, 512)
-	key := func(i int) []byte { return []byte(fmt.Sprintf("key%06d", i)) }
-
-	dir := t.TempDir()
-	db, err := OpenDB(dir, DBOptions{Sync: SyncNever, SegmentSize: 256 << 10, MergeTrigger: 1 << 30})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	for i := 0; i < records; i++ {
-		if err := db.Write(key(i), value); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	single, err := Open(filepath.Join(t.TempDir(), "kv"), Options{Sync: SyncNever})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer single.Close()
-	for i := 0; i < records; i++ {
-		if err := single.Write(key(i), value); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	time := func(read func(i int) error) float64 {
-		start := nanotime()
-		for round := 0; round < 5; round++ {
-			for i := 0; i < records; i++ {
-				if err := read(i); err != nil {
-					t.Fatal(err)
-				}
-			}
-		}
-		return float64(nanotime()-start) / float64(records*5)
-	}
-
-	fromDisk := time(func(i int) error {
-		_, err := db.Read(key(i))
-		return err
-	})
-	fromMemory := time(func(i int) error {
-		_, err := single.Read(key(i))
-		return err
-	})
-
-	t.Logf("read of a 512-byte value: %.0f ns from a frozen log on disk, %.0f ns from memory",
-		fromDisk, fromMemory)
 }
 
 // TestDBTieredKeepsTombstones is the rule that makes a partial merge safe. A
@@ -1420,4 +1358,212 @@ func TestDBSyncCoversEveryLog(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Errorf("Close: %v", err)
 	}
+}
+
+// benchDB fills a store until several logs are frozen, and returns a key that
+// is in the active log and one that is in a frozen one. Reading them is the
+// same call and a different amount of work: memory against a file.
+func benchDB(b *testing.B, valueSize int) (*DB, []byte, []byte) {
+	b.Helper()
+
+	// Sized so that a few thousand records of whatever size fill several logs,
+	// rather than fitting in one when the values are small.
+	const records = 4000
+	segment := int64(records*(valueSize+headerSizeV1+9)) / 8
+
+	db, err := OpenDB(b.TempDir(), DBOptions{Sync: SyncNever, SegmentSize: segment, MergeTrigger: 1 << 30})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	value := make([]byte, valueSize)
+	for i := 0; i < records; i++ {
+		if err := db.Write([]byte(fmt.Sprintf("key%06d", i)), value); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if db.Segments() < 3 {
+		b.Fatalf("%d segments; the benchmark wants several", db.Segments())
+	}
+
+	// The active log is empty if the last write happened to rotate it, so put a
+	// key in it and take that one.
+	var inMemory, onDisk string
+	for attempt := 0; inMemory == "" && attempt < 4; attempt++ {
+		if err := db.Write([]byte(fmt.Sprintf("active%d", attempt)), value); err != nil {
+			b.Fatal(err)
+		}
+		db.mu.RLock()
+		db.active.eachKey(func(key string, _ int64) bool { inMemory = key; return false })
+		db.mu.RUnlock()
+	}
+
+	db.mu.RLock()
+	db.frozen[len(db.frozen)-1].eachKey(func(key string, _ int64) bool { onDisk = key; return false })
+	db.mu.RUnlock()
+
+	if inMemory == "" || onDisk == "" {
+		b.Fatal("could not find a key in each kind of log")
+	}
+	return db, []byte(inMemory), []byte(onDisk)
+}
+
+// BenchmarkDB_Read is the cost of keeping the frozen logs on the disk: the same
+// call, against memory and against a file.
+func BenchmarkDB_Read(b *testing.B) {
+	for _, size := range []int{16, 512, 4096} {
+		db, inMemory, onDisk := benchDB(b, size)
+
+		for _, probe := range []struct {
+			name string
+			key  []byte
+		}{
+			{"active", inMemory},
+			{"frozen", onDisk},
+		} {
+			b.Run(fmt.Sprintf("%d/%s", size, probe.name), func(b *testing.B) {
+				b.SetBytes(int64(size))
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if _, err := db.Read(probe.key); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+
+		db.Close()
+	}
+}
+
+// BenchmarkDB_Write measures a write with logs rotating under it against one
+// with a log large enough that they never do, which is the cost of rotating.
+func BenchmarkDB_Write(b *testing.B) {
+	value := make([]byte, 128)
+
+	for _, segment := range []struct {
+		name string
+		size int64
+	}{
+		{"rotating", 64 << 10},
+		{"one log", 1 << 30},
+	} {
+		b.Run(segment.name, func(b *testing.B) {
+			db, err := OpenDB(b.TempDir(), DBOptions{
+				Sync: SyncNever, SegmentSize: segment.size, MergeTrigger: 1 << 30,
+			})
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer db.Close()
+
+			b.SetBytes(int64(len(value)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := db.Write([]byte(fmt.Sprintf("key%08d", i)), value); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkDB_Merge is the background work: what it costs to fold a store's
+// frozen logs into one.
+func BenchmarkDB_Merge(b *testing.B) {
+	value := make([]byte, 256)
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		db, err := OpenDB(b.TempDir(), DBOptions{Sync: SyncNever, SegmentSize: 128 << 10, MergeTrigger: 1 << 30})
+		if err != nil {
+			b.Fatal(err)
+		}
+		// Rewrites, so the merge has records to drop as well as to copy.
+		for j := 0; j < 4000; j++ {
+			if err := db.Write([]byte(fmt.Sprintf("key%04d", j%1000)), value); err != nil {
+				b.Fatal(err)
+			}
+		}
+		b.StartTimer()
+
+		if err := db.Merge(); err != nil {
+			b.Fatal(err)
+		}
+
+		b.StopTimer()
+		db.Close()
+		b.StartTimer()
+	}
+}
+
+// BenchmarkDB_Open is what a hint is for: opening off the index written beside
+// each log, against reading every record to work it out again.
+func BenchmarkDB_Open(b *testing.B) {
+	dir := b.TempDir()
+
+	db, err := OpenDB(dir, DBOptions{Sync: SyncNever, SegmentSize: 1 << 20, MergeTrigger: 1 << 30})
+	if err != nil {
+		b.Fatal(err)
+	}
+	value := make([]byte, 1024)
+	for i := 0; i < 16_000; i++ {
+		if err := db.Write([]byte(fmt.Sprintf("key%08d", i)), value); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		b.Fatal(err)
+	}
+
+	dropHints := func(b *testing.B) {
+		b.Helper()
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			b.Fatal(err)
+		}
+		for _, entry := range entries {
+			if strings.HasSuffix(entry.Name(), hintSuffix) {
+				if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+	}
+
+	b.Run("with hints", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			reopened, err := OpenDB(dir, DBOptions{Sync: SyncNever, MergeTrigger: 1 << 30})
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.StopTimer()
+			reopened.Close()
+			b.StartTimer()
+		}
+	})
+
+	b.Run("without hints", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			// Opening writes the hints it worked out, so they go again first.
+			b.StopTimer()
+			dropHints(b)
+			b.StartTimer()
+
+			reopened, err := OpenDB(dir, DBOptions{Sync: SyncNever, MergeTrigger: 1 << 30})
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.StopTimer()
+			reopened.Close()
+			b.StartTimer()
+		}
+	})
 }
