@@ -694,7 +694,7 @@ func mergeInto(path string, victims []*diskSegment, dropTombstones bool) (map[st
 		})
 	}
 
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	file, err := openDisk(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -759,7 +759,7 @@ func mergeInto(path string, victims []*diskSegment, dropTombstones bool) (map[st
 // merge already built rather than reading the log again, and writes the hint
 // that saves the next open from reading it either.
 func adoptMerged(id uint64, path string, index map[string]int64, size int64) (*diskSegment, error) {
-	file, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	file, err := openDisk(path, os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
 	}
@@ -772,7 +772,7 @@ func adoptMerged(id uint64, path string, index map[string]int64, size int64) (*d
 // syncDir makes a rename in dir durable. Not every filesystem supports it, so a
 // failure is not fatal.
 func syncDir(dir string) {
-	if handle, err := os.Open(dir); err == nil {
+	if handle, err := openDisk(dir, os.O_RDONLY, 0); err == nil {
 		handle.Sync()
 		handle.Close()
 	}

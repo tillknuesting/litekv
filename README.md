@@ -454,6 +454,13 @@ anything either.
 go test -race ./...
 ```
 
+Durability is checked by watching the disk rather than by trusting the code. The package opens files
+through one function, which a test replaces with one that records every open, write, sync, truncate and
+close in order, and can be told to make any of them fail. That is how the sync policies are held to what
+they promise, how `Sync` is shown to reach the frozen logs and not only the active one, and how a merge
+is shown to sync its new log before renaming it into place. Orderings like those are most of what makes
+a crash survivable, and none of them show up in the result of an operation.
+
 The suite includes a model test that runs thousands of random operations against a plain map and checks
 the store still agrees after every one, over all three backings — in memory, an attached log, and a file
 — and another that reopens the file part way through, so records have to mean the same thing after a

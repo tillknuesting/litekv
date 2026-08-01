@@ -119,15 +119,26 @@ type logState struct {
 // returning; under the other policies it may have been, and that is what they
 // trade away.
 func Open(path string, opts Options) (*KeyValueStore, error) {
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
+	file, err := openDisk(path, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return nil, err
 	}
 
-	data, err := io.ReadAll(file)
+	// Read it by offset rather than by cursor: everything else in this package
+	// addresses a log by position, and a file with a read cursor is one more
+	// thing a stand-in for one would have to get right.
+	info, err := file.Stat()
 	if err != nil {
 		file.Close()
 		return nil, err
+	}
+
+	data := make([]byte, info.Size())
+	if len(data) > 0 {
+		if _, err := io.ReadFull(io.NewSectionReader(file, 0, info.Size()), data); err != nil {
+			file.Close()
+			return nil, err
+		}
 	}
 
 	kvs := &KeyValueStore{Data: data}
@@ -301,7 +312,7 @@ func (kvs *KeyValueStore) rewrite() error {
 func (kvs *KeyValueStore) rewriteFile(state *logState) error {
 	temp := state.path + ".rewrite"
 
-	file, err := os.OpenFile(temp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	file, err := openDisk(temp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
@@ -324,7 +335,7 @@ func (kvs *KeyValueStore) rewriteFile(state *logState) error {
 
 	// The rename is only durable once the directory holding it is synced. Not
 	// every filesystem supports that, so a failure here is not fatal.
-	if dir, err := os.Open(filepath.Dir(state.path)); err == nil {
+	if dir, err := openDisk(filepath.Dir(state.path), os.O_RDONLY, 0); err == nil {
 		dir.Sync()
 		dir.Close()
 	}

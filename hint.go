@@ -49,7 +49,7 @@ func writeHint(segmentPath string, segmentSize int64, index map[string]int64) er
 	path := hintPath(segmentPath)
 	temp := path + mergeSuffix
 
-	file, err := os.OpenFile(temp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	file, err := openDisk(temp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
