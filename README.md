@@ -461,6 +461,12 @@ they promise, how `Sync` is shown to reach the frozen logs and not only the acti
 is shown to sync its new log before renaming it into place. Orderings like those are most of what makes
 a crash survivable, and none of them show up in the result of an operation.
 
+A read that cannot be served is not treated as a log that ends. Bytes that are not a record, or a log
+stopping in the middle of one, are a torn tail, and the answer to a torn tail is to cut the log back to
+where it went wrong. A disk that will not give the bytes up is a different thing entirely, and answering
+it the same way would mean deleting what could not be read. Opening a store off a disk that is failing
+returns the failure and leaves every byte where it was.
+
 The same seam covers what happens when the disk refuses. A merge that cannot rename its result leaves
 every log it was going to replace still there and still answering. A merge that cannot remove the logs
 it replaced lands in exactly the state a crash between those removals leaves, and both the running store

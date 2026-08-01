@@ -284,6 +284,14 @@ func readRecordAt(file io.ReaderAt, size, pos int64) (Record, []byte, error) {
 
 // scanSegment walks the records of a file in order, reading it through a buffer
 // rather than holding it all at once.
+//
+// It tells two failures apart, and the difference matters more than anything
+// else in this file. Bytes that are not a record, or a log that stops in the
+// middle of one, are a torn tail: a *CorruptAtError, which the caller is
+// entitled to answer by throwing away everything from that point. A disk that
+// will not give the bytes up at all is not that, and is returned as it came,
+// because treating it as a torn tail would answer a read failure by deleting
+// what could not be read.
 func scanSegment(file io.ReaderAt, size int64, fn func(pos int64, raw []byte, r Record) bool) error {
 	reader := bufio.NewReaderSize(io.NewSectionReader(file, 0, size), 64<<10)
 
@@ -299,7 +307,7 @@ func scanSegment(file io.ReaderAt, size int64, fn func(pos int64, raw []byte, r 
 		// then find out which layout this is.
 		buf = buf[:headerSizeV0]
 		if _, err := io.ReadFull(reader, buf); err != nil {
-			return &CorruptAtError{Offset: pos}
+			return endOfLog(err, pos)
 		}
 
 		headerLen, known := headerSizeFor(buf[4])
@@ -309,7 +317,7 @@ func scanSegment(file io.ReaderAt, size int64, fn func(pos int64, raw []byte, r 
 		if headerLen > headerSizeV0 {
 			buf = buf[:headerLen]
 			if _, err := io.ReadFull(reader, buf[headerSizeV0:]); err != nil {
-				return &CorruptAtError{Offset: pos}
+				return endOfLog(err, pos)
 			}
 		}
 
@@ -335,7 +343,7 @@ func scanSegment(file io.ReaderAt, size int64, fn func(pos int64, raw []byte, r 
 		buf = buf[:total]
 
 		if _, err := io.ReadFull(reader, buf[headerLen:]); err != nil {
-			return &CorruptAtError{Offset: pos}
+			return endOfLog(err, pos)
 		}
 
 		record, _, err := parseRecordAt(buf, 0)
@@ -351,6 +359,16 @@ func scanSegment(file io.ReaderAt, size int64, fn func(pos int64, raw []byte, r 
 	}
 
 	return nil
+}
+
+// endOfLog turns a failure to read into the right kind of error: the log
+// running out is a torn tail, and anything else is the disk failing and is
+// passed along untouched.
+func endOfLog(err error, pos int64) error {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return &CorruptAtError{Offset: pos}
+	}
+	return err
 }
 
 // indexSegment builds the index of a segment file, checking every record
@@ -369,7 +387,11 @@ func indexSegment(file io.ReaderAt, size int64) (map[string]int64, int64, error)
 	})
 
 	// A record that will not decode ends the good part of the log, exactly as
-	// one that fails its checksum does.
+	// one that fails its checksum does. Anything else is the disk failing, and
+	// the caller must hear about it rather than be told the log ends here: the
+	// answer to a torn tail is to cut the log back to it, and cutting a log
+	// back because it could not be read would be answering a bad disk by
+	// throwing away what is on it.
 	var corrupt *CorruptAtError
 	if err != nil && !errors.As(err, &corrupt) {
 		return nil, 0, err

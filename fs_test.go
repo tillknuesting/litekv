@@ -19,6 +19,18 @@ type watchedDisk struct {
 	mu   sync.Mutex
 	ops  []diskOp
 	fail map[string]error // operation "sync:0000000001.seg" to the error to give
+
+	// writeLimit stops a file taking more than so many bytes, which is what a
+	// disk filling up part way through a record looks like from here. The write
+	// that crosses the line takes what fits and reports the rest as lost.
+	writeLimit map[string]int64
+	written    map[string]int64
+
+	// readsAllowed lets a file be read so many times before it starts
+	// refusing, which is how to fail the second read of a record rather than
+	// the first.
+	readsAllowed map[string]int
+	reads        map[string]int
 }
 
 type diskOp struct {
@@ -41,6 +53,14 @@ func (w *watchedDisk) install(t *testing.T) {
 	if w.fail == nil {
 		w.fail = map[string]error{}
 	}
+	if w.writeLimit == nil {
+		w.writeLimit = map[string]int64{}
+	}
+	if w.readsAllowed == nil {
+		w.readsAllowed = map[string]int{}
+	}
+	w.written = map[string]int64{}
+	w.reads = map[string]int{}
 
 	previous := disk
 	disk = w
@@ -96,6 +116,45 @@ func (w *watchedDisk) MkdirAll(name string, perm os.FileMode) error {
 	return osDisk{}.MkdirAll(name, perm)
 }
 
+// allowWrite reports how many of these bytes the file may take before it has
+// had all it is going to.
+func (w *watchedDisk) allowWrite(name string, n int) (int, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	limit, capped := w.writeLimit[filepath.Base(name)]
+	if !capped {
+		return n, true
+	}
+
+	already := w.written[filepath.Base(name)]
+	room := limit - already
+	if room < 0 {
+		room = 0
+	}
+	if int64(n) <= room {
+		w.written[filepath.Base(name)] = already + int64(n)
+		return n, true
+	}
+
+	w.written[filepath.Base(name)] = limit
+	return int(room), false
+}
+
+// allowRead reports whether the file has any reads left in it.
+func (w *watchedDisk) allowRead(name string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	allowed, capped := w.readsAllowed[filepath.Base(name)]
+	if !capped {
+		return true
+	}
+
+	w.reads[filepath.Base(name)]++
+	return w.reads[filepath.Base(name)] <= allowed
+}
+
 // since returns what happened to the files matching suffix, in order.
 func (w *watchedDisk) since(suffix string) []diskOp {
 	w.mu.Lock()
@@ -149,8 +208,13 @@ type watchedFile struct {
 	name  string
 }
 
-func (f *watchedFile) ReadAt(p []byte, off int64) (int, error) { return f.inner.ReadAt(p, off) }
-func (f *watchedFile) Stat() (os.FileInfo, error)              { return f.inner.Stat() }
+func (f *watchedFile) ReadAt(p []byte, off int64) (int, error) {
+	if !f.disk.allowRead(f.name) {
+		return 0, errDiskFailed
+	}
+	return f.inner.ReadAt(p, off)
+}
+func (f *watchedFile) Stat() (os.FileInfo, error) { return f.inner.Stat() }
 
 func (f *watchedFile) Sync() error {
 	if err := f.disk.record("sync", f.name); err != nil {
@@ -177,15 +241,34 @@ func (f *watchedFile) WriteAt(p []byte, off int64) (int, error) {
 	if err := f.disk.record("write", f.name); err != nil {
 		return 0, err
 	}
-	return f.inner.WriteAt(p, off)
+
+	allowed, whole := f.disk.allowWrite(f.name, len(p))
+	n, err := f.inner.WriteAt(p[:allowed], off)
+	if err == nil && !whole {
+		return n, errDiskFull
+	}
+	return n, err
 }
 
 func (f *watchedFile) Write(p []byte) (int, error) {
 	if err := f.disk.record("write", f.name); err != nil {
 		return 0, err
 	}
-	return f.inner.Write(p)
+
+	allowed, whole := f.disk.allowWrite(f.name, len(p))
+	n, err := f.inner.Write(p[:allowed])
+	if err == nil && !whole {
+		return n, errDiskFull
+	}
+	return n, err
 }
+
+// errDiskFull is what a disk that has run out says.
+var errDiskFull = errors.New("no space left on device")
+
+// errDiskFailed is a read that could not be served, which is not the same as a
+// file that ends.
+var errDiskFailed = errors.New("input/output error")
 
 // TestSyncPolicyReachesTheDisk checks that each policy syncs when it says it
 // does, which is the whole of what a policy is and is otherwise invisible.
@@ -648,5 +731,289 @@ func TestHintFailuresAreHarmless(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// bigDB fills a store with enough data that the merged log and its hint both
+// run past the buffer they are written through, so a write can fail part way
+// rather than only at the flush.
+func bigDB(t *testing.T, dir string) (*DB, map[string]string) {
+	t.Helper()
+
+	db, err := OpenDB(dir, DBOptions{Sync: SyncNever, SegmentSize: 64 << 10, MergeTrigger: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	value := strings.Repeat("v", 200)
+	want := map[string]string{}
+	for i := 0; i < 4000; i++ {
+		key := fmt.Sprintf("key%06d", i)
+		if err := db.Write([]byte(key), []byte(value)); err != nil {
+			t.Fatal(err)
+		}
+		want[key] = value
+	}
+
+	if db.Segments() < 4 {
+		t.Fatalf("%d segments; the test wants several", db.Segments())
+	}
+	return db, want
+}
+
+// TestMergePartialWrite is a disk that fills up in the middle of a merge, so
+// the write fails after some of the records are down rather than before any of
+// them are.
+func TestMergePartialWrite(t *testing.T) {
+	dir := t.TempDir()
+	watcher := &watchedDisk{}
+	watcher.install(t)
+
+	db, want := bigDB(t, dir)
+	defer db.Close()
+
+	segmentsBefore := db.Segments()
+
+	// The merge writes into a file beside the oldest log. Let it get a little
+	// way in and then run out of room.
+	db.mu.RLock()
+	temp := filepath.Base(db.path(db.frozen[len(db.frozen)-1].id())) + mergeSuffix
+	db.mu.RUnlock()
+
+	watcher.mu.Lock()
+	watcher.writeLimit[temp] = 100 << 10 // less than the merge needs
+	watcher.mu.Unlock()
+
+	if err := db.Merge(); err == nil {
+		t.Error("a merge that ran out of room reported success")
+	}
+
+	// Nothing was replaced, and the half-written file did not survive.
+	if got := db.Segments(); got != segmentsBefore {
+		t.Errorf("%d segments after a failed merge, was %d", got, segmentsBefore)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), mergeSuffix) {
+			t.Errorf("a merge that ran out of room left %q behind", entry.Name())
+		}
+	}
+
+	for key, value := range want {
+		if got, ok := liveValue(t, db, key); !ok || got != value {
+			t.Fatalf("%s: got '%s' (%v), want '%s'", key, got, ok, value)
+		}
+	}
+
+	// With room again, the merge goes through and the store is unchanged by
+	// any of it.
+	watcher.mu.Lock()
+	delete(watcher.writeLimit, temp)
+	watcher.mu.Unlock()
+
+	if err := db.Merge(); err != nil {
+		t.Fatalf("Merge after the disk recovered: %v", err)
+	}
+	for key, value := range want {
+		if got, ok := liveValue(t, db, key); !ok || got != value {
+			t.Fatalf("after merging, %s: got '%s' (%v), want '%s'", key, got, ok, value)
+		}
+	}
+}
+
+// TestHintPartialWrite is the same for a hint, which is written the same way
+// and matters less: a hint that did not finish is one the next open reads the
+// log instead of.
+func TestHintPartialWrite(t *testing.T) {
+	dir := t.TempDir()
+	watcher := &watchedDisk{}
+	watcher.install(t)
+
+	db, want := bigDB(t, dir)
+
+	// Every hint from here on runs out of room part way through.
+	watcher.mu.Lock()
+	db.mu.RLock()
+	for _, seg := range db.frozen {
+		watcher.writeLimit[filepath.Base(hintPath(db.path(seg.id())))+mergeSuffix] = 4 << 10
+	}
+	db.mu.RUnlock()
+	watcher.mu.Unlock()
+
+	if err := db.Merge(); err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// No half-written hint was left where a reader would find it.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), mergeSuffix) {
+			t.Errorf("a hint that ran out of room left %q behind", entry.Name())
+		}
+	}
+
+	watcher.mu.Lock()
+	watcher.writeLimit = map[string]int64{}
+	watcher.mu.Unlock()
+
+	reopened, err := OpenDB(dir, DBOptions{Sync: SyncNever, MergeTrigger: 1 << 30})
+	if err != nil {
+		t.Fatalf("Open after hints that could not be written: %v", err)
+	}
+	defer reopened.Close()
+
+	for key, value := range want {
+		if got, ok := liveValue(t, reopened, key); !ok || got != value {
+			t.Fatalf("%s: got '%s' (%v), want '%s'", key, got, ok, value)
+		}
+	}
+}
+
+// TestShortReadIsReported checks that a disk giving back less than it was asked
+// for is an error rather than a wrong answer. This is the claim that a
+// half-read record cannot be mistaken for a whole one.
+func TestShortReadIsReported(t *testing.T) {
+	// A record is read in two goes: its header, then the rest of it. Failing
+	// the first and failing the second are different paths through the reader.
+	for _, allowed := range []int{0, 1} {
+		t.Run(fmt.Sprintf("after %d reads", allowed), func(t *testing.T) {
+			dir := t.TempDir()
+			watcher := &watchedDisk{}
+			watcher.install(t)
+
+			db, err := OpenDB(dir, smallSegments(300))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+
+			for i := 0; i < 60; i++ {
+				if err := db.Write([]byte(fmt.Sprintf("key%02d", i)), []byte(strings.Repeat("v", 40))); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if db.Segments() < 2 {
+				t.Fatalf("%d segments; the test needs a frozen one", db.Segments())
+			}
+
+			// Find a key that lives in a frozen log, so reading it goes to the
+			// disk rather than to memory.
+			db.mu.RLock()
+			frozen := db.frozen[0]
+			var key string
+			frozen.eachKey(func(k string, _ int64) bool { key = k; return false })
+			name := filepath.Base(db.path(frozen.id()))
+			db.mu.RUnlock()
+
+			if value, err := db.Read([]byte(key)); err != nil {
+				t.Fatalf("%s should be readable before the disk misbehaves: %v", key, err)
+			} else if len(value) == 0 {
+				t.Fatalf("%s read back empty", key)
+			}
+
+			watcher.mu.Lock()
+			watcher.readsAllowed[name] = allowed
+			watcher.reads[name] = 0
+			watcher.mu.Unlock()
+
+			// A short read has to be an error, not a value built from whatever
+			// came back.
+			value, err := db.Read([]byte(key))
+			if err == nil {
+				t.Errorf("a short read gave back '%s' instead of an error", value)
+			}
+			if value != nil {
+				t.Errorf("a failed read returned %d bytes as well as its error", len(value))
+			}
+		})
+	}
+}
+
+// TestShortReadWhileIndexing checks the same for the streaming reader, which is
+// what opening a store without a hint uses.
+func TestShortReadWhileIndexing(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := OpenDB(dir, smallSegments(300))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 60; i++ {
+		if err := db.Write([]byte(fmt.Sprintf("key%02d", i)), []byte(strings.Repeat("v", 40))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Without hints, opening has to read the logs.
+	hints, _ := hintFiles(t, dir)
+	for _, name := range hints {
+		if err := os.Remove(filepath.Join(dir, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	watcher := &watchedDisk{}
+	watcher.install(t)
+
+	_, segments := hintFiles(t, dir)
+	watcher.mu.Lock()
+	for _, name := range segments {
+		watcher.readsAllowed[name] = 0
+	}
+	watcher.mu.Unlock()
+
+	sizesBefore := map[string]int64{}
+	for _, name := range segments {
+		info, err := os.Stat(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		sizesBefore[name] = info.Size()
+	}
+
+	// A disk that will not be read is a store that will not open, rather than
+	// one that opens with some of its keys missing.
+	if _, err := OpenDB(dir, smallSegments(300)); err == nil {
+		t.Error("opening a store off an unreadable disk reported success")
+	}
+
+	// And nothing was thrown away on the strength of a read that failed. This
+	// is the point: a torn tail is answered by cutting the log back to it, and
+	// a read that cannot be served must not look like one.
+	for _, name := range segments {
+		info, err := os.Stat(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Size() != sizesBefore[name] {
+			t.Errorf("%s is %d bytes after a failed open, was %d", name, info.Size(), sizesBefore[name])
+		}
+	}
+
+	// With the disk back, everything is still there.
+	watcher.mu.Lock()
+	watcher.readsAllowed = map[string]int{}
+	watcher.mu.Unlock()
+
+	reopened, err := OpenDB(dir, smallSegments(300))
+	if err != nil {
+		t.Fatalf("reopen after the disk recovered: %v", err)
+	}
+	defer reopened.Close()
+
+	if got := reopened.Len(); got != 60 {
+		t.Errorf("%d keys after the disk recovered, want 60", got)
 	}
 }
