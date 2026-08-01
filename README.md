@@ -191,13 +191,13 @@ db, err := litekv.OpenDB("data", litekv.DBOptions{
     Sync:         litekv.SyncEvery,
     Interval:     time.Second,
     SegmentSize:  4 << 20, // freeze a log at 4 MiB
-    MergeTrigger: 4,       // merge once four have piled up
+    MergeTrigger: 2,       // merge once two logs of a size have collected
 })
 defer db.Close()
 
 err = db.Write([]byte("foo"), []byte("bar"))
 value, err := db.Read([]byte("foo"))
-err = db.Merge()  // or merge now, rather than waiting
+err = db.Merge()  // or compact the whole store now, rather than waiting
 ```
 
 Each log keeps its own index, so a lookup asks the active one first and then the frozen ones from newest
@@ -241,6 +241,37 @@ The single log's wait is the compaction itself and grows with what is stored. Th
 grow, and what is left is not lock contention at all: it is the one sync that makes the merge crash safe,
 which on macOS is a full device barrier and stalls other writes at the operating system. That is one
 barrier per merge, whatever the store holds.
+
+### Merging by size
+
+Merging every frozen log into one each time means rewriting the whole store, and the cost of that grows
+with the store. Instead only logs of roughly the same size are merged together — within a factor of four
+— so a large log is rewritten only when enough of its own size has collected beside it. The store settles
+at about `MergeTrigger` logs per size class, a handful in total.
+
+Writing 1 KiB records into 1 MiB logs, counting every byte the merges wrote:
+
+| written | merging everything | merging by size |
+| ------- | ------------------ | --------------- |
+| 31 MiB  | 2.3x over 6 merges | 2.9x over 18 merges |
+| 127 MiB | 3.7x over 11 merges | 3.1x over 64 merges |
+
+Merging by size is slightly worse for a small store and pulls ahead as it grows, because its cost is
+bounded by the number of size classes — about log₄ of the store — while merging everything keeps
+climbing with the store itself. The merges are also many and small rather than few and enormous, which
+is what keeps one of them from sitting in front of a write.
+
+`MergeTrigger` defaults to 2, which keeps the number of logs as low as it goes at the price of merging
+more often. That is the right way round for fast storage, where the rewriting costs little and the logs
+each cost a lookup and an index. Raise it to merge less and hold more logs. Setting it to 1 turns
+merging off altogether, which is what an append-only workload of write-once keys wants: nothing is ever
+superseded there, so a merge would reclaim nothing.
+
+Two rules make a partial merge safe. Only a contiguous run of logs is merged, since the order they are
+asked in is the only thing deciding which version of a key wins. And a tombstone is dropped only by a
+merge that reaches the oldest log — anything older left out of the run could still hold the value the
+tombstone hides, and dropping it would bring a deleted key back. `Merge` reaches every log by
+definition, so it drops them all.
 
 ### What a crash leaves behind
 
@@ -358,9 +389,9 @@ which version wrote it.
   lookups cost 3 to 4.5x more, which was the wrong trade here. It is in the history at `9e3cf2c`.
 - **One writer at a time.** Writes take every shard of the lock, so they serialize with each other, and
   for a single `KeyValueStore` with compaction as well.
-- **Merging rewrites everything frozen.** A `DB` merges all its frozen logs into one rather than merging
-  them in tiers, so each merge costs what the store holds. It runs in the background and streams through
-  a buffer rather than gathering the result up, but on a large store it is a lot of background.
+- **Merging still rewrites.** Merging by size bounds the cost at about log₄ of the store rather than
+  letting it grow with it, but every record is still rewritten a few times over its life. An append-only
+  workload should turn merging off rather than pay for it.
 - **A closed `DB` cannot read.** Its values are on the disk and closing shuts the files. A closed
   `KeyValueStore` goes on answering, because its records are in memory.
 

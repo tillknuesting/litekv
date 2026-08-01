@@ -66,14 +66,25 @@ type DBOptions struct {
 	// started. Zero means 4 MiB.
 	SegmentSize int64
 
-	// MergeTrigger is how many frozen logs may pile up before they are merged
-	// in the background. Zero means four, and one disables merging.
+	// MergeTrigger is how many logs of a size may pile up before they are
+	// merged into one. Zero means two, and one disables merging.
+	//
+	// Merging is size tiered: only logs of roughly the same size are merged
+	// together, so a large one is rewritten only when enough of its own size
+	// has collected beside it. The store settles at about MergeTrigger logs per
+	// size, which is a handful in total, and two keeps that as low as it goes
+	// at the cost of merging more often.
 	MergeTrigger int
 }
 
 const (
 	defaultSegmentSize  = 4 << 20
-	defaultMergeTrigger = 4
+	defaultMergeTrigger = 2
+
+	// tierRatio is how much bigger a log has to be to count as a size of its
+	// own. Four means a log is only merged with others within four times its
+	// size, so merging one of them does not drag the whole store through.
+	tierRatio = 4
 
 	segmentSuffix = ".seg"
 	mergeSuffix   = ".merging"
@@ -91,6 +102,60 @@ func (o DBOptions) mergeTrigger() int {
 		return defaultMergeTrigger
 	}
 	return o.MergeTrigger
+}
+
+// sizeTier puts a log into a size class: how many times its size divides by
+// tierRatio before it is down to a freshly rotated one.
+func sizeTier(size, base int64) int {
+	if base <= 0 {
+		base = defaultSegmentSize
+	}
+
+	tier := 0
+	for size >= base*tierRatio {
+		size /= tierRatio
+		tier++
+	}
+	return tier
+}
+
+// pickMerge chooses the logs to merge next: the oldest run of logs of the same
+// size that has enough of them, as a half-open range over db.frozen, which runs
+// newest first.
+//
+// The run has to be contiguous. Merging logs with others left between them
+// would put records of different ages into one log, and the order they are
+// asked in is the only thing that decides which version of a key wins.
+//
+// Tombstones can only be dropped by a merge that reaches the oldest log, since
+// any log older than the run could still hold the value a tombstone hides.
+// Callers must hold db.mu.
+func (db *DB) pickMerge() (victims []*diskSegment, dropTombstones, ok bool) {
+	trigger := db.opts.mergeTrigger()
+	base := db.opts.segmentSize()
+
+	from, to, tier := 0, 0, 0
+	for i := 0; i < len(db.frozen); {
+		runTier := sizeTier(db.frozen[i].bytes, base)
+
+		j := i
+		for j < len(db.frozen) && sizeTier(db.frozen[j].bytes, base) == runTier {
+			j++
+		}
+
+		// The smallest size first: those merges are the cheap ones, and they
+		// are what keeps the number of logs down.
+		if j-i >= trigger && (to == 0 || runTier < tier) {
+			from, to, tier = i, j, runTier
+		}
+
+		i = j
+	}
+
+	if to == 0 {
+		return nil, false, false
+	}
+	return append([]*diskSegment(nil), db.frozen[from:to]...), to == len(db.frozen), true
 }
 
 // OpenDB opens the DB in dir, creating the directory if it does not exist.
@@ -418,7 +483,10 @@ func (db *DB) rotateIfFull(written *memSegment) error {
 // mergeInBackground starts a merge if enough logs have piled up and one is not
 // already running. Callers must hold db.mu for writing.
 func (db *DB) mergeInBackground() {
-	if db.merging || db.closed || len(db.frozen) < db.opts.mergeTrigger() {
+	if db.merging || db.closed {
+		return
+	}
+	if _, _, ok := db.pickMerge(); !ok {
 		return
 	}
 
@@ -435,20 +503,58 @@ func (db *DB) mergeInBackground() {
 	}()
 }
 
-// Merge merges the frozen logs now, rather than waiting for enough of them to
-// pile up, and returns when it is done. Reads and writes carry on throughout.
+// Merge merges every frozen log into one now, rather than waiting for enough of
+// a size to collect, and returns when it is done. Reads and writes carry on
+// throughout. This is the whole store compacted: nothing superseded and no
+// deleted key survives it.
 func (db *DB) Merge() error {
+	// The logs to merge have to be chosen with the merge lock already held, or
+	// a merge running in the background could remove them in between.
+	db.mergeMu.Lock()
+	defer db.mergeMu.Unlock()
+
 	db.mu.RLock()
 	closed := db.closed
+	victims := append([]*diskSegment(nil), db.frozen...)
 	db.mu.RUnlock()
 
 	if closed {
 		return ErrorClosed
 	}
-	return db.merge()
+	if len(victims) < 2 {
+		return nil
+	}
+	return db.mergeLocked(victims, true)
 }
 
-// merge combines every frozen log into one.
+// merge is the background merge: it takes the run of same sized logs that
+// pickMerge chooses, and keeps going while another run is worth merging, since
+// combining one run can complete the next size up.
+func (db *DB) merge() error {
+	for {
+		db.mergeMu.Lock()
+
+		db.mu.RLock()
+		closed := db.closed
+		victims, dropTombstones, ok := db.pickMerge()
+		db.mu.RUnlock()
+
+		if closed || !ok {
+			db.mergeMu.Unlock()
+			return nil
+		}
+
+		err := db.mergeLocked(victims, dropTombstones)
+		db.mergeMu.Unlock()
+
+		if err != nil {
+			return err
+		}
+	}
+}
+
+// mergeLocked combines a contiguous run of logs, newest first, into one.
+// Callers must hold db.mergeMu, and must have chosen the run while holding it.
 //
 // The merged log is written beside the others and then renamed over the oldest
 // of them, and only then are the rest removed, oldest first. That order is what
@@ -456,14 +562,9 @@ func (db *DB) Merge() error {
 // are the merged one plus the newest few of the ones it replaced, and since
 // those are newer they are asked first: a key they hold answers from them, and
 // a key they do not falls through to the merged log, which holds the newest
-// version of everything older. A tombstone is only dropped once every log that
-// could still hold the value it hides has gone.
-func (db *DB) merge() error {
-	db.mergeMu.Lock()
-	defer db.mergeMu.Unlock()
-
+// version of everything older in the run.
+func (db *DB) mergeLocked(victims []*diskSegment, dropTombstones bool) error {
 	db.mu.RLock()
-	victims := append([]*diskSegment(nil), db.frozen...) // newest first
 	closed := db.closed
 	db.mu.RUnlock()
 
@@ -474,7 +575,7 @@ func (db *DB) merge() error {
 	oldest := victims[len(victims)-1]
 
 	temp := db.path(oldest.id()) + mergeSuffix
-	if err := mergeInto(temp, victims); err != nil {
+	if err := mergeInto(temp, victims, dropTombstones); err != nil {
 		return err
 	}
 
@@ -497,15 +598,17 @@ func (db *DB) merge() error {
 		replaced[seg.id()] = true
 	}
 
-	// Anything frozen while the merge ran is newer than the merged log and
-	// stays where it is.
-	var kept []*diskSegment
+	// Rebuilt by id rather than by position: logs frozen while the merge ran
+	// were added to the front, and the merged log belongs where its oldest
+	// input was. Ids only ever increase, so ordering by id is ordering by age.
+	kept := []*diskSegment{merged}
 	for _, seg := range db.frozen {
 		if !replaced[seg.id()] {
 			kept = append(kept, seg)
 		}
 	}
-	db.frozen = append(kept, merged)
+	sort.Slice(kept, func(i, j int) bool { return kept[i].id() > kept[j].id() })
+	db.frozen = kept
 	db.mu.Unlock()
 
 	// Oldest first, so that what is left on disk is always answerable. None of
@@ -523,12 +626,16 @@ func (db *DB) merge() error {
 }
 
 // mergeInto writes the records worth keeping from the given logs, which are
-// newest first, into a new file at path: the newest version of every key that
-// is not deleted, in the order the surviving records were written.
+// newest first, into a new file at path: the newest version of every key, in
+// the order the surviving records were written.
+//
+// A tombstone is only dropped when dropTombstones says every log that could
+// hold the value it hides is part of this merge. Otherwise it is carried into
+// the merged log, where it goes on shadowing whatever is older.
 //
 // The records are streamed through a buffer rather than gathered up, so merging
 // a store costs no more memory than merging a small one.
-func mergeInto(path string, victims []*diskSegment) error {
+func mergeInto(path string, victims []*diskSegment, dropTombstones bool) error {
 	type locator struct {
 		seg *diskSegment
 		pos int64
@@ -565,9 +672,7 @@ func mergeInto(path string, victims []*diskSegment) error {
 
 		var writeErr error
 		scanErr := seg.scan(func(pos int64, raw []byte, r Record) bool {
-			// Deleted keys are dropped outright: every log that could hold the
-			// value a tombstone hides is part of this merge.
-			if r.Type != RecordTypeNormal {
+			if r.Type != RecordTypeNormal && dropTombstones {
 				return true
 			}
 			if loc, ok := live[string(r.Key)]; !ok || loc.seg != seg || loc.pos != pos {

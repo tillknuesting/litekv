@@ -981,3 +981,127 @@ func TestDBReadCost(t *testing.T) {
 	t.Logf("read of a 512-byte value: %.0f ns from a frozen log on disk, %.0f ns from memory",
 		fromDisk, fromMemory)
 }
+
+// TestDBTieredKeepsTombstones is the rule that makes a partial merge safe. A
+// merge that does not reach the oldest log must carry its tombstones into the
+// merged log: an older log left out of it can still hold the value one hides,
+// and dropping it would bring a deleted key back.
+func TestDBTieredKeepsTombstones(t *testing.T) {
+	dir := t.TempDir()
+
+	// Merging is left to the test, so the runs are known.
+	db, err := OpenDB(dir, smallSegments(150))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// The oldest log holds the value.
+	if err := db.Write([]byte("doomed"), []byte("the old value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Write([]byte("filler"), []byte(strings.Repeat("x", 150))); err != nil {
+		t.Fatal(err)
+	}
+
+	// Newer logs hold the delete, and enough after it to make a run.
+	if err := db.Delete([]byte("doomed")); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 6; i++ {
+		if err := db.Write([]byte(fmt.Sprintf("other%d", i)), []byte(strings.Repeat("y", 150))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	db.mu.RLock()
+	frozen := len(db.frozen)
+	db.mu.RUnlock()
+	if frozen < 4 {
+		t.Fatalf("only %d frozen logs; the test needs several", frozen)
+	}
+
+	// Merge a run that stops short of the oldest log, which is where the value
+	// still lives.
+	db.mu.RLock()
+	victims := append([]*diskSegment(nil), db.frozen[:frozen-1]...)
+	db.mu.RUnlock()
+
+	db.mergeMu.Lock()
+	err = db.mergeLocked(victims, false) // false: an older log remains
+	db.mergeMu.Unlock()
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	// The delete has to have survived, or the old value comes back.
+	if _, err := db.Read([]byte("doomed")); !errors.Is(err, ErrorKeyDeleted) {
+		value, _ := db.Read([]byte("doomed"))
+		t.Errorf("after a partial merge: expected '%v', got '%v' (value '%s')", ErrorKeyDeleted, err, value)
+	}
+
+	// And once a merge does reach the oldest log, both can go.
+	if err := db.Merge(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Read([]byte("doomed")); !errors.Is(err, ErrorKeyNotFound) {
+		t.Errorf("after a full merge: expected '%v', got '%v'", ErrorKeyNotFound, err)
+	}
+}
+
+// TestDBTiers checks that merging only combines logs of a size, so the store
+// settles at a few logs rather than rewriting itself into one every time.
+func TestDBTiers(t *testing.T) {
+	db, err := OpenDB(t.TempDir(), DBOptions{Sync: SyncNever, SegmentSize: 32 << 10, MergeTrigger: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	value := make([]byte, 256)
+	for i := 0; i < 4000; i++ {
+		if err := db.Write([]byte(fmt.Sprintf("key%06d", i)), value); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Everything the background merges were going to do.
+	for {
+		db.mergeMu.Lock()
+		db.mu.RLock()
+		victims, drop, ok := db.pickMerge()
+		db.mu.RUnlock()
+		if !ok {
+			db.mergeMu.Unlock()
+			break
+		}
+		err := db.mergeLocked(victims, drop)
+		db.mergeMu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	db.mu.RLock()
+	var sizes []int64
+	tiers := map[int]int{}
+	for _, seg := range db.frozen {
+		sizes = append(sizes, seg.bytes)
+		tiers[sizeTier(seg.bytes, 32<<10)]++
+	}
+	db.mu.RUnlock()
+
+	t.Logf("%d frozen logs of sizes %v, in %d size classes", len(sizes), sizes, len(tiers))
+
+	// With the trigger at two, no size class may hold two logs once merging has
+	// settled: they would have been merged.
+	for tier, count := range tiers {
+		if count >= 2 {
+			t.Errorf("size class %d still holds %d logs", tier, count)
+		}
+	}
+	// And the whole store is a handful of logs, not one per rotation.
+	if len(sizes) > 6 {
+		t.Errorf("%d frozen logs is more than a tiered store should settle at", len(sizes))
+	}
+}
