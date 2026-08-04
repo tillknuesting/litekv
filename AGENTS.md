@@ -124,6 +124,52 @@ take another write.
 full log is housekeeping that happens after the record is safe; a failure there
 is remembered in `db.rotateErr` and reported by `Sync` and `Close`.
 
+## The replication tests were checked by breaking the code
+
+Tests that pass on the first run have said nothing yet. Each of these edits was
+made to `replica.go` on purpose, the replication tests were run, and the edit
+was reverted. All twelve are caught. If you change that file and want to know
+whether the suite still has hold of it, this is the list to work through again.
+
+| the code, broken                                              | caught by                             |
+| ------------------------------------------------------------- | ------------------------------------- |
+| Leader skips the checksum in the position check                | `TestReplicaDiverged`                 |
+| Leader ignores where the follower says its log ends            | `TestReplicaDiverged`                 |
+| Leader misses a follower that is ahead of it                   | `TestReplicaDiverged`                 |
+| A torn tail is streamed to followers                           | `TestPositionIgnoresATornTail`        |
+| `Position` gives up instead of reading the log                 | `TestPositionTracksTheLog`            |
+| Batch cut off by one                                           | `TestReplicaBatchEndsOnARecord`       |
+| Follower does not verify record checksums                      | `TestReplicaRejectsDamagedBatch`      |
+| Follower does not check the batch continues its log            | `TestReplicaWrongPosition`            |
+| Follower treats a partly arrived record as whole               | `TestReplicaTruncatedBatch`           |
+| Follower drops the unapplied tail between reads                | `TestReplicaModel`                    |
+| Follower keeps the first record for a key rather than the last | `TestReplicaSupersededAcrossBatches`  |
+| Follower appends to the log but not to the index               | `TestReplicaCatchUp`                  |
+
+Three of those are worth knowing about beyond the list.
+
+**Two checks in `batch` look redundant and are not.** The checksum makes the
+offset comparisons look like belt and braces, and for an intact log they are.
+The case they exist for is a log with a torn tail: whole, correctly checksummed
+records can lie *beyond* bytes that do not decode, because a crash tore a hole
+in front of them rather than at the end. A position naming one of those parses,
+ends where it says, and carries a checksum that genuinely matches — and only
+`pos.Offset > here.Offset` catches it. Removing that check broke no test until
+one was written for exactly that shape. Both subtests are in
+`TestReplicaDiverged` and both say in their comments why they are contrived.
+
+**A broken replication path makes the suite slow before it makes it fail.**
+Several tests wait on a deadline for an asynchronous follower to arrive — which
+is the only honest thing to do, since there is nothing to assert about how long
+that takes — so a change that stops followers converging burns those deadlines
+before anything reports. If the suite suddenly takes half a minute longer, read
+the failures rather than the clock.
+
+**`lastRecord` is the one thing no mutation can reach.** Failing to move it is
+invisible by design: `position` falls back to reading the log, so the answer
+stays right and only the speed goes. That is the trade, and it is why the
+invariant above is phrased as slow-never-wrong rather than as a rule to follow.
+
 ## Traps this codebase has already sprung
 
 - **Hard-coded header offsets.** Bit twice. Ask `decodeHeader`.

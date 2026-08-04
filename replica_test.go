@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -322,6 +324,87 @@ func TestReplicaDiverged(t *testing.T) {
 
 		if _, err := leader.Since(follower.Position(), io.Discard, ReplicaOptions{}); !errors.Is(err, ErrorDiverged) {
 			t.Fatalf("a follower ahead of its leader got '%v', want %v", err, ErrorDiverged)
+		}
+	})
+
+	t.Run("a position whose fields disagree with each other", func(t *testing.T) {
+		// The three fields have to describe one log between them: the record at
+		// Last has to end exactly where Offset says the follower's log does. A
+		// position naming a real record of this log, with that record's real
+		// checksum, but ending a byte away from where the record actually ends,
+		// describes a log this one has never been.
+		leader := &KeyValueStore{}
+		for i := 0; i < 3; i++ {
+			if err := leader.Write([]byte{byte('a' + i)}, []byte("value")); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		first, second, err := offsetOfRecord(leader.Data, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		record, _, err := parseRecordAt(leader.Data, first)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Not past the end of the log, so the offsets alone do not give it
+		// away, and the checksum is genuinely this record's.
+		bad := Position{Offset: second + 1, Last: first, Crc: record.Crc}
+		if bad.Offset >= leader.Position().Offset {
+			t.Fatal("the bad offset is past the end of the log, so the case is not set up")
+		}
+
+		if _, err := leader.Since(bad, io.Discard, ReplicaOptions{}); !errors.Is(err, ErrorDiverged) {
+			t.Fatalf("a position ending a byte off its own last record got '%v', want %v", err, ErrorDiverged)
+		}
+	})
+
+	t.Run("a position past the end of a log with a torn tail", func(t *testing.T) {
+		// This is the one case the checksum cannot answer, and the only reason
+		// batch compares the offsets at all. A log that stops at bytes which do
+		// not decode can still have whole, correctly checksummed records lying
+		// beyond them — records this store really wrote, before a crash tore a
+		// hole in front of them. A position naming one of those parses, ends
+		// where it says it does, and carries a checksum that genuinely matches.
+		// Only its being past the end of the log gives it away.
+		leader := &KeyValueStore{}
+		if err := leader.Write([]byte("a"), []byte("1")); err != nil {
+			t.Fatal(err)
+		}
+		good := leader.Position()
+
+		stranded := &KeyValueStore{}
+		if err := stranded.Write([]byte("b"), []byte("2")); err != nil {
+			t.Fatal(err)
+		}
+
+		rubbish := make([]byte, headerSizeV0)
+		rubbish[4] = 99 // not a version this package knows, so decoding stops here
+
+		leader.Lock()
+		at := int64(len(leader.Data) + len(rubbish))
+		leader.Data = append(leader.Data, rubbish...)
+		leader.Data = append(leader.Data, stranded.Data...)
+		leader.Unlock()
+
+		if got := leader.Position(); got != good {
+			t.Fatalf("the log ends at %+v, want %+v: the rubbish should end it", got, good)
+		}
+
+		record, next, err := parseRecordAt(leader.Data, at)
+		if err != nil {
+			t.Fatalf("the stranded record does not parse, so the case is not set up: %v", err)
+		}
+		beyond := Position{Offset: next, Last: at, Crc: record.Crc}
+
+		if record.Crc != checksumSerialized(leader.Data[at:next]) {
+			t.Fatal("the stranded record's checksum does not match, so the case is not set up")
+		}
+
+		if _, err := leader.Since(beyond, io.Discard, ReplicaOptions{}); !errors.Is(err, ErrorDiverged) {
+			t.Fatalf("a position past the end of the log got '%v', want %v", err, ErrorDiverged)
 		}
 	})
 
@@ -1021,6 +1104,525 @@ func offsetOfRecord(data []byte, n int) (int64, int64, error) {
 		}
 		at = next
 	}
+}
+
+// syncUp is a follower's loop as it would really be written: ask, apply, and
+// when the leader says there is no offset the two logs agree on, empty and take
+// the log again. Every test that replicates a store that also compacts needs
+// this rather than catchUp, since compaction may or may not move a given
+// follower depending on what it had already taken.
+func syncUp(t *testing.T, leader, follower *KeyValueStore, opts ReplicaOptions) (resyncs int) {
+	t.Helper()
+
+	pos := follower.Position()
+
+	for {
+		var wire bytes.Buffer
+
+		next, err := leader.Since(pos, &wire, opts)
+		if errors.Is(err, ErrorDiverged) {
+			if err := follower.Reset(); err != nil {
+				t.Fatal(err)
+			}
+			pos = Position{}
+			resyncs++
+			continue
+		}
+		if err != nil {
+			t.Fatalf("Since(%+v): %v", pos, err)
+		}
+		if next == pos {
+			return resyncs
+		}
+
+		if pos, err = follower.Apply(pos, &wire, opts); err != nil {
+			t.Fatalf("Apply(%+v): %v", pos, err)
+		}
+	}
+}
+
+// TestReplicaModel runs a long random history against a leader and replicates
+// it to a follower as it goes, in batches of a random size, and holds both to
+// the same model of what the answers should be. The maintenance operations are
+// in the mix rather than at the end, so replication has to survive being
+// interleaved with compaction rather than only being tried on a quiet store.
+//
+// The batch sizes go down to one byte, which means one record a batch: the
+// boundary between what crosses now and what crosses next is then in a
+// different place every time, which is the part hand-written cases keep missing.
+func TestReplicaModel(t *testing.T) {
+	leader := &KeyValueStore{}
+	follower := &KeyValueStore{}
+
+	m := newModel()
+	random := rand.New(rand.NewSource(2))
+
+	// A small key space, so writes collide, keys get rewritten and deleted keys
+	// come back. Two keys that are easy to get wrong go in as well.
+	keys := make([]string, 40)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("key%02d", i)
+	}
+	keys = append(keys, "", "\x00\xff\x00")
+
+	replications, resyncs := 0, 0
+
+	for step := 0; step < 3000; step++ {
+		key := keys[random.Intn(len(keys))]
+
+		switch n := random.Intn(100); {
+		case n < 55:
+			value := fmt.Sprintf("value-%d", step)
+			if err := leader.Write([]byte(key), []byte(value)); err != nil {
+				t.Fatalf("step %d: %v", step, err)
+			}
+			m.write(key, value)
+
+		case n < 75:
+			if err := leader.Delete([]byte(key)); err != nil {
+				t.Fatalf("step %d: %v", step, err)
+			}
+			m.delete(key)
+
+		case n < 97:
+			// Whatever has piled up since the last time, in batches of a size
+			// that has nothing to do with where the records fall.
+			opts := ReplicaOptions{BatchSize: int64(1 + random.Intn(300))}
+			resyncs += syncUp(t, leader, follower, opts)
+			replications++
+
+			m.check(t, follower, fmt.Sprintf("step %d, follower", step))
+			sameStore(t, leader, follower)
+
+		default:
+			if err := leader.Compact(); err != nil {
+				t.Fatalf("step %d: %v", step, err)
+			}
+			m.compact()
+		}
+	}
+
+	resyncs += syncUp(t, leader, follower, ReplicaOptions{BatchSize: 64})
+
+	m.check(t, leader, "leader at the end")
+	m.check(t, follower, "follower at the end")
+	sameStore(t, leader, follower)
+
+	// The test is only worth anything if it actually did both of the things it
+	// is about.
+	if replications < 100 {
+		t.Errorf("only %d replications in 3000 steps", replications)
+	}
+	if resyncs == 0 {
+		t.Error("no compaction ever moved the follower, so recovery was never exercised")
+	}
+	t.Logf("%d replications, %d of them starting again after a compaction", replications, resyncs)
+}
+
+// TestReplicaOfAReplica checks that a follower is a leader like any other. Its
+// log is the leader's log byte for byte, so there is no reason it should not be
+// followed in turn — and if its own position were wrong in any way it could not
+// serve one, which is what makes this worth having beyond the shape of it.
+func TestReplicaOfAReplica(t *testing.T) {
+	leader := &KeyValueStore{}
+	middle := &KeyValueStore{}
+	tail := &KeyValueStore{}
+
+	for i := 0; i < 50; i++ {
+		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := leader.Delete([]byte("key-07")); err != nil {
+		t.Fatal(err)
+	}
+
+	catchUp(t, leader, middle)
+	catchUp(t, middle, tail)
+
+	sameStore(t, leader, middle)
+	sameStore(t, leader, tail)
+
+	// And it keeps up down the chain, one record at a time.
+	for i := 0; i < 5; i++ {
+		if err := leader.Write([]byte("late"), []byte(fmt.Sprintf("record-%d", i))); err != nil {
+			t.Fatal(err)
+		}
+		catchUp(t, leader, middle)
+		catchUp(t, middle, tail)
+	}
+	sameStore(t, leader, tail)
+
+	if _, err := tail.Read([]byte("key-07")); !errors.Is(err, ErrorKeyDeleted) {
+		t.Errorf("a tombstone two hops away reads as '%v', want %v", err, ErrorKeyDeleted)
+	}
+}
+
+// TestReplicaManyFollowers puts several followers on one leader while it is
+// being written to. What is being checked is not the answers so much as the
+// race detector: Changed hands the same channel to all of them and replaces it
+// under the writer, and Since takes a pooled buffer per call.
+func TestReplicaManyFollowers(t *testing.T) {
+	const (
+		followers = 4
+		records   = 400
+	)
+
+	leader := &KeyValueStore{}
+	done := make(chan struct{})
+
+	replicas := make([]*KeyValueStore, followers)
+	var streaming sync.WaitGroup
+
+	for i := range replicas {
+		replicas[i] = &KeyValueStore{}
+
+		streaming.Add(1)
+		go func(follower *KeyValueStore) {
+			defer streaming.Done()
+
+			pos := Position{}
+			for {
+				changed := leader.Changed()
+
+				for {
+					var wire bytes.Buffer
+
+					next, err := leader.Since(pos, &wire, ReplicaOptions{})
+					if err != nil {
+						t.Errorf("Since: %v", err)
+						return
+					}
+					if next == pos {
+						break
+					}
+					if pos, err = follower.Apply(pos, &wire, ReplicaOptions{}); err != nil {
+						t.Errorf("Apply: %v", err)
+						return
+					}
+				}
+
+				select {
+				case <-changed:
+				case <-done:
+					return
+				}
+			}
+		}(replicas[i])
+	}
+
+	for i := 0; i < records; i++ {
+		if err := leader.Write([]byte(fmt.Sprintf("key-%03d", i)), []byte("value")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		behind := false
+		for _, follower := range replicas {
+			if follower.Size() < leader.Size() {
+				behind = true
+			}
+		}
+		if !behind || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	close(done)
+	streaming.Wait()
+
+	for i, follower := range replicas {
+		t.Run(fmt.Sprint(i), func(t *testing.T) { sameStore(t, leader, follower) })
+	}
+}
+
+// TestReplicaFollowReportsDivergence checks that a stream already running says
+// so when the log under it is rewritten, rather than sending records from
+// offsets that now mean something else.
+func TestReplicaFollowReportsDivergence(t *testing.T) {
+	leader := &KeyValueStore{}
+
+	// The same key over and over, so that compaction has most of the log to
+	// throw away and every offset after the first moves.
+	for i := 0; i < 20; i++ {
+		if err := leader.Write([]byte("one key"), []byte(fmt.Sprintf("version %d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Start the stream where a follower that had taken everything would be.
+	from := leader.Position()
+
+	failed := make(chan error, 1)
+	go func() {
+		_, err := leader.Follow(from, io.Discard, nil, ReplicaOptions{})
+		failed <- err
+	}()
+
+	// Give it a moment to be waiting rather than still sending, then move every
+	// record out from under it.
+	time.Sleep(10 * time.Millisecond)
+	if err := leader.Compact(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-failed:
+		if !errors.Is(err, ErrorDiverged) {
+			t.Fatalf("a stream over a compacted log ended with '%v', want %v", err, ErrorDiverged)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a stream over a compacted log never ended")
+	}
+}
+
+// TestReplicaOldFormat checks that records written before the version byte
+// existed replicate like any others. They are shorter by nine bytes and carry
+// no timestamp, so every length in the streaming path has to come from the
+// record rather than from a constant.
+func TestReplicaOldFormat(t *testing.T) {
+	var data []byte
+	data = appendV0(data, RecordTypeNormal, []byte("alpha"), []byte("one"))
+	data = appendV0(data, RecordTypeNormal, []byte("beta"), []byte("two"))
+	data = appendV0(data, RecordTypeDeleted, []byte("alpha"), nil)
+
+	leader := &KeyValueStore{Data: data}
+	if _, err := leader.Recover(); err != nil {
+		t.Fatal(err)
+	}
+
+	// And a record in the current layout beside them, since a real store that
+	// has been reopened holds both.
+	if err := leader.Write([]byte("gamma"), []byte("three")); err != nil {
+		t.Fatal(err)
+	}
+
+	follower := &KeyValueStore{}
+
+	// One byte a batch, so the boundary lands inside the old records too.
+	syncUp(t, leader, follower, ReplicaOptions{BatchSize: 1})
+	sameStore(t, leader, follower)
+
+	if _, err := follower.Read([]byte("alpha")); !errors.Is(err, ErrorKeyDeleted) {
+		t.Errorf("an old tombstone reads as '%v' on the follower, want %v", err, ErrorKeyDeleted)
+	}
+	if got, err := follower.Read([]byte("beta")); err != nil || string(got) != "two" {
+		t.Errorf("an old record reads as %q, '%v' on the follower", got, err)
+	}
+}
+
+// TestReplicaBatchEndsOnARecord checks the boundary itself. A batch takes every
+// record that fits and stops, so a size that is exactly two records must send
+// two, and one byte less than that must send one.
+func TestReplicaBatchEndsOnARecord(t *testing.T) {
+	leader := &KeyValueStore{}
+	for i := 0; i < 5; i++ {
+		if err := leader.Write([]byte(fmt.Sprintf("key-%d", i)), []byte("value")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_, two, err := offsetOfRecord(leader.Data, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sizes := []struct {
+		name   string
+		size   int64
+		expect int64
+	}{
+		{"exactly two records", two, two},
+		{"a byte under two records", two - 1, two / 2},
+		{"a byte over two records", two + 1, two},
+		{"one byte", 1, two / 2},
+	}
+
+	for _, test := range sizes {
+		t.Run(test.name, func(t *testing.T) {
+			var wire bytes.Buffer
+
+			next, err := leader.Since(Position{}, &wire, ReplicaOptions{BatchSize: test.size})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if int64(wire.Len()) != test.expect {
+				t.Errorf("a batch of %d bytes sent %d, want %d", test.size, wire.Len(), test.expect)
+			}
+			if next.Offset != test.expect {
+				t.Errorf("it left the follower at %d, want %d", next.Offset, test.expect)
+			}
+		})
+	}
+}
+
+// TestReplicaShortWriteOnTheWire checks what happens when a connection takes
+// part of a batch and then fails. The leader reports that it did not send the
+// batch; the follower keeps the whole records that reached it and says where
+// that leaves it, and the difference between the two is settled by the follower
+// asking again from where it actually is.
+func TestReplicaShortWriteOnTheWire(t *testing.T) {
+	leader := &KeyValueStore{}
+	for i := 0; i < 5; i++ {
+		if err := leader.Write([]byte(fmt.Sprintf("key-%d", i)), []byte("value")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A connection that takes two records and a bit, then breaks.
+	_, twoRecords, err := offsetOfRecord(leader.Data, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire := &shortWriter{limit: int(twoRecords) + 4}
+
+	if _, err := leader.Since(Position{}, wire, ReplicaOptions{}); !errors.Is(err, errWireBroke) {
+		t.Fatalf("a broken connection reported '%v', want the writer's error", err)
+	}
+
+	follower := &KeyValueStore{}
+	pos, err := follower.Apply(Position{}, bytes.NewReader(wire.taken), ReplicaOptions{})
+
+	var corrupt *CorruptAtError
+	if !errors.As(err, &corrupt) {
+		t.Fatalf("half a record applied with '%v', want a *CorruptAtError", err)
+	}
+	if pos.Offset != twoRecords {
+		t.Errorf("the follower kept %d bytes, want the two whole records at %d", pos.Offset, twoRecords)
+	}
+	if err := follower.Verify(); err != nil {
+		t.Errorf("the follower kept something that does not verify: %v", err)
+	}
+
+	// The leader thought it had sent nothing. The follower knows better, and
+	// asking from where it is settles it.
+	catchUp(t, leader, follower)
+	sameStore(t, leader, follower)
+}
+
+// shortWriter takes so many bytes and then refuses, which is a connection that
+// broke part way through a write.
+type shortWriter struct {
+	limit int
+	taken []byte
+}
+
+var errWireBroke = errors.New("connection reset by peer")
+
+func (w *shortWriter) Write(p []byte) (int, error) {
+	if len(w.taken)+len(p) <= w.limit {
+		w.taken = append(w.taken, p...)
+		return len(p), nil
+	}
+
+	room := w.limit - len(w.taken)
+	w.taken = append(w.taken, p[:room]...)
+	return room, errWireBroke
+}
+
+// TestReplicaSupersededAcrossBatches checks that a key rewritten in a later
+// batch wins, which is the index being updated as records are applied rather
+// than the log merely being appended to. A follower whose index lagged its log
+// would answer with the older value and look perfectly healthy doing it.
+func TestReplicaSupersededAcrossBatches(t *testing.T) {
+	leader := &KeyValueStore{}
+	follower := &KeyValueStore{}
+
+	for round := 0; round < 5; round++ {
+		if err := leader.Write([]byte("key"), []byte(fmt.Sprintf("version %d", round))); err != nil {
+			t.Fatal(err)
+		}
+		if err := leader.Write([]byte("other"), []byte("unchanged")); err != nil {
+			t.Fatal(err)
+		}
+
+		// One batch a round, so each version crosses on its own.
+		if batches := catchUp(t, leader, follower); batches != 1 {
+			t.Fatalf("round %d took %d batches, want 1", round, batches)
+		}
+
+		want := fmt.Sprintf("version %d", round)
+		got, err := follower.Read([]byte("key"))
+		if err != nil {
+			t.Fatalf("round %d: %v", round, err)
+		}
+		if string(got) != want {
+			t.Fatalf("round %d: the follower reads %q, want %q", round, got, want)
+		}
+	}
+
+	// And a delete in a batch of its own supersedes the value before it.
+	if err := leader.Delete([]byte("key")); err != nil {
+		t.Fatal(err)
+	}
+	catchUp(t, leader, follower)
+
+	if _, err := follower.Read([]byte("key")); !errors.Is(err, ErrorKeyDeleted) {
+		t.Errorf("a delete in a later batch reads as '%v', want %v", err, ErrorKeyDeleted)
+	}
+	sameStore(t, leader, follower)
+}
+
+// TestReplicaResetEmptiesTheFile checks that a follower told to start again
+// does so on the disk and not only in memory. A file left holding the old log
+// would come back at the next Open, and the store would be a mixture of two
+// histories with no way to tell.
+func TestReplicaResetEmptiesTheFile(t *testing.T) {
+	leader := &KeyValueStore{}
+	for i := 0; i < 20; i++ {
+		if err := leader.Write([]byte("one key"), []byte(fmt.Sprintf("version %d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	path := filepath.Join(t.TempDir(), "follower.kv")
+
+	follower, err := Open(path, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	catchUp(t, leader, follower)
+
+	if info, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	} else if info.Size() == 0 {
+		t.Fatal("the follower's file is empty before the reset")
+	}
+
+	if err := follower.Reset(); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 0 {
+		t.Errorf("a reset left %d bytes in the file", info.Size())
+	}
+
+	// Compacting the leader is what a reset is usually the answer to, so finish
+	// the story: take the log again and reopen to prove it is on the disk.
+	if err := leader.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	syncUp(t, leader, follower, ReplicaOptions{})
+	sameStore(t, leader, follower)
+
+	if err := follower.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(path, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+
+	sameStore(t, leader, reopened)
 }
 
 // BenchmarkReplicaSteady is a follower keeping up: one record written, and the
