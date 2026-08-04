@@ -1439,6 +1439,168 @@ func BenchmarkDB_Read(b *testing.B) {
 	}
 }
 
+// benchMissDB builds a DB spread over several frozen logs and returns it with a
+// key it does not hold and one held by the oldest log, which is the furthest a
+// lookup can walk before finding something.
+func benchMissDB(b *testing.B, keys, logs int) (db *DB, absent, oldest [][]byte, segments int) {
+	b.Helper()
+
+	value := make([]byte, 100)
+	// Sized so that the keys land in roughly the number of logs asked for. The
+	// count matters because it decides how big one log's index is, and that is
+	// the whole question: a small index stays in cache and a filter has nothing
+	// to beat, while a large one does not.
+	perSegment := int64(keys/logs) * int64(headerSize+16+len(value))
+
+	db, err := OpenDB(b.TempDir(), DBOptions{
+		Sync: SyncNever, SegmentSize: perSegment, MergeTrigger: 1 << 30,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	for i := 0; i < keys; i++ {
+		if err := db.Write([]byte(fmt.Sprintf("key%013d", i)), value); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	// As many distinct probes as there are keys. This is the part that decides
+	// whether the benchmark can answer its own question at all.
+	//
+	// A map lookup only loses to a filter when it has to go to memory for its
+	// bucket, and what decides that is not how big the map is but how much of
+	// it a workload touches. Probing one key, or a few thousand, keeps their
+	// buckets in cache however large the map — and then a map lookup is a few
+	// nanoseconds and nothing can beat it. Probing as many keys as the store
+	// holds is what puts the buckets past the cache, which is the condition the
+	// filter is supposed to win in.
+	probes := keys
+
+	db.mu.RLock()
+	segments = len(db.frozen) + 1
+	if len(db.frozen) > 0 {
+		oldest = make([][]byte, 0, probes)
+		db.frozen[len(db.frozen)-1].eachKey(func(key string, _ int64) bool {
+			oldest = append(oldest, []byte(key))
+			return len(oldest) < probes
+		})
+	}
+	db.mu.RUnlock()
+
+	if len(oldest) == 0 {
+		b.Fatal("no frozen log to read from")
+	}
+
+	absent = make([][]byte, probes)
+	for i := range absent {
+		absent[i] = []byte(fmt.Sprintf("absent%010d", i))
+	}
+	return db, absent, oldest, segments
+}
+
+// setFilters turns the Bloom filters on every frozen log on or off, which is
+// how the benchmark below measures what they are worth without two builds.
+func setFilters(b *testing.B, db *DB, on bool) {
+	b.Helper()
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	for _, seg := range db.frozen {
+		if on {
+			seg.filter = newBloom(seg.index)
+		} else {
+			seg.filter = nil
+		}
+	}
+}
+
+// BenchmarkDB_ReadMissing is the lookup a Bloom filter exists for, and the one
+// nothing here measured before.
+//
+// A lookup asks every log newest first and stops at the first answer, so a key
+// that is not in the store is the most expensive one it has: every log, and no
+// early exit. Each of those is today a lookup in a map holding all of that
+// log's keys, which for a large log is a walk out to memory. A filter over the
+// same keys is some forty times smaller and stays in cache.
+//
+// The textbook reason for a filter — keeping a lookup off the disk — does not
+// apply here, since a frozen log answers a miss from its index without any I/O.
+// So the filter is being asked to win on cache alone, which is a narrower claim
+// and the reason this is measured rather than assumed. The present rows are
+// what it costs when it does not help: a hit pays the filter and the map both.
+func BenchmarkDB_ReadMissing(b *testing.B) {
+	// The last of these is the case the filter needs. Half a million keys in one
+	// log is an index of about 30 MB, past what this machine holds in L2, where
+	// a filter over the same keys is under a megabyte and still fits.
+	for _, shape := range []struct{ keys, logs int }{
+		{10_000, 10},
+		{200_000, 10},
+		{1_000_000, 2},
+	} {
+		keys := shape.keys
+		db, absent, oldest, segments := benchMissDB(b, keys, shape.logs)
+
+		for _, probe := range []struct {
+			name string
+			keys [][]byte
+		}{
+			{"missing", absent},
+			{"oldest", oldest},
+		} {
+			for _, filtered := range []bool{false, true} {
+				b.Run(fmt.Sprintf("%dkeys_%dlogs/%s/filter=%t", keys, segments, probe.name, filtered), func(b *testing.B) {
+					setFilters(b, db, filtered)
+
+					b.ReportAllocs()
+					b.ResetTimer()
+					for i := 0; i < b.N; i++ {
+						_, _ = db.Read(probe.keys[i%len(probe.keys)])
+					}
+				})
+			}
+		}
+
+		db.Close()
+	}
+}
+
+// BenchmarkDB_BloomThreshold is where defaultBloomMinKeys comes from, and the
+// reason that constant is not a matter of taste.
+//
+// A filter is worth having exactly when a lookup has to go to memory for its
+// map bucket, and what decides that is how many keys one log holds. Below the
+// crossover the index stays in cache, a map lookup is a few nanoseconds, and
+// the filter is an extra hash and six probes buying nothing. Above it the map
+// lookup is a walk out to memory and the filter, forty times smaller, is not.
+//
+// This sweeps that one variable so the crossover can be read off. If the record
+// format changes, or the index does, or the machine does, re-run it and move
+// the constant to wherever the two columns cross.
+func BenchmarkDB_BloomThreshold(b *testing.B) {
+	const logs = 4
+
+	for _, perLog := range []int{1_000, 4_000, 16_000, 64_000, 256_000} {
+		db, absent, _, _ := benchMissDB(b, perLog*logs, logs)
+
+		for _, filtered := range []bool{false, true} {
+			b.Run(fmt.Sprintf("%dkeys_a_log/filter=%t", perLog, filtered), func(b *testing.B) {
+				setFilters(b, db, filtered)
+
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					_, _ = db.Read(absent[i%len(absent)])
+				}
+			})
+		}
+
+		db.Close()
+		runtime.GC()
+	}
+}
+
 // BenchmarkDB_View is Read without the copy, against both kinds of log.
 //
 // For a KeyValueStore this is most of the cost, since the record is already in

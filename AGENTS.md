@@ -13,6 +13,7 @@ to save you a day, not to introduce the code.
 | `db.go`      | `DB`: segments, rotation, merging by size                                 |
 | `segment.go` | the two kinds of segment, and reading a log without holding it in memory  |
 | `hint.go`    | the index of a frozen log, written beside it                             |
+| `bloom.go`   | the filter in front of that index, once a log is big enough to want one   |
 | `fs.go`      | the one seam through which this package touches a disk                    |
 
 `KeyValueStore` and `DB` are deliberately separate. The first is one log with
@@ -110,6 +111,15 @@ is remembered in `db.rotateErr` and reported by `Sync` and `Close`.
 - **`HeapAlloc` deltas under-report.** They once claimed a 100k-entry map costs
   10.9 bytes a key. Count the structure, or use `TotalAlloc` over a preallocated
   build.
+- **A benchmark that probes too few distinct keys measures nothing.** Deciding
+  whether a Bloom filter beat the index took three attempts, and the first two
+  gave opposite answers, both wrong. Probing one absent key said the filter won
+  by a quarter; four thousand keys said it lost by 8%; probing as many keys as
+  the store held said it won by 2.6x. What decides whether a map lookup goes to
+  memory is not how big the map is but how much of it the workload touches, and
+  a small probe set keeps the buckets in cache however large the map. If a
+  benchmark is about cache, count the distinct keys it touches before believing
+  it.
 - **Benchmarks run back to back drift.** Two toolchains looked 6-8% apart until
   they were interleaved, at which point they were identical. That was the
   laptop warming up. Alternate the runs.
@@ -137,6 +147,11 @@ matters is the ratios.
 | segments                                   | exactly, they change in four places, and the copy would   |
 |                                            | be a fifth. searchOrder yields instead, which allocates   |
 |                                            | nothing and cannot go stale                              |
+| Bloom filters, on the grounds that a       | wrong, and adopted instead. No I/O is saved, but the      |
+| frozen miss never touches the disk         | filter is 40x smaller than the index and stays in cache   |
+|                                            | when it does not: a miss over 256k-key logs went 250 ns   |
+|                                            | to 87. Below ~4k keys a log it costs ~8%, hence the       |
+|                                            | threshold. See BenchmarkDB_BloomThreshold                 |
 | Blaming the DB's parallel read collapse on | wrong. Removing it made a serial active read a third      |
 | the per-read allocation                    | faster and moved the parallel table not at all. It was    |
 |                                            | the two system calls a frozen read made; a page of        |

@@ -83,6 +83,10 @@ type diskSegment struct {
 	file  diskFile
 	index map[string]int64
 	bytes int64
+
+	// filter answers "not in this log" without consulting index. Nil disables
+	// it, which is how the benchmarks measure what it is worth.
+	filter *bloom
 }
 
 // openDiskSegment indexes the segment at path without holding its records in
@@ -91,7 +95,7 @@ type diskSegment struct {
 // The index comes from the hint file beside it when there is a usable one,
 // which is the difference between reading twenty bytes per key and reading the
 // whole log. Otherwise the log is read and a hint written for next time.
-func openDiskSegment(id uint64, path string) (*diskSegment, error) {
+func openDiskSegment(id uint64, path string, bloomMin int) (*diskSegment, error) {
 	file, err := disk.Open(path, os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
@@ -104,7 +108,7 @@ func openDiskSegment(id uint64, path string) (*diskSegment, error) {
 	}
 
 	if index, ok := loadHint(path, info.Size()); ok {
-		return &diskSegment{segID: id, path: path, file: file, index: index, bytes: info.Size()}, nil
+		return &diskSegment{segID: id, path: path, file: file, index: index, bytes: info.Size(), filter: maybeBloom(index, bloomMin)}, nil
 	}
 
 	index, good, err := indexSegment(file, info.Size())
@@ -128,12 +132,12 @@ func openDiskSegment(id uint64, path string) (*diskSegment, error) {
 	// again does not. A hint that cannot be written is not worth failing over.
 	writeHint(path, good, index)
 
-	return &diskSegment{segID: id, path: path, file: file, index: index, bytes: good}, nil
+	return &diskSegment{segID: id, path: path, file: file, index: index, bytes: good, filter: maybeBloom(index, bloomMin)}, nil
 }
 
 // freeze turns the active segment into a frozen one, letting go of the records
 // it was holding in memory and keeping only the index it had already built.
-func freeze(m *memSegment, policy SyncPolicy) (*diskSegment, error) {
+func freeze(m *memSegment, policy SyncPolicy, bloomMin int) (*diskSegment, error) {
 	// Closing the store stops its own syncing, so anything the timer would
 	// have got to has to be seen to here. SyncAlways has already done it, and
 	// SyncNever asked for none.
@@ -174,7 +178,7 @@ func freeze(m *memSegment, policy SyncPolicy) (*diskSegment, error) {
 	// store from ever having to read this log.
 	writeHint(path, size, index)
 
-	return &diskSegment{segID: m.segID, path: path, file: file, index: index, bytes: size}, nil
+	return &diskSegment{segID: m.segID, path: path, file: file, index: index, bytes: size, filter: maybeBloom(index, bloomMin)}, nil
 }
 
 func (d *diskSegment) id() uint64 { return d.segID }
@@ -201,6 +205,13 @@ func (d *diskSegment) recordAt(pos int64) (Record, []byte, error) {
 }
 
 func (d *diskSegment) read(key []byte) ([]byte, error) {
+	// The filter is smaller than the index by a factor of forty or so, so a key
+	// this log has never held is turned away by something that fits in cache
+	// rather than by a map that does not.
+	if d.filter != nil && !d.filter.mayContain(key) {
+		return nil, ErrorKeyNotFound
+	}
+
 	pos, ok := d.index[string(key)]
 	if !ok {
 		return nil, ErrorKeyNotFound

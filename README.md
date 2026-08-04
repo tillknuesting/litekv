@@ -216,6 +216,7 @@ db, err := litekv.OpenDB("data", litekv.DBOptions{
     Interval:     time.Second,
     SegmentSize:  4 << 20, // freeze a log at 4 MiB
     MergeTrigger: 2,       // merge once two logs of a size have collected
+    BloomMinKeys: 4096,    // filter a frozen log once it holds this many keys
 })
 defer db.Close()
 
@@ -346,6 +347,41 @@ Merging keeps out of a write's way only if there is a core for it to run on. On 
 is the same work in the same place, and a write waits for whatever the scheduler decides — measured at 9
 to 19 ms against the 4 ms it costs with cores to spare. Segments still bound what a merge rewrites and
 still keep the memory down; what they stop buying is the quiet.
+
+### Bloom filters
+
+A lookup asks every log, newest first, and stops at the first answer. So the most expensive lookup a
+`DB` has is one for a key it does not hold: every log, and no early exit. Once a frozen log holds enough
+keys it gets a Bloom filter over them, which turns such a key away without the log consulting its index
+at all.
+
+The usual reason for a filter does not apply here, and it is worth saying why, because it changes where
+the filter helps. A filter normally exists to keep a lookup off the disk; a frozen log here answers a
+miss out of its index and never touches the disk to do it. What the filter saves is not I/O but cache.
+The index of half a million keys is about 30 MB and a lookup in it is a walk out to memory; a filter over
+the same keys is under a megabyte and stays in cache. That is the whole of the win, and it is why there
+is a threshold: a small index is already in cache, and then a map lookup is a few nanoseconds that a hash
+and six probes cannot beat.
+
+A miss against logs of a given size, with a filter and without:
+
+| keys a log | no filter | filter  |
+| ---------- | --------- | ------- |
+| 1,000      | 67.9 ns   | 73.3 ns |
+| 4,000      | 74.7 ns   | 74.5 ns |
+| 16,000     | 78.5 ns   | 77.4 ns |
+| 64,000     | 112 ns    | 84.4 ns |
+| 256,000    | 250 ns    | 86.6 ns |
+
+The filter's cost barely moves across that range while the index's climbs, which is the argument in one
+table. They cross at about four thousand keys, so that is what `BloomMinKeys` defaults to: below it a
+filter measures worse, above it only better, and by a quarter of a million keys a miss is three times
+cheaper. Set it lower to filter more logs, higher to filter fewer, or negative to build none.
+
+It costs about 10 bits a key, some 3% on top of the index it sits in front of, and about one lookup in a
+hundred is a false positive that consults the index anyway and finds nothing. A false negative would be
+a different matter — a key reported missing while it sits in the log — so that is what the tests are
+mostly about.
 
 ### What a crash leaves behind
 

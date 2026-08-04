@@ -81,11 +81,39 @@ type DBOptions struct {
 	// size, which is a handful in total, and two keeps that as low as it goes
 	// at the cost of merging more often.
 	MergeTrigger int
+
+	// BloomMinKeys is how many keys a frozen log must hold before it is given a
+	// Bloom filter over them. Zero means the default; a negative value turns
+	// filters off entirely.
+	//
+	// A filter turns away a key the log has never held without consulting its
+	// index, which matters because a lookup asks every log and only stops when
+	// one answers. It is worth having exactly when the index has grown past
+	// what the cache holds, and a cost below that — see the "Bloom filters"
+	// section of the README for where the default comes from.
+	BloomMinKeys int
 }
 
 const (
 	defaultSegmentSize  = 4 << 20
 	defaultMergeTrigger = 2
+
+	// defaultBloomMinKeys is where a filter starts paying for itself, read off
+	// BenchmarkDB_BloomThreshold rather than chosen. A miss against logs of a
+	// given size, with the filter and without:
+	//
+	//	keys a log     no filter    filter
+	//	     1,000       67.9 ns   73.3 ns
+	//	     4,000       74.7 ns   74.5 ns
+	//	    16,000       78.5 ns   77.4 ns
+	//	    64,000        112 ns   84.4 ns
+	//	   256,000        250 ns   86.6 ns
+	//
+	// The filter's cost barely moves while the map's climbs, which is the whole
+	// argument: the filter stays in cache and the index stops doing so. They
+	// cross at about four thousand, so that is the default — below it a filter
+	// is measurably worse, above it only better.
+	defaultBloomMinKeys = 4096
 
 	// tierRatio is how much bigger a log has to be to count as a size of its
 	// own. Four means a log is only merged with others within four times its
@@ -101,6 +129,13 @@ func (o DBOptions) segmentSize() int64 {
 		return defaultSegmentSize
 	}
 	return o.SegmentSize
+}
+
+func (o DBOptions) bloomMinKeys() int {
+	if o.BloomMinKeys == 0 {
+		return defaultBloomMinKeys
+	}
+	return o.BloomMinKeys
 }
 
 func (o DBOptions) mergeTrigger() int {
@@ -207,7 +242,7 @@ func OpenDB(dir string, opts DBOptions) (*DB, error) {
 			continue
 		}
 
-		frozen, err := openDiskSegment(id, db.path(id))
+		frozen, err := openDiskSegment(id, db.path(id), opts.bloomMinKeys())
 		if err != nil {
 			db.closeSegments()
 			return nil, err
@@ -524,7 +559,7 @@ func (db *DB) rotateIfFull(written *memSegment) {
 
 	// Freezing hands the records over to the disk: the store and the Data
 	// slice it was holding go, and what stays in memory is the index.
-	frozen, err := freeze(written, db.opts.Sync)
+	frozen, err := freeze(written, db.opts.Sync, db.opts.bloomMinKeys())
 	if err != nil {
 		db.rotateErr = err
 		return
@@ -656,7 +691,7 @@ func (db *DB) mergeLocked(victims []*diskSegment, dropTombstones bool) error {
 
 	// The merge knows where it put every record, so there is nothing to read
 	// back: the index it built is the index of the new log.
-	merged, err := adoptMerged(oldest.id(), db.path(oldest.id()), index, size)
+	merged, err := adoptMerged(oldest.id(), db.path(oldest.id()), index, size, db.opts.bloomMinKeys())
 	if err != nil {
 		return err
 	}
@@ -786,7 +821,7 @@ func mergeInto(path string, victims []*diskSegment, dropTombstones bool) (map[st
 // adoptMerged opens a log the merge has just written, taking the index the
 // merge already built rather than reading the log again, and writes the hint
 // that saves the next open from reading it either.
-func adoptMerged(id uint64, path string, index map[string]int64, size int64) (*diskSegment, error) {
+func adoptMerged(id uint64, path string, index map[string]int64, size int64, bloomMin int) (*diskSegment, error) {
 	file, err := disk.Open(path, os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
@@ -794,7 +829,7 @@ func adoptMerged(id uint64, path string, index map[string]int64, size int64) (*d
 
 	writeHint(path, size, index)
 
-	return &diskSegment{segID: id, path: path, file: file, index: index, bytes: size}, nil
+	return &diskSegment{segID: id, path: path, file: file, index: index, bytes: size, filter: maybeBloom(index, bloomMin)}, nil
 }
 
 // syncDir makes a rename in dir durable. Not every filesystem supports it, so a
