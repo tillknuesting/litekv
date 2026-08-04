@@ -1,15 +1,20 @@
 // Command example walks through litekv from one end to the other: a store in
 // memory, what it can tell you about itself, the same store saved and loaded by
-// hand, one that mirrors its writes somewhere else, one that keeps a file, and
-// one split across segments for more than fits in memory.
+// hand, one that mirrors its writes somewhere else, one that keeps a file, one
+// split across segments for more than fits in memory, and one followed by a
+// replica over a connection.
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/tillknuesting/litekv"
@@ -20,6 +25,40 @@ import (
 func must(err error) {
 	if err != nil {
 		log.Fatalln(err)
+	}
+}
+
+// catchUp brings a follower up to date a batch at a time. This is the shape a
+// transport that answers requests takes — the follower asks, the leader answers
+// once, and it asks again — and it is what Follow does without the asking.
+func catchUp(leader, follower *litekv.KeyValueStore) error {
+	pos := follower.Position()
+
+	for {
+		var batch bytes.Buffer
+
+		next, err := leader.Since(pos, &batch, litekv.ReplicaOptions{})
+		if err != nil {
+			return err
+		}
+		if next == pos {
+			return nil // up to date
+		}
+		if pos, err = follower.Apply(pos, &batch, litekv.ReplicaOptions{}); err != nil {
+			return err
+		}
+	}
+}
+
+// waitFor gives an asynchronous follower a moment to arrive. There is nothing
+// to assert about how long that takes, which is what asynchronous means.
+func waitFor(arrived func() bool) {
+	deadline := time.Now().Add(10 * time.Second)
+	for !arrived() {
+		if time.Now().After(deadline) {
+			log.Fatalln("the follower never caught up")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -174,6 +213,106 @@ func main() {
 	must(err)
 	fmt.Println("after reopening, persisted =", string(value))
 	must(store.Close())
+
+	// ------------------------------------------------------------ replicated
+	// A log is an ordered, checksummed, append-only stream of records, so a
+	// follower holding the first N bytes of one and given the bytes after them
+	// holds the same store. Nothing in the library opens a socket: it hands
+	// over a position and a run of records, and moving them is this code's job.
+	fmt.Println("\n== replicated to a follower ==")
+
+	leader := &litekv.KeyValueStore{}
+	for i := 0; i < 5; i++ {
+		must(leader.Write([]byte(fmt.Sprintf("key-%d", i)), []byte("value")))
+	}
+
+	replica := &litekv.KeyValueStore{}
+
+	// A connection. net.Pipe rather than a socket so that the example needs no
+	// port and no cleanup; over TCP the code either side of it is the same.
+	client, server := net.Pipe()
+	stop := make(chan struct{})
+
+	var streaming sync.WaitGroup
+	streaming.Add(2)
+
+	// The leader's end: read the position the follower has reached, then send
+	// records from there for as long as it stays connected. A position is
+	// twenty bytes, which is the only thing the two ends have to agree on.
+	go func() {
+		defer streaming.Done()
+		defer server.Close()
+
+		var asked [20]byte
+		if _, err := io.ReadFull(server, asked[:]); err != nil {
+			return
+		}
+
+		var from litekv.Position
+		if err := from.UnmarshalBinary(asked[:]); err != nil {
+			return
+		}
+
+		leader.Follow(from, server, stop, litekv.ReplicaOptions{})
+	}()
+
+	// The follower's end: say where it has got to, then apply what arrives
+	// until the connection ends. A record carries its own lengths, so there is
+	// no framing to agree on either.
+	go func() {
+		defer streaming.Done()
+		defer client.Close()
+
+		from := replica.Position()
+
+		here, err := from.MarshalBinary()
+		if err != nil {
+			return
+		}
+		if _, err := client.Write(here); err != nil {
+			return
+		}
+
+		// It returns when the connection does, which is not a failure here.
+		replica.Apply(from, client, litekv.ReplicaOptions{})
+	}()
+
+	waitFor(func() bool { return replica.Size() == leader.Size() })
+	fmt.Printf("the follower caught up: %d bytes\n", replica.Size())
+
+	// Changed is what tells a leader there is something to send. Follow is
+	// waiting on exactly this inside the goroutine above, which is why a record
+	// written now crosses without the follower asking again.
+	changed := leader.Changed()
+	must(leader.Write([]byte("late"), []byte("record")))
+	<-changed
+
+	waitFor(func() bool { return replica.Size() == leader.Size() })
+
+	value, err = replica.Read([]byte("late"))
+	must(err)
+	fmt.Println("and kept up:", string(value))
+
+	close(stop)
+	streaming.Wait()
+
+	// Compaction moves every record, so no follower's position survives one.
+	// The leader says so rather than sending records that would splice one
+	// history onto another, and the follower empties itself and starts again.
+	must(leader.Write([]byte("key-0"), []byte("updated")))
+	must(leader.Compact())
+
+	_, err = leader.Since(replica.Position(), io.Discard, litekv.ReplicaOptions{})
+	if errors.Is(err, litekv.ErrorDiverged) {
+		fmt.Println("after the leader compacted:", err)
+
+		must(replica.Reset())
+		must(catchUp(leader, replica))
+	}
+
+	value, err = replica.Read([]byte("key-0"))
+	must(err)
+	fmt.Printf("the follower took the log again: key-0 = %s, %d bytes\n", value, replica.Size())
 
 	// -------------------------------------------------------------- segments
 	// A DB spreads the store over several logs, for more than fits in memory.

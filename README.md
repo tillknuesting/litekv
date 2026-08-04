@@ -3,7 +3,8 @@
 LiteKV is a small key-value store written in Go. Records are appended to a log, an index maps each key
 to its newest record, and the whole store is one byte slice you can hold in memory, save yourself, or
 have written to disk as it changes. For a store bigger than memory, `DB` splits it across several logs,
-keeps only the keys and the newest log in memory, and merges the rest in the background.
+keeps only the keys and the newest log in memory, and merges the rest in the background. A
+`KeyValueStore` can be followed by a replica, which is the same log sent somewhere else.
 
 The design is Bitcask, described by Justin Sheehy and David Smith at Basho Technologies in their 2010
 paper *Bitcask: A Log-Structured Hash Table for Fast Key/Value Data*, which credits Eric Brewer for the
@@ -29,6 +30,7 @@ the store outgrows memory, or when compacting one log in one go has become a sta
 | Compaction               | stops the world      | merges in the background                 |
 | After `Close`            | still reads          | refuses: its values are behind shut files |
 | Data as a byte slice     | yes, `Data`          | no, it is several files                  |
+| Replication              | yes, ship the log    | not yet                                  |
 
 ## Getting Started
 
@@ -457,6 +459,104 @@ in the suite has one.
 `Recover` is the same walk with every checksum verified, and costs about what `RebuildIndex` does — 400
 µs against 418 for 4096 keys — so there is no speed to be had by rebuilding without the checking.
 
+## Replication
+
+The log is already an ordered, checksummed, append-only stream of records, so a follower that holds the
+first *N* bytes of a leader's log and is given the bytes after them holds the same store, record for
+record. That is all replication is here: shipping the log. It is the WAL-shipping arrangement described
+in the leader-follower chapter of *Designing Data-Intensive Applications*, and the one PostgreSQL and
+MySQL use — the follower names a position once and the leader streams from there.
+
+Nothing in the library opens a socket. What crosses the gap is a `Position`, which marshals to twenty
+bytes, and a run of records; carrying those over TCP, HTTP, a pipe or a file is yours to do. A record
+carries its own lengths, so a stream of them needs no framing on top.
+
+```go
+// the leader, on a connection
+leader.Follow(from, conn, stop, litekv.ReplicaOptions{})
+
+// the follower, on the other end of it
+replica.Apply(from, conn, litekv.ReplicaOptions{})
+```
+
+`Follow` sends what the follower is missing and then goes on sending as records are written, until
+`stop` is closed or the connection stops taking them. `Apply` reads records and appends them, applying
+whatever arrived together in one write and one sync, and returns when the connection ends. A slow
+follower does not slow the leader down: each batch is copied out under the read lock and written outside
+it, which is what makes the replication asynchronous and what lets a follower fall behind.
+
+`Since` is the same thing for a transport that answers requests rather than holding a connection open —
+one batch and a return — and costs a round trip per batch:
+
+```go
+next, err := leader.Since(pos, w, litekv.ReplicaOptions{})   // one batch
+```
+
+`example/` wires a leader and a follower over a connection, end to end, in about fifty lines.
+
+### A position is not an offset
+
+An offset on its own cannot say which log it is an offset into. Two stores can both be a thousand bytes
+long and hold entirely different records, and sending the bytes after a thousand to the second of them
+splices one history onto the other and leaves a log that decodes perfectly and answers wrongly.
+
+So a position also says where its last record starts and what that record's checksum is, and a leader
+checks both against its own log before it sends anything:
+
+```go
+type Position struct {
+	Offset int64  // bytes of the leader's log the follower holds
+	Last   int64  // where the last of those records starts
+	Crc    uint32 // that record's checksum
+}
+```
+
+This is the check Raft makes with `prevLogIndex` and `prevLogTerm`, in the fields this format already
+had — no store identifier, no epoch counter, and no change to the record layout. A position that is not
+a point in the leader's log gets `ErrorDiverged`, and the only way back is `Reset`, which empties the
+follower so it can be sent the whole log from `Position{}`. Compaction on the leader produces exactly
+this, since it moves every record.
+
+The same check keeps a follower honest. Nothing marks a store read-only, and nothing needs to: `Apply`
+takes the position the batch was cut for and refuses when the store is somewhere else, so a write of the
+follower's own is caught by the next batch rather than quietly kept. A batch that arrives twice is
+refused for the same reason, with `ErrorPosition`.
+
+### What a follower checks
+
+Every record is decoded and verified against its own checksum before any of it is kept. A leader is not
+a reason to trust the wire in between, and a record kept without checking is one no later read can
+question. A stream that ends part way through a record keeps the whole records before it and reports the
+rest as damaged, along with the position it reached, so carrying on from there loses nothing.
+
+A follower is a store like any other. Give it a file with `Open` and it survives a restart: its position
+is where its own log ends, which is what it asks with next time. That is the catch-up recovery every
+leader-follower system needs after a follower has been down.
+
+### What it costs
+
+| | |
+| ------------------------------------ | -------- |
+| A record across, leader and follower  | 379 ns   |
+| The same, 1 KiB values                | 969 ns   |
+| Catching up from nothing              | 1.9 GB/s |
+
+Those leave out the transport, which is the point: they are what this package costs, and any connection
+is slower. Two allocations a record, and neither of them a buffer — both ends keep theirs between calls.
+
+A leader that nobody is following pays one atomic swap per write for the notification that would wake
+one, which does not measure: 110.9, 111.3 and 111.3 ns against 109.8, 111.4 and 116.6 ns without it,
+which is less than three runs of the same code differ by. A leader that *is* being followed pays for
+waking it — 107 ns a write becomes 138. That is the worst case and deliberately so: the follower in
+`BenchmarkWriteWithAWaiter` wakes on every single record and goes straight back to asking, where a real
+one drains what has piled up and asks once. Handing out that channel used to take the store's write
+lock, which put the follower in the same queue as the writers and made it 165 ns instead; it is an
+atomic now.
+
+`ReplicaOptions.BatchSize` is how much crosses at once and how much either end buffers, a megabyte by
+default. Since a stream costs no round trip per batch, it is a memory setting rather than a latency one.
+A record larger than a batch still crosses whole, or a log holding one could never be replicated at all.
+
 ## Concurrency
 
 `KeyValueStore` embeds a reader-writer lock and every method takes it, so the methods are safe to call
@@ -686,6 +786,21 @@ anything either.
   writes, and the stall it was meant to remove comes back.
 - **A closed `DB` cannot read.** Its values are on the disk and closing shuts the files. A closed
   `KeyValueStore` goes on answering, because its records are in memory.
+- **Only a `KeyValueStore` replicates.** A `DB` cannot, because its offsets are per log and merging
+  rewrites and removes logs, so no offset in one survives. Doing it needs a logical stream rather than
+  this physical one — the follower building its own segments from the records rather than copying the
+  leader's bytes. `AGENTS.md` has what that would take.
+- **Replication is asynchronous, and only that.** A write returns as soon as the leader has it, so a
+  leader that dies loses whatever its followers had not received yet. There is no synchronous or
+  semi-synchronous mode, no acknowledgement from a follower, and nothing waits for one.
+- **There is no failover, and no leader election.** Which store is the leader is your decision and
+  nobody else's. A follower promoted by hand is just a store you start writing to; two of them written
+  to at once diverge, and the divergence is reported rather than resolved.
+- **A follower is a whole copy.** There is no partial replication, no filtering by key, and no way to
+  follow one part of a store. The unit is the log.
+- **A replica costs the leader a copy.** Each batch is copied out of `Data` under the read lock before
+  it is written to the connection, which is what keeps a slow follower from blocking writes. Ten
+  followers catching up at once is ten copies.
 
 ## Working on it
 

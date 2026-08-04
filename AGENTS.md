@@ -14,6 +14,7 @@ to save you a day, not to introduce the code.
 | `segment.go` | the two kinds of segment, and reading a log without holding it in memory  |
 | `hint.go`    | the index of a frozen log, written beside it                             |
 | `bloom.go`   | the filter in front of that index, once a log is big enough to want one   |
+| `replica.go` | `Position`, and shipping the log to a follower: `Since`, `Follow`, `Apply` |
 | `fs.go`      | the one seam through which this package touches a disk                    |
 
 `KeyValueStore` and `DB` are deliberately separate. The first is one log with
@@ -35,6 +36,7 @@ go test -race ./...
 GOMAXPROCS=1 go test ./...   # the lock degrades to one shard; that path is real
 go run ./example      # it exercises every exported call
 go test -run xxx -fuzz FuzzSegmentBytes -fuzztime 30s .
+go test -run xxx -fuzz FuzzApply -fuzztime 30s .   # what arrives over a wire
 ```
 
 `GOMAXPROCS=1` is not paranoia. The lock shards on `GOMAXPROCS`, so a one-core
@@ -77,6 +79,34 @@ cut the log back to it. A disk that will not hand the bytes over is a different
 thing, and answering it the same way deletes what could not be read. This was
 real: one refused read per log truncated all thirteen logs to zero and reported
 a healthy, empty store. `endOfLog` in `segment.go` is the whole fix.
+
+**A follower's position is checked before a leader sends it anything.** An
+offset alone cannot say which log it is an offset into, and two stores of the
+same length holding different records would otherwise be spliced into one log
+that decodes perfectly and answers wrongly. `Position` carries where its last
+record starts and that record's checksum, and `batch` verifies both against its
+own log or answers `ErrorDiverged`. `TestReplicaDiverged` covers the three ways
+it happens: a follower with a history of its own, a leader that compacted, and a
+follower ahead of its leader.
+
+**A follower verifies every record before keeping any of it.** `applyWhole`
+decodes and checksums the whole batch first, and a record it will not vouch for
+stops it there. A leader is not a reason to trust the wire, and a record kept
+without checking is one no later read can question. `FuzzApply` is the same
+claim against arbitrary bytes.
+
+**Nothing marks a store read-only, and nothing needs to.** `Apply` takes the
+position the batch was cut for and refuses when the store is somewhere else, so
+a write of a follower's own — or a batch that arrived twice — is caught by the
+position rather than by a mode flag. `TestReplicaWrongPosition`.
+
+**`Position` is allowed to be slow, never wrong.** `lastRecord` is where the
+last record starts, and every path that changes `Data` moves it. If one forgets,
+`position` finds out — it checks the record there against the end of `Data` and
+reads the log when it does not fit. That is deliberate: this is the shape of the
+cached-search-order idea rejected below, and the fallback is what makes it safe
+to keep. `TestPositionTracksTheLog` corrupts the shortcut on purpose after every
+operation that moves the log.
 
 **The record offsets live only in `decodeHeader`.** They were in three places
 once and a format change left two of them reading the wrong bytes, compiling
@@ -123,6 +153,20 @@ is remembered in `db.rotateErr` and reported by `Sync` and `Close`.
 - **Benchmarks run back to back drift.** Two toolchains looked 6-8% apart until
   they were interleaved, at which point they were identical. That was the
   laptop warming up. Alternate the runs.
+- **A follower asking whether there is more, through the write lock.**
+  `Changed` handed out its channel under `kvs.Lock`, which takes every shard, so
+  a follower waiting on a store stood in the same queue as the writers and took
+  a write from 105 ns to 165. It is an `atomic.Pointer` now, and 138. The write
+  lock is not a general-purpose lock in this package; anything a follower calls
+  often does not belong behind it. `BenchmarkWriteWithAWaiter` is the number.
+- **A buffer sized to the maximum, allocated per call.** `Apply` reads into a
+  buffer bounded by `BatchSize`, and allocating it at that size on the way in
+  cost 2 MB and 79 µs for a batch holding one 46-byte record — a 200x
+  regression on the version it replaced, and invisible to every test. It grows
+  into what is arriving instead, and both ends keep their buffers in a
+  `sync.Pool`, as `segment.go` does for the same reason. If a replication
+  benchmark reports more than a few hundred bytes an op, a buffer is being
+  allocated per call again.
 - **`crc32` leaks its argument to the heap.** Handing it a stack array put that
   array on the heap and cost an allocation on every read and write. The header
   is folded a byte at a time for that reason; do not "simplify" it back.
@@ -199,11 +243,27 @@ a crash survivable and none of them show up in the result of a call.
 
 ## What to build next, and what it needs
 
-**Replication by shipping the log** is the natural one. The log is already an
-ordered, checksummed, immutable stream of records with timestamps, so a follower
-needs little more than "send me everything from offset N". The timestamp and
-version fields were added with this in mind. It brings networking into a library
-that has none, which is the thing to think about before starting.
+**Replicating a `DB`** is what replication left undone. A `KeyValueStore` ships
+its log as bytes, which works because the log only ever grows. A `DB` cannot do
+that: its offsets are per segment, and merging rewrites and removes segments, so
+no position in one survives.
+
+The way through is the other kind of replication log the book describes — a
+logical stream rather than this physical one. Ship the records and let the
+follower build its own segments and do its own merging, so the two stores agree
+on what they hold without agreeing on their bytes. A new follower needs a
+snapshot and the position it was taken at, which for a `DB` is `ForEach` plus
+`(active segment id, offset)` captured under `db.mu`, and then the stream from
+there. Rotation is the only event the follower has to be told about, and it does
+not need to be: it rotates on its own when its active log fills.
+
+What that costs is that `sameStore`, the test helper that compares two logs byte
+for byte, stops being available, and every test has to compare what the stores
+answer instead. That is the honest trade of logical replication and worth
+knowing before starting rather than after.
+
+Nothing here does failover, and adding it is a different project: it needs a way
+to agree on who the leader is, which is consensus, and this is a storage engine.
 
 Smaller: expiry, now that records carry a time; or a batch write, which needs a
 commit marker in the format to be atomic across a crash.

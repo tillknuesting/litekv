@@ -46,3 +46,4 @@ jobs:
         go test -run xxx -fuzz FuzzSegmentBytes -fuzztime 30s .
         go test -run xxx -fuzz FuzzHint -fuzztime 30s .
         go test -run xxx -fuzz FuzzKeyValueStore_WriteReadDelete -fuzztime 20s .
+        go test -run xxx -fuzz FuzzApply -fuzztime 30s .

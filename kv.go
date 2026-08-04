@@ -10,6 +10,7 @@ import (
 	"math"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -167,6 +168,22 @@ type KeyValueStore struct {
 	// state is the log the store mirrors writes to, nil for a store that lives
 	// only in memory. See file.go.
 	state *logState
+
+	// lastRecord is where the newest record in Data starts, which is half of
+	// what a follower's Position is. It is a shortcut rather than the truth:
+	// Position checks it against Data and reads the log when it does not fit,
+	// so a path that changes Data and forgets to move it costs a scan and not a
+	// wrong answer. See replica.go.
+	lastRecord int64
+
+	// waiters is closed to wake whatever is following this store's log, and
+	// replaced the next time anything asks. Nil when nothing is following.
+	//
+	// It is an atomic rather than another field under the store's lock because
+	// Changed is on a follower's hot path: taking the write lock to answer it
+	// put the follower in the same queue as the writers, and one follower
+	// waiting took a write from 105 ns to 165. See replica.go.
+	waiters atomic.Pointer[chan struct{}]
 }
 
 // maxShards bounds the read side of the store's lock.
@@ -762,6 +779,7 @@ func (kvs *KeyValueStore) Compact() error {
 	// Walk the Data slice a second time instead of ranging over the map, so that
 	// the compacted layout does not depend on Go's map iteration order. Surviving
 	// records are copied verbatim rather than re-serialized.
+	var last int64
 	err = kvs.scan(func(pos, next int64, r Record) bool {
 		if r.Type != RecordTypeNormal {
 			return true
@@ -769,7 +787,8 @@ func (kvs *KeyValueStore) Compact() error {
 		if survivor, ok := latest[string(r.Key)]; !ok || survivor != pos {
 			return true
 		}
-		index[string(r.Key)] = int64(len(data))
+		last = int64(len(data))
+		index[string(r.Key)] = last
 		data = append(data, kvs.Data[pos:next]...)
 		return true
 	})
@@ -779,6 +798,11 @@ func (kvs *KeyValueStore) Compact() error {
 
 	kvs.Data = data
 	kvs.Index = index
+
+	// Every record has moved, so no follower's position survives this. Waking
+	// them is how they find that out rather than waiting for the next write.
+	kvs.lastRecord = last
+	kvs.notify()
 
 	// A store with a log has just shortened its data; the log has to follow, or
 	// the next recovery would bring the compacted records back.
@@ -812,6 +836,10 @@ func (kvs *KeyValueStore) RebuildIndex() error {
 	}
 
 	kvs.Index = index
+	if len(offs) > 0 {
+		kvs.lastRecord = offs[len(offs)-1]
+	}
+	kvs.notify()
 	return err
 }
 

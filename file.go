@@ -236,17 +236,22 @@ func (kvs *KeyValueStore) Recover() (int64, error) {
 	// A record that fails to decode ends the scan with an error, and one that
 	// fails its checksum ends it by returning false. Either way the log is only
 	// trustworthy up to that point.
-	var good int64
+	var good, last int64
 	kvs.scan(func(pos, next int64, r Record) bool {
 		if r.Crc != checksumSerialized(kvs.Data[pos:next]) {
 			return false
 		}
 		index[string(r.Key)] = pos
-		good = next
+		last, good = pos, next
 		return true
 	})
 
 	kvs.Index = index
+	kvs.lastRecord = last
+
+	// Whatever was following this log was following the version of it that was
+	// here before it was loaded or recovered.
+	kvs.notify()
 
 	discarded := int64(len(kvs.Data)) - good
 	if discarded == 0 {
@@ -484,6 +489,9 @@ func (kvs *KeyValueStore) appendRecord(record *Record, key []byte) error {
 		kvs.Index = make(map[string]int64)
 	}
 	kvs.Index[string(key)] = pos
+
+	kvs.lastRecord = pos
+	kvs.notify()
 	return nil
 }
 
