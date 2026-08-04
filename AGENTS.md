@@ -95,6 +95,15 @@ stops it there. A leader is not a reason to trust the wire, and a record kept
 without checking is one no later read can question. `FuzzApply` is the same
 claim against arbitrary bytes.
 
+**A follower that crashed says where it got to, and the leader takes it.** A
+batch is one write, so losing power part way through leaves a record half on the
+disk. Opening drops that tail and truncates the file, and the position that
+comes back has to be one the leader will carry on from — a follower that had to
+start again from empty after every crash would be no follower at all.
+`TestReplicaSurvivesACrashMidBatch` tears a batch at the end of a catch-up and
+`TestReplicaCrashWithMoreToCome` tears one in the middle of one; both assert
+that the resync count is zero.
+
 **Nothing marks a store read-only, and nothing needs to.** `Apply` takes the
 position the batch was cut for and refuses when the store is somewhere else, so
 a write of a follower's own — or a batch that arrived twice — is caught by the

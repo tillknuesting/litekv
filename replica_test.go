@@ -675,6 +675,133 @@ func TestReplicaFollowerKeepsAFile(t *testing.T) {
 	sameStore(t, leader, reopened)
 }
 
+// TestReplicaSurvivesACrashMidBatch is the case a follower exists for. A batch
+// is one write, and a machine that loses power part way through one leaves a
+// record half on the disk. Reopening has to drop that tail, report the position
+// of the last whole record, and have the leader accept it — which is catch-up
+// recovery, and the whole reason a follower keeps a log of its own.
+func TestReplicaSurvivesACrashMidBatch(t *testing.T) {
+	leader := &KeyValueStore{}
+	for i := 0; i < 30; i++ {
+		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	path := filepath.Join(t.TempDir(), "follower.kv")
+
+	follower, err := Open(path, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	catchUp(t, leader, follower)
+
+	whole := follower.Position()
+	if err := follower.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The machine went down between the record's header reaching the disk and
+	// the rest of it doing so.
+	torn, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := torn.Write(leader.Data[whole.Last : whole.Offset-3]); err != nil {
+		t.Fatal(err)
+	}
+	if err := torn.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Opening recovers: the half record goes, and so does the tail on the disk.
+	reopened, err := Open(path, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+
+	if got := reopened.Position(); got != whole {
+		t.Fatalf("after a crash the follower is at %+v, want the last whole record at %+v", got, whole)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != whole.Offset {
+		t.Errorf("the file still holds %d bytes, want %d: the torn tail is on the disk", info.Size(), whole.Offset)
+	}
+
+	// And the leader takes that position, which is the point: a follower that
+	// crashed says where it got to and carries on from there rather than
+	// starting again.
+	if resyncs := syncUp(t, leader, reopened, ReplicaOptions{}); resyncs != 0 {
+		t.Errorf("a crashed follower started again from empty %d times, want 0", resyncs)
+	}
+	sameStore(t, leader, reopened)
+}
+
+// TestReplicaCrashWithMoreToCome is the same crash caught mid-catch-up rather
+// than at the end of one, so that the records the follower had not reached yet
+// have to arrive after it as well.
+func TestReplicaCrashWithMoreToCome(t *testing.T) {
+	leader := &KeyValueStore{}
+	for i := 0; i < 60; i++ {
+		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	path := filepath.Join(t.TempDir(), "follower.kv")
+
+	follower, err := Open(path, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A few records in, and no further: a follower that is still catching up.
+	var wire bytes.Buffer
+	if _, err := leader.Since(Position{}, &wire, ReplicaOptions{BatchSize: 100}); err != nil {
+		t.Fatal(err)
+	}
+	part, err := follower.Apply(Position{}, &wire, ReplicaOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if part.Offset >= int64(len(leader.Data)) {
+		t.Fatal("the follower caught up entirely, so there is no crash mid-stream to test")
+	}
+	if err := follower.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	torn, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := torn.Write(leader.Data[part.Offset : part.Offset+9]); err != nil {
+		t.Fatal(err)
+	}
+	if err := torn.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(path, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+
+	if got := reopened.Position(); got != part {
+		t.Fatalf("after a crash the follower is at %+v, want %+v", got, part)
+	}
+	if resyncs := syncUp(t, leader, reopened, ReplicaOptions{}); resyncs != 0 {
+		t.Errorf("a crashed follower started again from empty %d times, want 0", resyncs)
+	}
+	sameStore(t, leader, reopened)
+}
+
 // TestReplicaAppliesABatchAtOnce checks that a batch reaches the disk in one
 // write and one sync rather than one of each per record. A follower under
 // SyncAlways would otherwise be paying for the leader's whole history a record
