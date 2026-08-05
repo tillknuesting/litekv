@@ -888,10 +888,13 @@ anything either.
   position that claims them, so a crash in between means the same batch arrives twice. The records are
   identical and in the same order, so nothing it holds changes; the bytes are spent twice and a merge
   reclaims them.
-- **A `DB` follower that falls behind a merge starts again.** There is nothing like a replication slot
-  holding a log open for it, so a log it was reading can be merged away, and the answer is another
-  snapshot of the whole store. A follower that keeps up never sees this: it sits on the log being
-  written, which is never merged.
+- **A `DB` follower can be stranded by a merge, even a caught-up one.** There is nothing like a
+  replication slot holding a log open for it. A follower that is behind is reading a frozen log, and a
+  merge can take that log; one that has caught up rests wherever it read last, which is the end of the
+  last frozen log whenever the log being written is empty — and a merge can take that too. It is only
+  safe while the store is being written steadily, because then it rests inside the log being written,
+  which is never merged. So the answer is always another snapshot, and a loop that follows a `DB` has to
+  be written with that in it.
 - **Replication is asynchronous, and only that.** A write returns as soon as the leader has it, so a
   leader that dies loses whatever its followers had not received yet. There is no synchronous or
   semi-synchronous mode, no acknowledgement from a follower, and nothing waits for one.

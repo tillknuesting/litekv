@@ -390,12 +390,22 @@ a crash survivable and none of them show up in the result of a call.
 Replication is finished in both halves, for a single store and for a `DB`. What
 is left is the operational apparatus around it, and none of it is small.
 
-**A replication slot**, or something like one. A follower that falls behind far
-enough for the log it was reading to be merged away has to take a whole new
-snapshot, and nothing here holds a log open for it. That is also the narrow
-window a follower resting at the end of a frozen log sits in. PostgreSQL's
-answer is a slot, and it costs the leader unbounded disk when a follower dies
-quietly, which is why it is a decision rather than an obvious improvement.
+**A replication slot**, or something like one, is the biggest gap. A follower
+that falls behind far enough for the log it was reading to be merged away has to
+take a whole new snapshot, and nothing here holds a log open for it. Worse, a
+follower that has *caught up* is not safe either: when the log being written is
+empty it rests at the end of the last frozen log, and a merge can take that one
+as well. It is only out of reach while the store is written steadily, since it
+then rests inside the log being written.
+
+Three tests had to turn merging off to assert "this needed no new snapshot", and
+that is the honest measure of the gap rather than a testing inconvenience.
+PostgreSQL's answer is a slot, and it costs the leader unbounded disk when a
+follower dies quietly, which is why it is a decision rather than an obvious
+improvement. The cheaper half might be worth doing first: a merge already writes
+its victims out oldest-first and in order, so it knows the offset in its output
+where each input log's records end, and recording that would let a position at
+the end of a merged log be mapped forward instead of refused.
 
 **Semi-synchronous replication.** Everything here is asynchronous: a write
 returns as soon as the leader has it, and a leader that dies loses whatever its
