@@ -494,7 +494,9 @@ next, err := leader.Since(pos, w, litekv.ReplicaOptions{})   // one batch
 ```
 
 `example/` wires a leader and a follower over a connection, end to end, in about fifty lines, and shows
-a `DB` followed by another further down.
+a `DB` followed by another further down. `tcp_test.go` is the same thing over a real loopback socket,
+with framing, a connection broken part way through and a reconnect — the only place that says any of
+this survives a wire rather than a pipe.
 
 ### A position is not an offset
 

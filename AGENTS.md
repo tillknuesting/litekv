@@ -213,6 +213,34 @@ and `TestDBRotationFailureLeavesTheStoreWritable` holds the first two.
 full log is housekeeping that happens after the record is safe; a failure there
 is remembered in `db.rotateErr` and reported by `Sync` and `Close`.
 
+## Replication over a real socket
+
+`tcp_test.go` is the only place the library is put on a wire. Everything else
+moves records through a `bytes.Buffer` or an `io.Pipe`, which says what the
+records are but not that the arrangement works: a pipe never returns a short
+read, never splits a write across two calls, and never goes away in the middle
+of one.
+
+It runs a leader and a follower over loopback TCP with a length in front of
+every frame, a connection broken on purpose part way through, and a reconnect.
+The framing is not part of the library and deliberately so — it is what the
+package says is the caller's job — but writing it found three things no
+in-process test had:
+
+- **A leader must answer `ErrorDiverged` with a snapshot, not by hanging up.**
+  Nothing holds a log open for a follower that is not connected, so a follower
+  that was away long enough always comes back to a position that is gone. A
+  leader that treats that as a failed connection leaves it stuck forever.
+- **`Applied() == Position()` is the wrong way to ask whether a follower has
+  caught up.** A follower that has read a log to its end rests there rather than
+  stepping to the start of the log being written, so a caught-up pair reports
+  the end of log 13 against the start of log 14. Ask the leader whether it has
+  anything more instead.
+- **`Len()` is the wrong way to compare two stores.** It counts tombstones, and
+  a follower that came back by way of a snapshot has none, since a snapshot
+  carries only live records. Both stores are right and the counts differ. Count
+  what `ForEach` yields.
+
 ## Chaos: faults in the way of every operation
 
 `chaos_test.go` puts a fault in the way of each disk operation in turn and
