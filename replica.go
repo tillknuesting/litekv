@@ -428,38 +428,7 @@ func growBuffer(buf []byte, limit int64) []byte {
 // reports how many bytes of it that was. A record that is only partly there is
 // left for the next read; one that is not a record at all is an error.
 func (kvs *KeyValueStore) applyWhole(from Position, batch []byte) (Position, int64, error) {
-	// Where each key's newest record in this batch sits, relative to the start
-	// of it. Building this while checking saves decoding the batch twice, and a
-	// key written repeatedly within one batch is inserted once.
-	index := make(map[string]int64)
-
-	var good, last int64
-	var damaged error
-
-	for good < int64(len(batch)) {
-		size, whole, ok := recordLen(batch[good:])
-		if !ok {
-			damaged = &CorruptAtError{Offset: from.Offset + good}
-			break
-		}
-		if !whole {
-			break // the rest of it has not arrived
-		}
-
-		record, next, err := parseRecordAt(batch, good)
-		if err != nil || next != good+size {
-			damaged = &CorruptAtError{Offset: from.Offset + good}
-			break
-		}
-		if record.Crc != checksumSerialized(batch[good:next]) {
-			damaged = fmt.Errorf("record at offset %d: %w", from.Offset+good, ErrorChecksumMismatch)
-			break
-		}
-
-		index[string(record.Key)] = good
-		last = good
-		good = next
-	}
+	index, good, last, damaged := verifyRecords(batch, from.Offset)
 
 	kvs.Lock()
 	defer kvs.Unlock()
@@ -477,16 +446,67 @@ func (kvs *KeyValueStore) applyWhole(from Position, batch []byte) (Position, int
 		return from, 0, damaged
 	}
 
-	// Data, then the log, then the index, as for a write of the store's own:
-	// the index points at the records only once both have taken them, so a
-	// failure leaves the store where it was rather than half caught up.
+	if err := kvs.takeRecords(batch[:good], index, last); err != nil {
+		return from, 0, err
+	}
+	return kvs.position(), good, damaged
+}
+
+// verifyRecords walks the whole records at the front of batch, checking each
+// against its own checksum, and reports how many bytes of it are good and where
+// the last of those records starts. Offsets in the errors it returns are
+// relative to at, which is where the batch sits in whatever it came from.
+//
+// The index it builds is where each key's newest record in this batch is,
+// relative to the start of it. Building it here saves decoding the batch twice,
+// and a key written repeatedly within one batch is inserted once.
+func verifyRecords(batch []byte, at int64) (index map[string]int64, good, last int64, damaged error) {
+	index = make(map[string]int64)
+
+	for good < int64(len(batch)) {
+		size, whole, ok := recordLen(batch[good:])
+		if !ok {
+			damaged = &CorruptAtError{Offset: at + good}
+			break
+		}
+		if !whole {
+			break // the rest of it has not arrived
+		}
+
+		record, next, err := parseRecordAt(batch, good)
+		if err != nil || next != good+size {
+			damaged = &CorruptAtError{Offset: at + good}
+			break
+		}
+		if record.Crc != checksumSerialized(batch[good:next]) {
+			damaged = fmt.Errorf("record at offset %d: %w", at+good, ErrorChecksumMismatch)
+			break
+		}
+
+		index[string(record.Key)] = good
+		last = good
+		good = next
+	}
+
+	return index, good, last, damaged
+}
+
+// takeRecords appends records that have already been verified, and points the
+// index at them. last is where the last of them starts, and index says where
+// each key's newest one is, both relative to the start of batch. Callers must
+// hold the write lock.
+//
+// Data, then the log, then the index, as for a write of the store's own: the
+// index points at the records only once both have taken them, so a failure
+// leaves the store where it was rather than half caught up.
+func (kvs *KeyValueStore) takeRecords(batch []byte, index map[string]int64, last int64) error {
 	pos := int64(len(kvs.Data))
-	kvs.Data = append(kvs.Data, batch[:good]...)
+	kvs.Data = append(kvs.Data, batch...)
 
 	if state := kvs.state; state != nil {
 		if err := kvs.writeToLog(state, kvs.Data[pos:], pos); err != nil {
 			kvs.Data = kvs.Data[:pos]
-			return from, 0, err
+			return err
 		}
 	}
 
@@ -499,8 +519,7 @@ func (kvs *KeyValueStore) applyWhole(from Position, batch []byte) (Position, int
 
 	kvs.lastRecord = pos + last
 	kvs.notify()
-
-	return kvs.position(), good, damaged
+	return nil
 }
 
 // recordLen reports how many bytes the record at the front of buf takes and

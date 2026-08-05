@@ -364,6 +364,82 @@ func main() {
 		return true
 	}))
 
+	// ------------------------------------------------ a DB with a follower
+	// A DB cannot ship its log the way a single store does: its logs are merged
+	// in the background, and a merge writes its output over the oldest log it
+	// replaces, so a file keeps its name while becoming something else. What
+	// crosses is records instead, and the follower lays them out however its
+	// own rotations and merges decide.
+	fmt.Println("\n== a DB followed by another ==")
+
+	replicaDB, err := litekv.OpenDB(filepath.Join(dir, "replica"), litekv.DBOptions{
+		Sync: litekv.SyncNever,
+
+		// A different size from the leader's, to make the point that the two
+		// agree on what they hold and on nothing about their files.
+		SegmentSize: 512,
+	})
+	must(err)
+
+	// A follower with no position needs a snapshot: the live records, and the
+	// position they are current as of.
+	var snapshot bytes.Buffer
+	at, err := db.Snapshot(&snapshot, litekv.ReplicaOptions{})
+	must(err)
+	must(replicaDB.ApplySnapshot(at, &snapshot, litekv.ReplicaOptions{}))
+
+	// Len counts tombstones as well as live keys, and a snapshot carries no
+	// tombstones, so the follower's count is the live one.
+	fmt.Printf("the follower took %d live keys over %d logs; the leader is over %d\n",
+		replicaDB.Len(), replicaDB.Segments(), db.Segments())
+
+	// And then the tail. A position is twenty-eight bytes on the wire and has to
+	// travel with the records: a DB follower cannot work out where it is from
+	// its own logs the way a follower of a single store can.
+	//
+	// Take the channel before the write, never after. Changed is closed by the
+	// next change, so one taken afterwards waits for the change after that —
+	// which is what Follow does for you when a leader streams.
+	more := db.Changed()
+	must(db.Write([]byte("delta"), []byte("written after the snapshot")))
+	<-more
+
+	pos := replicaDB.Applied()
+	for {
+		var batch bytes.Buffer
+
+		next, err := db.Since(pos, &batch, litekv.ReplicaOptions{})
+		must(err)
+		if next == pos {
+			break
+		}
+
+		encoded, err := next.MarshalBinary()
+		must(err)
+
+		var arrived litekv.DBPosition
+		must(arrived.UnmarshalBinary(encoded))
+
+		pos, err = replicaDB.Apply(pos, arrived, &batch, litekv.ReplicaOptions{})
+		must(err)
+	}
+
+	value, err = replicaDB.Read([]byte("delta"))
+	must(err)
+	fmt.Println("the follower kept up: delta =", string(value))
+
+	if replicaDB.Position() != db.Position() {
+		fmt.Println("and the two stores are laid out entirely differently, as they should be")
+	}
+
+	// Reset empties a follower, which is what it does when a leader says there
+	// is no position the two agree on.
+	must(replicaDB.Reset())
+	fmt.Printf("after a reset the follower holds %d keys and no position: %t\n",
+		replicaDB.Len(), replicaDB.Applied() == litekv.DBPosition{})
+
+	must(replicaDB.Close())
+
 	// Sync reaches every log, and reports a rotation that could not be
 	// finished, which Write does not: a record is stored either way.
 	must(db.Sync())

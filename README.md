@@ -577,10 +577,36 @@ Because a merge destroys history, a leader cannot replay its writes from arbitra
 protocol can make it. Replication is therefore a snapshot and then the tail after it:
 
 ```go
-at, err := leader.Snapshot(w, litekv.ReplicaOptions{})  // the live records
-...
-at, err = leader.Follow(at, conn, stop, litekv.ReplicaOptions{})
+// the leader
+at, err := leader.Snapshot(w, litekv.ReplicaOptions{})   // the live records
+at, err = leader.Follow(at, send, stop, litekv.ReplicaOptions{})
+
+// the follower
+err = replica.ApplySnapshot(at, r, litekv.ReplicaOptions{})
+at, err = replica.Apply(from, next, r, litekv.ReplicaOptions{})
 ```
+
+`Follow` hands each batch to a callback along with the position it leads to, rather than writing it to a
+writer, because both have to reach the other end. A follower of a `DB` cannot work out where it is from
+its own logs the way a follower of a single store can — its files have nothing to do with the leader's —
+so the position travels with the records. How it travels is yours: a length, the twenty-eight bytes of
+`MarshalBinary`, and the records will do.
+
+`ApplySnapshot` is the other half: it empties the store, applies the records as they arrive — a snapshot
+of a store larger than memory costs no more than a small one, which reading it in one piece would give
+away — and writes the position down last. A failure anywhere in between leaves a store holding part of a
+snapshot and claiming no position at all, which is a follower that needs another one: where it started.
+
+`Apply` takes a batch and the position it leads to. A batch is all or nothing here, unlike the
+single-store `Apply`: there a half-applied batch is a fact about the follower's own log and its position
+says so, while here the position is something the leader said about the whole batch. A batch that is
+damaged or ends part way through a record is refused entirely.
+
+The records go down before the position that claims them. A crash in between leaves a follower having
+applied records it does not admit to, and the same batch arrives again — the same records in the same
+order, so what they say is unchanged and only the bytes are spent twice. The other order would claim
+records that were never written, which is the one that loses data. `Applied` reports how far through a
+leader a store has got, and survives closing and reopening because it is written down beside the logs.
 
 `Snapshot` writes one record per live key — the newest version, tombstones skipped, since a follower
 starting from nothing has no older value for one to hide — and returns the position they are current as
@@ -836,11 +862,10 @@ anything either.
   writes, and the stall it was meant to remove comes back.
 - **A closed `DB` cannot read.** Its values are on the disk and closing shuts the files. A closed
   `KeyValueStore` goes on answering, because its records are in memory.
-- **A `DB` has a leader but not yet a follower.** `Snapshot`, `Since` and `Follow` hand out the records;
-  what applies them is still a `KeyValueStore`, which means a `DB` can only be replicated into something
-  its live records fit into. A `DB` follower needs somewhere durable to keep the leader position it has
-  applied, since unlike a single store it cannot work that out from its own log. `AGENTS.md` has what
-  is left.
+- **Applying a batch to a `DB` follower is at least once.** The records reach the disk before the
+  position that claims them, so a crash in between means the same batch arrives twice. The records are
+  identical and in the same order, so nothing it holds changes; the bytes are spent twice and a merge
+  reclaims them.
 - **A `DB` follower that falls behind a merge starts again.** There is nothing like a replication slot
   holding a log open for it, so a log it was reading can be merged away, and the answer is another
   snapshot of the whole store. A follower that keeps up never sees this: it sits on the log being

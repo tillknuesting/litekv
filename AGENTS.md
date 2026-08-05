@@ -106,6 +106,15 @@ snapshot of a store whose active log is empty, which is refused if that log has
 since frozen. `TestDBSnapshotOfAnEmptyStore` is the exception,
 `TestDBTailCrossesFrozenLogs` is the rule.
 
+**A `DB` follower writes the records before the position that claims them.**
+Crashing in between means the same batch arrives again, which is the same
+records in the same order and changes nothing it holds. The other order claims
+records that were never written, and that is the one that loses data. It is an
+ordering, so no call's result shows it: `TestDBFollowerWritesRecordsBeforeThePosition`
+watches it through the seam in `fs.go`, on both the batch path and the snapshot
+path, because a mutation that swapped the order in one of them went unnoticed
+while only the other was watched.
+
 **A `DB` snapshot freezes before it reads.** Everything it covers is then on the
 disk and cannot change, and the position it reports is the end of the log it
 just froze — not the start of the new one, which would name no record and be
@@ -328,32 +337,28 @@ a crash survivable and none of them show up in the result of a call.
 
 ## What to build next, and what it needs
 
-**A `DB` follower** is what is left. The leader half is done — `Snapshot` hands
-out the live records, `Since` and `Follow` hand out the tail after them — and
-what applies those records is still a `KeyValueStore`, so a `DB` can only be
-replicated into something its live records fit into, which is the opposite of
-why `DB` exists.
+Replication is finished in both halves, for a single store and for a `DB`. What
+is left is the operational apparatus around it, and none of it is small.
 
-Two things it needs that the single-store follower did not.
+**A replication slot**, or something like one. A follower that falls behind far
+enough for the log it was reading to be merged away has to take a whole new
+snapshot, and nothing here holds a log open for it. That is also the narrow
+window a follower resting at the end of a frozen log sits in. PostgreSQL's
+answer is a slot, and it costs the leader unbounded disk when a follower dies
+quietly, which is why it is a decision rather than an obvious improvement.
 
-Somewhere durable to keep the leader position it has applied. A `KeyValueStore`
-follower gets that for free, because its log *is* the leader's log and its own
-length answers the question. A `DB` follower's files have nothing to do with the
-leader's, so the position has to be written down beside the segments and must
-never claim more than has actually been applied. Crashing between the records
-and that file means replaying a few, which is harmless — the same records in the
-same order — so at-least-once is the contract to aim for rather than exactly
-once.
+**Semi-synchronous replication.** Everything here is asynchronous: a write
+returns as soon as the leader has it, and a leader that dies loses whatever its
+followers had not received. The book is pointed about this. It needs an
+acknowledgement from a follower, which needs the leader to know its followers,
+which is the first piece of state the leader does not currently keep.
 
-A way to append a leader's record bytes to the active log without going through
-`Write`, which would re-serialise them and give them a new timestamp. The
-records must cross unchanged. `applyWhole` in `replica.go` already does the
-appending; what it also does is check the store is at the position the batch was
-cut for, and a `DB` follower's own position is not the leader's, so that check
-has to move up a level.
+**Reads that are not stale.** `Position` is the right primitive for
+read-your-writes and monotonic reads — take the leader's position after a write
+and refuse a follower behind it — and none of it is built.
 
-Nothing here does failover, and adding it is a different project: it needs a way
-to agree on who the leader is, which is consensus, and this is a storage engine.
+Failover is a different project again: it needs a way to agree on who the leader
+is, which is consensus, and this is a storage engine.
 
 Smaller: expiry, now that records carry a time; or a batch write, which needs a
 commit marker in the format to be atomic across a crash.

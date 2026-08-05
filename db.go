@@ -53,6 +53,12 @@ type DB struct {
 	// hear; Sync and Close report it instead.
 	rotateErr error
 
+	// applied is how far through a leader's records this store has taken, for
+	// one being used as a follower, and is nothing for one that is not. Unlike
+	// a single store it cannot be worked out from the logs, so it is written
+	// down beside them. See dbreplica.go.
+	applied DBPosition
+
 	// waiters is closed to wake whatever is following this store, and replaced
 	// the next time anything asks. A follower of a DB cannot wait on the active
 	// log's own channel, because rotation replaces the log. See dbreplica.go.
@@ -231,7 +237,7 @@ func OpenDB(dir string, opts DBOptions) (*DB, error) {
 		return nil, err
 	}
 
-	db := &DB{dir: dir, opts: opts}
+	db := &DB{dir: dir, opts: opts, applied: readApplied(dir)}
 
 	// An interrupted merge leaves its half built file behind. The logs it was
 	// merging are all still there, so it can simply go.

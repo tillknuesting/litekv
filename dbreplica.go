@@ -3,8 +3,13 @@ package litekv
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
+	"os"
+	"path/filepath"
+	"strings"
 )
 
 // Replicating a DB is not replicating a KeyValueStore across several files.
@@ -242,24 +247,40 @@ func (db *DB) Since(pos DBPosition, w io.Writer, opts ReplicaOptions) (DBPositio
 	return next, nil
 }
 
-// Follow writes the records after pos to w and goes on writing them as they are
-// written to this store, until until is closed or w stops taking them.
+// Follow hands the records after pos to send, and goes on handing them over as
+// they are written to this store, until until is closed or send reports an
+// error. It returns the position it had got as far as.
+//
+// send takes the position those records leave a follower at, as well as the
+// records, and both have to reach the other end. A follower of a DB cannot work
+// out where it is from its own log the way a follower of a single store can —
+// its files have nothing to do with the leader's — so the position has to
+// travel. How it travels is the caller's business: a length, the twenty-eight
+// bytes of MarshalBinary, and the records will do.
 //
 // A slow follower does not slow this store down: each batch is copied out under
-// the lock and written to w outside it.
-func (db *DB) Follow(pos DBPosition, w io.Writer, until <-chan struct{}, opts ReplicaOptions) (DBPosition, error) {
+// the lock and handed over outside it.
+func (db *DB) Follow(pos DBPosition, send func(batch []byte, next DBPosition) error, until <-chan struct{}, opts ReplicaOptions) (DBPosition, error) {
+	bufp := sendBuffers.Get().(*[]byte)
+	defer func() { sendBuffers.Put(bufp) }()
+
 	for {
 		// Before asking, never after: a record written in between closes the
 		// channel already in hand, so the wait ends at once.
 		changed := db.Changed()
 
 		for {
-			next, err := db.Since(pos, w, opts)
+			batch, next, err := db.batch(pos, opts.batchSize(), (*bufp)[:0])
+			*bufp = batch
+
 			if err != nil {
 				return pos, err
 			}
 			if next == pos {
 				break
+			}
+			if err := send(batch, next); err != nil {
+				return pos, err
 			}
 			pos = next
 		}
@@ -280,9 +301,16 @@ func (db *DB) Follow(pos DBPosition, w io.Writer, until <-chan struct{}, opts Re
 // log names no record, so there is nothing for the leader to check it against —
 // and a frozen log may have been merged, keeping its name while becoming a
 // different file entirely. Reading at least one record of a log before resting
-// there means every position a follower is ever handed names a record, and so
-// can be checked. The cost is that a batch may overshoot its size by one record
-// at each log it crosses.
+// in it means every position in a frozen log names a record, and so can be
+// checked. The cost is that a batch may overshoot its size by one record at
+// each log it crosses.
+//
+// A follower that has caught up rests wherever it read last: after a record in
+// the log being written, or at the end of the last frozen log when that log is
+// empty. Either way it names a record. A merge that takes the frozen log it is
+// resting at will strand it, and the answer to that is a fresh snapshot — there
+// is nothing here holding a log open for a follower the way a replication slot
+// would.
 func (db *DB) batch(pos DBPosition, size int64, dst []byte) ([]byte, DBPosition, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
@@ -340,11 +368,17 @@ func (db *DB) batch(pos DBPosition, size int64, dst []byte) ([]byte, DBPosition,
 		}
 
 		// This log is finished, so carry on into the next one — but only if
-		// there is something in it to read. Resting at the end of this log
-		// names its last record and can be checked later; resting at the start
-		// of the next names nothing at all, and a follower that paused there
-		// while the log filled and froze could not be told whether it was still
-		// the same log.
+		// there is something in it to read. The end of this log names its last
+		// record and can be checked later; the start of the next names nothing
+		// at all.
+		//
+		// Waiting at the start of the log being written would be checkable by
+		// nothing, and that log is certain to freeze eventually. Waiting at the
+		// end of this one is checkable, and only a merge that takes this log
+		// disturbs it. Both leave the same narrow window — a follower that
+		// pauses across a rotation — but only one of them can tell afterwards
+		// whether the log is still the log it was, and a spurious snapshot
+		// costs less than a silent wrong answer.
 		after, ok := db.segmentAfter(next.Segment)
 		if !ok {
 			return dst, next, nil
@@ -477,4 +511,342 @@ func (d *diskSegment) batch(pos Position, size int64, dst []byte) ([]byte, Posit
 	}
 
 	return dst[:start+int(next.Offset-pos.Offset)], next, nil
+}
+
+// Applied is the leader position this store has taken records up to, for a
+// store being used as a follower. It is the zero position for one that has
+// never applied anything, which is a follower that needs a snapshot.
+//
+// Unlike a single store, a DB cannot work this out from its own log: its files
+// have nothing to do with the leader's. It is written down beside the logs
+// instead, and read back when the store is opened.
+func (db *DB) Applied() DBPosition {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	return db.applied
+}
+
+// Apply appends one batch of a leader's records to this store and records that
+// it has reached next. from is the position the batch was cut for; Apply
+// reports ErrorPosition if this store has applied something else since.
+//
+// A batch is all or nothing here, which is the difference from the single-store
+// Apply. There the follower's own log is the leader's log, so the position of
+// half a batch is a fact about the bytes it holds; here the position is
+// something the leader said, and it describes the whole batch or none of it. A
+// batch that is damaged or ends part way through a record is refused entirely
+// and the store is left where it was, ready for the same batch again.
+//
+// The records go down before the position that claims them. A crash in between
+// leaves the store having applied records it does not admit to, and the same
+// batch arrives again — the same records, in the same order, so what they say
+// is unchanged and only the bytes are spent twice. The other order would claim
+// records that were never written, which is the one that loses data.
+func (db *DB) Apply(from, next DBPosition, r io.Reader, opts ReplicaOptions) (DBPosition, error) {
+	batch, err := readBatch(r, opts.batchSize())
+	if err != nil {
+		return db.Applied(), err
+	}
+
+	index, good, last, damaged := verifyRecords(batch, 0)
+	if damaged != nil {
+		return db.Applied(), damaged
+	}
+	if good != int64(len(batch)) {
+		// Whole records as far as it goes and then part of one, which for a
+		// batch that has to arrive entire is a batch that did not.
+		return db.Applied(), &CorruptAtError{Offset: good}
+	}
+
+	db.mu.RLock()
+	if db.closed {
+		db.mu.RUnlock()
+		return db.applied, ErrorClosed
+	}
+	if db.applied != from {
+		here := db.applied
+		db.mu.RUnlock()
+		return here, ErrorPosition
+	}
+	active := db.active
+	db.mu.RUnlock()
+
+	if good > 0 {
+		if err := active.take(batch, index, last); err != nil {
+			return db.Applied(), err
+		}
+	}
+
+	if err := db.setApplied(next); err != nil {
+		return db.Applied(), err
+	}
+
+	// The records are stored; rotating is housekeeping, as it is after a write.
+	db.rotateIfFull(active)
+	return next, nil
+}
+
+// ApplySnapshot replaces everything this store holds with the records in r, and
+// records that it is now at the position the snapshot was taken from. It is the
+// other half of Snapshot, and what a follower does to start or to start again.
+//
+// The records are applied as they arrive rather than gathered up, so a snapshot
+// of a store larger than memory costs no more than a small one — which is the
+// whole reason DB exists and would be given away by reading it in one piece.
+//
+// The store is emptied first, and the position is written down last. A failure
+// anywhere in between leaves a store holding some of a snapshot and admitting
+// to no position at all, which is a follower that needs another one: the same
+// place it started.
+func (db *DB) ApplySnapshot(at DBPosition, r io.Reader, opts ReplicaOptions) error {
+	if err := db.Reset(); err != nil {
+		return err
+	}
+	if err := db.applyStream(r, opts.batchSize()); err != nil {
+		return err
+	}
+	return db.setApplied(at)
+}
+
+// applyStream reads records from r and appends them to the log being written, a
+// group at a time as they arrive. What is applied together is what arrived
+// together, as for a single store.
+func (db *DB) applyStream(r io.Reader, limit int64) error {
+	bufp := applyBuffers.Get().(*[]byte)
+	buf := (*bufp)[:0]
+	defer func() {
+		*bufp = buf
+		applyBuffers.Put(bufp)
+	}()
+
+	for {
+		if len(buf) == cap(buf) {
+			buf = growBuffer(buf, limit)
+		}
+
+		n, err := r.Read(buf[len(buf):cap(buf)])
+		buf = buf[:len(buf)+n]
+
+		if n > 0 {
+			index, good, last, damaged := verifyRecords(buf, 0)
+			if damaged != nil {
+				return damaged
+			}
+
+			if good > 0 {
+				db.mu.RLock()
+				if db.closed {
+					db.mu.RUnlock()
+					return ErrorClosed
+				}
+				active := db.active
+				db.mu.RUnlock()
+
+				if err := active.take(buf[:good], index, last); err != nil {
+					return err
+				}
+				db.rotateIfFull(active)
+			}
+			buf = append(buf[:0], buf[good:]...)
+		}
+
+		if err != nil {
+			// A record that stops half way is a torn stream, not a record.
+			if len(buf) > 0 {
+				return &CorruptAtError{Offset: int64(len(buf))}
+			}
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+// take appends verified records to the log being written. It is the write path
+// without the writing: the records cross unchanged, keeping the timestamps the
+// leader gave them, which going through Write would replace.
+func (m *memSegment) take(batch []byte, index map[string]int64, last int64) error {
+	m.kvs.Lock()
+	defer m.kvs.Unlock()
+
+	if state := m.kvs.state; state != nil && state.closed {
+		return ErrorClosed
+	}
+	return m.kvs.takeRecords(batch, index, last)
+}
+
+// setApplied writes down how far through the leader this store has got, and
+// makes it durable before returning: a position that is not on the disk is a
+// position a crash turns into records applied twice.
+func (db *DB) setApplied(pos DBPosition) error {
+	if err := writeApplied(db.dir, pos); err != nil {
+		return err
+	}
+
+	db.mu.Lock()
+	db.applied = pos
+	db.mu.Unlock()
+	return nil
+}
+
+// Reset empties the store: every log goes, and so does the record of how far
+// through a leader it had got. It is what a follower does when a leader answers
+// ErrorDiverged, since there is no offset the two agree on and the only way
+// forward is a new snapshot.
+//
+// Everything the store held is gone.
+func (db *DB) Reset() error {
+	// A merge must not be running over logs that are about to be removed, and
+	// this is the lock order the rest of the package uses.
+	db.mergeMu.Lock()
+	defer db.mergeMu.Unlock()
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if db.closed {
+		return ErrorClosed
+	}
+
+	err := db.closeSegments()
+	db.active, db.frozen = nil, nil
+
+	entries, readErr := disk.ReadDir(db.dir)
+	if readErr != nil {
+		return readErr
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() {
+			continue
+		}
+		if !strings.HasSuffix(name, segmentSuffix) && !strings.HasSuffix(name, hintSuffix) {
+			continue
+		}
+		if rerr := disk.Remove(filepath.Join(db.dir, name)); err == nil {
+			err = rerr
+		}
+	}
+
+	if rerr := disk.Remove(filepath.Join(db.dir, appliedFile)); err == nil {
+		err = rerr
+	}
+	db.applied = DBPosition{}
+	db.notify()
+
+	if serr := db.start(db.nextID); err == nil {
+		err = serr
+	}
+	return err
+}
+
+// readBatch reads a whole batch into a buffer. The caller has framed it, so it
+// is bounded by whatever the leader was asked for; the limit here only decides
+// how much is taken in one read.
+func readBatch(r io.Reader, limit int64) ([]byte, error) {
+	bufp := applyBuffers.Get().(*[]byte)
+	buf := (*bufp)[:0]
+	defer func() {
+		*bufp = buf
+		applyBuffers.Put(bufp)
+	}()
+
+	for {
+		if len(buf) == cap(buf) {
+			buf = growBuffer(buf, limit)
+		}
+
+		n, err := r.Read(buf[len(buf):cap(buf)])
+		buf = buf[:len(buf)+n]
+
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return append([]byte(nil), buf...), nil
+			}
+			return nil, err
+		}
+	}
+}
+
+// The record of how far through a leader a follower has got, written beside the
+// logs. It is small and rewritten constantly, so it goes to one side and is
+// renamed into place: one that exists is one that was finished.
+//
+// A damaged or missing one means no position at all, which costs a snapshot and
+// never a wrong answer — the same bargain a hint makes.
+const (
+	appliedFile    = "replica"
+	appliedMagic   = "LKVR"
+	appliedVersion = 1
+
+	// magic, version, the position, and a checksum over all of it.
+	appliedSize = 4 + 1 + dbPositionSize + 4
+)
+
+func writeApplied(dir string, pos DBPosition) error {
+	encoded, err := pos.MarshalBinary()
+	if err != nil {
+		return err
+	}
+
+	var buf [appliedSize]byte
+	copy(buf[0:4], appliedMagic)
+	buf[4] = appliedVersion
+	copy(buf[5:5+dbPositionSize], encoded)
+	binary.LittleEndian.PutUint32(buf[5+dbPositionSize:], crc32.ChecksumIEEE(buf[:5+dbPositionSize]))
+
+	path := filepath.Join(dir, appliedFile)
+	temp := path + mergeSuffix
+
+	file, err := disk.Open(temp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+
+	failed := func(err error) error {
+		file.Close()
+		disk.Remove(temp)
+		return err
+	}
+
+	if _, err := file.Write(buf[:]); err != nil {
+		return failed(err)
+	}
+	if err := file.Sync(); err != nil {
+		return failed(err)
+	}
+	if err := file.Close(); err != nil {
+		disk.Remove(temp)
+		return err
+	}
+	if err := disk.Rename(temp, path); err != nil {
+		disk.Remove(temp)
+		return err
+	}
+
+	syncDir(dir)
+	return nil
+}
+
+// readApplied reads that record back, and reports the zero position for one
+// that is not there or cannot be trusted.
+func readApplied(dir string) DBPosition {
+	raw, err := disk.ReadFile(filepath.Join(dir, appliedFile))
+	if err != nil || len(raw) != appliedSize {
+		return DBPosition{}
+	}
+	if string(raw[0:4]) != appliedMagic || raw[4] != appliedVersion {
+		return DBPosition{}
+	}
+	if binary.LittleEndian.Uint32(raw[5+dbPositionSize:]) != crc32.ChecksumIEEE(raw[:5+dbPositionSize]) {
+		return DBPosition{}
+	}
+
+	var pos DBPosition
+	if err := pos.UnmarshalBinary(raw[5 : 5+dbPositionSize]); err != nil {
+		return DBPosition{}
+	}
+	return pos
 }
