@@ -740,7 +740,8 @@ func FuzzKeyValueStore_Data(f *testing.F) {
 	seed.Write([]byte("b"), []byte(""))
 	f.Add(seed.Data)
 	f.Add([]byte{})
-	f.Add(make([]byte, headerSize))
+	f.Add(make([]byte, headerSizeV1))
+	f.Add(make([]byte, headerSizeV2))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		kvs := &KeyValueStore{Data: data}
@@ -779,11 +780,21 @@ func TestKeyValueStore_View(t *testing.T) {
 	kvs.Write([]byte("gone"), []byte("x"))
 	kvs.Delete([]byte("gone"))
 
+	// Where the value sits, asked of the record rather than worked out from a
+	// header size. This test used to add headerSize to the offset, which was
+	// right until a second layout existed and headerSize became the largest of
+	// them rather than the one a plain Write uses. That is the hard-coded
+	// offset trap in AGENTS.md, sprung a third time.
+	stored, _, err := parseRecordAt(kvs.Data, kvs.Index["k"])
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	var seen string
 	if err := kvs.View([]byte("k"), func(value []byte) error {
 		seen = string(value)
 		// The value must be the stored bytes, not a copy of them.
-		if &value[0] != &kvs.Data[kvs.Index["k"]+headerSize+1] {
+		if &value[0] != &stored.Value[0] {
 			t.Error("View copied the value")
 		}
 		return nil
@@ -795,7 +806,7 @@ func TestKeyValueStore_View(t *testing.T) {
 	}
 
 	called := false
-	err := kvs.View([]byte("gone"), func(value []byte) error {
+	err = kvs.View([]byte("gone"), func(value []byte) error {
 		called = true
 		return nil
 	})

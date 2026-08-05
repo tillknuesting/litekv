@@ -115,8 +115,9 @@ func (db *DB) position() DBPosition {
 // running, or once you have given up on it; releasing twice is harmless.
 //
 // What crosses is one record per live key — the newest version of it — and
-// nothing else. Superseded records do not go, and neither do tombstones, since
-// a follower starting from nothing has no older value for one to hide.
+// nothing else. Superseded records do not go, and neither do tombstones or
+// records whose expiry has passed, since a follower starting from nothing has
+// no older value for either of them to hide.
 //
 // The snapshot is consistent without stopping the store. The active log is
 // frozen first, so everything the snapshot covers is on the disk and can no
@@ -168,7 +169,7 @@ func (db *DB) Snapshot(w io.Writer, opts ReplicaOptions) (DBPosition, func(), er
 				failed = fmt.Errorf("log %d, record at offset %d: %w", seg.id(), pos, ErrorChecksumMismatch)
 				return false
 			}
-			if record.Type != RecordTypeNormal {
+			if record.Type != RecordTypeNormal || record.Expired() {
 				return true
 			}
 			if _, err := writer.Write(raw); err != nil {

@@ -69,6 +69,7 @@ func FuzzSegmentBytes(f *testing.F) {
 	f.Add([]byte{})
 	f.Add(make([]byte, headerSizeV0))
 	f.Add(make([]byte, headerSizeV1))
+	f.Add(make([]byte, headerSizeV2))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		reader := bytes.NewReader(data)

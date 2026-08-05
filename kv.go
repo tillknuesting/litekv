@@ -40,17 +40,29 @@ const (
 	recordV0     = 0
 	headerSizeV0 = 13
 
-	// recordV1 is the current layout: Crc (4), Version (1), Type (1),
-	// Timestamp (8), KeyLength (4), ValueLength (4).
+	// recordV1 is the layout for a record that does not expire: Crc (4),
+	// Version (1), Type (1), Timestamp (8), KeyLength (4), ValueLength (4).
 	recordV1     = 2
 	headerSizeV1 = 22
 
-	// recordVersion is what new records are written as.
+	// recordV2 is the same with an expiry after the timestamp: Crc (4),
+	// Version (1), Type (1), Timestamp (8), Expires (8), KeyLength (4),
+	// ValueLength (4).
+	//
+	// It is a version rather than a field on every record because most records
+	// never expire and eight bytes on each of them is not free — the timestamp
+	// alone cost about 60 ns a write. A record is written in this layout only
+	// when it has an expiry to carry, so a store that never uses one is exactly
+	// as it was.
+	recordV2     = 3
+	headerSizeV2 = 30
+
+	// recordVersion is what a record with nothing to expire is written as.
 	recordVersion = recordV1
 
 	// headerSize is the largest header, which is what a reader has to have in
 	// hand before it knows which layout it is looking at.
-	headerSize = headerSizeV1
+	headerSize = headerSizeV2
 )
 
 // headerSizeFor returns the fixed-width size of a record of this version, and
@@ -61,6 +73,8 @@ func headerSizeFor(version uint8) (int64, bool) {
 		return headerSizeV0, true
 	case version == recordV1:
 		return headerSizeV1, true
+	case version == recordV2:
+		return headerSizeV2, true
 	default:
 		return 0, false
 	}
@@ -88,7 +102,38 @@ type Record struct {
 	// writer's clock, so it says when the store was told, not the order two
 	// stores did anything in.
 	Timestamp int64
+
+	// Expires is when the record stops counting, in nanoseconds since the Unix
+	// epoch, or zero for one that never does. Records written without an expiry
+	// are in a layout that has no room for this and always report zero.
+	//
+	// It is an instant rather than a duration on purpose. A duration would mean
+	// something different on each machine that read it, and a record that
+	// crosses to a follower has to expire at the same moment on both.
+	Expires int64
 }
+
+// Expired reports whether the record has an expiry that has passed.
+func (r Record) Expired() bool {
+	return r.Expires != 0 && now().UnixNano() >= r.Expires
+}
+
+// ExpiresAt is when the record stops counting, or the zero time for one that
+// never does.
+func (r Record) ExpiresAt() time.Time {
+	if r.Expires == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, r.Expires)
+}
+
+// now is where this package reads the clock, and the only place it does.
+//
+// Expiry is the one thing here whose answer changes without anybody writing
+// anything, so a test that cannot move the clock has to sleep, and a test that
+// sleeps is a test that is slow and flaky by turns. Replacing it is for tests in
+// this package, which do not run in parallel — the same bargain as fs.go.
+var now = time.Now
 
 // Written returns when the record was written, or the zero time for one from a
 // store written before records carried timestamps.
@@ -132,6 +177,12 @@ const (
 	// ErrorRecordTooLarge is returned when a key or value does not fit in the
 	// uint32 length fields of the binary format.
 	ErrorRecordTooLarge = Error("key or value exceeds 4 GiB")
+
+	// ErrorKeyExpired is returned for a key whose newest record was written
+	// with an expiry that has passed. Like ErrorKeyDeleted it means there is no
+	// value; the two are told apart because one of them says the key was asked
+	// to go and the other says it was told to go by itself.
+	ErrorKeyExpired = Error("key has expired")
 )
 
 // CorruptAtError reports the offset in the Data slice at which decoding stopped.
@@ -288,19 +339,49 @@ func (m *shardedRWMutex) Unlock() {
 // uint32 length fields of the binary format. The key and value are copied into
 // Data, so the caller may reuse both slices afterwards.
 func (kvs *KeyValueStore) Write(key, value []byte) error {
+	return kvs.write(key, value, 0)
+}
+
+// WriteExpiring stores the key and value like Write, and marks the record as
+// having stopped counting once at has passed. A zero time means it never does,
+// which is exactly what Write asks for.
+//
+// The expiry is an instant, not a duration, and it is stored as one: a duration
+// would mean something different on every machine that read it, and a record
+// that crosses to a follower has to stop counting at the same moment on both.
+// An instant already in the past is allowed and writes a record that is expired
+// the moment it lands, which is a way of saying "gone, and here is when".
+//
+// Only records written this way pay for it. A store that never calls this holds
+// exactly the bytes it always did, since the expiry lives in a wider record
+// layout rather than in every record.
+//
+// An expired record still shadows the older records for its key, in the same
+// way a tombstone does, until a compaction or a merge that reaches the oldest
+// log is entitled to drop both.
+func (kvs *KeyValueStore) WriteExpiring(key, value []byte, at time.Time) error {
+	expires := int64(0)
+	if !at.IsZero() {
+		expires = at.UnixNano()
+	}
+	return kvs.write(key, value, expires)
+}
+
+func (kvs *KeyValueStore) write(key, value []byte, expires int64) error {
 	if uint64(len(key)) > maxFieldLen || uint64(len(value)) > maxFieldLen {
 		return ErrorRecordTooLarge
 	}
 
 	record := &Record{
-		Version:     recordVersion,
 		Type:        RecordTypeNormal,
-		Timestamp:   time.Now().UnixNano(),
+		Timestamp:   now().UnixNano(),
+		Expires:     expires,
 		Key:         key,
 		Value:       value,
 		KeyLength:   uint32(len(key)),
 		ValueLength: uint32(len(value)),
 	}
+	record.Version = record.version()
 	record.Crc = record.calculateChecksum()
 
 	kvs.Lock()
@@ -383,6 +464,9 @@ func (kvs *KeyValueStore) lookup(key []byte) ([]byte, error) {
 	if record.Type != RecordTypeNormal {
 		return nil, ErrorKeyDeleted
 	}
+	if record.Expired() {
+		return nil, ErrorKeyExpired
+	}
 
 	return record.Value, nil
 }
@@ -413,6 +497,9 @@ func (kvs *KeyValueStore) Modified(key []byte) (time.Time, error) {
 	if record.Type != RecordTypeNormal {
 		return record.Written(), ErrorKeyDeleted
 	}
+	if record.Expired() {
+		return record.Written(), ErrorKeyExpired
+	}
 
 	return record.Written(), nil
 }
@@ -431,7 +518,7 @@ func (kvs *KeyValueStore) Delete(key []byte) error {
 	record := &Record{
 		Version:   recordVersion,
 		Type:      RecordTypeDeleted,
-		Timestamp: time.Now().UnixNano(),
+		Timestamp: now().UnixNano(),
 		Key:       key,
 		KeyLength: uint32(len(key)),
 	}
@@ -455,14 +542,30 @@ func (kvs *KeyValueStore) Delete(key []byte) error {
 // serialized are cheaper to check with checksumSerialized.
 func (r *Record) calculateChecksum() uint32 {
 	crc := ^uint32(0)
-	crc = crcFoldByte(crc, recordVersion)
+	crc = crcFoldByte(crc, r.version())
 	crc = crcFoldByte(crc, byte(r.Type))
 	crc = crcFoldUint64(crc, uint64(r.Timestamp))
+	if r.Expires != 0 {
+		crc = crcFoldUint64(crc, uint64(r.Expires))
+	}
 	crc = crcFoldUint32(crc, r.KeyLength)
 	crc = crcFoldUint32(crc, r.ValueLength)
 
 	crc = crc32.Update(^crc, crc32.IEEETable, r.Key)
 	return crc32.Update(crc, crc32.IEEETable, r.Value)
+}
+
+// version is the layout a record about to be written goes into: the wider one
+// only when there is an expiry to put in it.
+//
+// This has to agree with appendTo byte for byte, since checksumSerialized reads
+// back what appendTo wrote and calculateChecksum folds what this says it will
+// be. They are next to each other for that reason.
+func (r *Record) version() uint8 {
+	if r.Expires != 0 {
+		return recordV2
+	}
+	return recordVersion
 }
 
 // crcFoldUint64 folds a little-endian uint64 into a pre-complemented CRC.
@@ -494,18 +597,26 @@ func crcFoldUint32(crc uint32, v uint32) uint32 {
 }
 
 // appendTo serializes the Record and appends it to dst, returning the extended
-// slice, always in the current layout. Fields are written in little-endian
-// order: Crc, Version, Type, Timestamp, KeyLength, ValueLength, Key, Value.
+// slice. Fields are written in little-endian order: Crc, Version, Type,
+// Timestamp, then Expires when there is one, then KeyLength, ValueLength, Key,
+// Value. A record with nothing to expire goes into the narrower layout, so a
+// store that never sets one is byte for byte what it was.
 func (r *Record) appendTo(dst []byte) []byte {
-	var hdr [headerSizeV1]byte
+	var hdr [headerSizeV2]byte
 	binary.LittleEndian.PutUint32(hdr[0:4], r.Crc)
-	hdr[4] = recordVersion
+	hdr[4] = r.version()
 	hdr[5] = byte(r.Type)
 	binary.LittleEndian.PutUint64(hdr[6:14], uint64(r.Timestamp))
-	binary.LittleEndian.PutUint32(hdr[14:18], r.KeyLength)
-	binary.LittleEndian.PutUint32(hdr[18:22], r.ValueLength)
 
-	dst = append(dst, hdr[:]...)
+	at := 14
+	if r.Expires != 0 {
+		binary.LittleEndian.PutUint64(hdr[14:22], uint64(r.Expires))
+		at = 22
+	}
+	binary.LittleEndian.PutUint32(hdr[at:at+4], r.KeyLength)
+	binary.LittleEndian.PutUint32(hdr[at+4:at+8], r.ValueLength)
+
+	dst = append(dst, hdr[:at+8]...)
 	dst = append(dst, r.Key...)
 	dst = append(dst, r.Value...)
 	return dst
@@ -560,6 +671,7 @@ type recordHeader struct {
 	version     uint8
 	recordType  RecordType
 	timestamp   int64
+	expires     int64
 	keyLength   uint32
 	valueLength uint32
 	size        int64 // what the header itself takes
@@ -573,6 +685,7 @@ func (h recordHeader) record() Record {
 		Version:     h.version,
 		Type:        h.recordType,
 		Timestamp:   h.timestamp,
+		Expires:     h.expires,
 		KeyLength:   h.keyLength,
 		ValueLength: h.valueLength,
 	}
@@ -608,8 +721,14 @@ func decodeHeader(buf []byte) (recordHeader, bool) {
 	h.version = buf[4]
 	h.recordType = RecordType(buf[5])
 	h.timestamp = int64(binary.LittleEndian.Uint64(buf[6:14]))
-	h.keyLength = binary.LittleEndian.Uint32(buf[14:18])
-	h.valueLength = binary.LittleEndian.Uint32(buf[18:22])
+
+	at := 14
+	if size == headerSizeV2 {
+		h.expires = int64(binary.LittleEndian.Uint64(buf[14:22]))
+		at = 22
+	}
+	h.keyLength = binary.LittleEndian.Uint32(buf[at : at+4])
+	h.valueLength = binary.LittleEndian.Uint32(buf[at+4 : at+8])
 	return h, true
 }
 
@@ -706,7 +825,9 @@ func (kvs *KeyValueStore) LoadIndex(data []byte) error {
 
 // latestOffsets returns the offset of the newest live record for each key.
 // Records are appended, so a later record supersedes an earlier one with the
-// same key, and a tombstone removes the key until a later write re-adds it.
+// same key, and a tombstone removes the key until a later write re-adds it. A
+// record whose expiry has passed counts as a tombstone here, since it says the
+// same thing: there is no value, and nothing older may be answered instead.
 // Callers must hold at least a read lock.
 func (kvs *KeyValueStore) latestOffsets() (map[string]int64, error) {
 	offs, err := kvs.offsets()
@@ -732,7 +853,7 @@ func (kvs *KeyValueStore) latestOffsets() (map[string]int64, error) {
 			continue
 		}
 
-		if record.Type == RecordTypeNormal {
+		if record.Type == RecordTypeNormal && !record.Expired() {
 			latest[string(record.Key)] = pos
 		} else {
 			latest[string(record.Key)] = deleted
@@ -749,7 +870,11 @@ func (kvs *KeyValueStore) latestOffsets() (map[string]int64, error) {
 }
 
 // Compact iterates through the KeyValueStore's Data byte slice, identifies the latest record for each key,
-// and rebuilds the Data slice and Index, dropping superseded records and deleted keys.
+// and rebuilds the Data slice and Index, dropping superseded records, deleted keys and expired ones.
+//
+// Dropping them outright is safe here in a way it is not for a DB: this is one
+// log, so there is nothing older anywhere for a tombstone or an expired record
+// to be hiding.
 // This method is useful for reducing the storage size and improving the performance of the KeyValueStore.
 //
 // Surviving records keep their relative order, so compacting the same store
@@ -781,9 +906,10 @@ func (kvs *KeyValueStore) Compact() error {
 	// records are copied verbatim rather than re-serialized.
 	var last int64
 	err = kvs.scan(func(pos, next int64, r Record) bool {
-		if r.Type != RecordTypeNormal {
-			return true
-		}
+		// Whether a record survives is latestOffsets' decision and only its
+		// decision — a record it did not choose is not in the map. Repeating
+		// the test here would mean two places to keep in step, and each would
+		// hide a mistake in the other.
 		if survivor, ok := latest[string(r.Key)]; !ok || survivor != pos {
 			return true
 		}

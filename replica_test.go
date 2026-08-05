@@ -1909,6 +1909,7 @@ func FuzzApply(f *testing.F) {
 	leader := &KeyValueStore{}
 	leader.Write([]byte("alpha"), []byte("one"))
 	leader.Write([]byte("beta"), []byte("two"))
+	leader.WriteExpiring([]byte("gamma"), []byte("three"), time.Now().Add(time.Hour))
 	leader.Delete([]byte("alpha"))
 
 	var wire bytes.Buffer
@@ -1921,6 +1922,7 @@ func FuzzApply(f *testing.F) {
 	f.Add(whole[:10], true)
 	f.Add([]byte{}, false)
 	f.Add(make([]byte, headerSizeV1), false)
+	f.Add(make([]byte, headerSizeV2), false)
 	f.Add([]byte("not a record at all"), false)
 
 	f.Fuzz(func(t *testing.T, batch []byte, seeded bool) {

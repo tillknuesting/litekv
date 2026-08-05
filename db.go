@@ -390,6 +390,21 @@ func (db *DB) removeStaleMerges() error {
 // Write stores the key and value in the active log, freezing it and starting a
 // new one once it has grown past the segment size.
 func (db *DB) Write(key, value []byte) error {
+	return db.write(key, value, time.Time{})
+}
+
+// WriteExpiring stores the key and value like Write, and marks the record as
+// having stopped counting once at has passed, under the same terms as
+// KeyValueStore.WriteExpiring.
+//
+// An expired record is dropped by a merge on the same terms as a tombstone, and
+// for the same reason: anything older that was left out of the run could still
+// hold the value it is hiding.
+func (db *DB) WriteExpiring(key, value []byte, at time.Time) error {
+	return db.write(key, value, at)
+}
+
+func (db *DB) write(key, value []byte, at time.Time) error {
 	db.mu.RLock()
 	if db.closed {
 		db.mu.RUnlock()
@@ -397,7 +412,7 @@ func (db *DB) Write(key, value []byte) error {
 	}
 
 	active := db.active
-	err := active.kvs.Write(key, value)
+	err := active.kvs.WriteExpiring(key, value, at)
 	db.mu.RUnlock()
 
 	if err != nil {
@@ -516,8 +531,9 @@ func (db *DB) searchOrder() iter.Seq[readable] {
 }
 
 // ForEach calls fn with every live key and its value, skipping the records that
-// newer logs have superseded and the keys that tombstones have deleted. The
-// order is unspecified. The key and value are only valid until fn returns.
+// newer logs have superseded, the keys that tombstones have deleted and the
+// records whose expiry has passed. The order is unspecified. The key and value
+// are only valid until fn returns.
 func (db *DB) ForEach(fn func(key, value []byte) bool) error {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
@@ -548,7 +564,7 @@ func (db *DB) ForEach(fn func(key, value []byte) bool) error {
 				err = fmt.Errorf("record at offset %d: %w", pos, ErrorChecksumMismatch)
 				return false
 			}
-			if record.Type != RecordTypeNormal {
+			if record.Type != RecordTypeNormal || record.Expired() {
 				return true
 			}
 			if !fn(record.Key, record.Value) {
@@ -854,7 +870,8 @@ func (db *DB) mergeLocked(victims []*diskSegment, dropTombstones bool) error {
 //
 // A tombstone is only dropped when dropTombstones says every log that could
 // hold the value it hides is part of this merge. Otherwise it is carried into
-// the merged log, where it goes on shadowing whatever is older.
+// the merged log, where it goes on shadowing whatever is older. A record whose
+// expiry has passed is treated the same way and for the same reason.
 //
 // The records are streamed through a buffer rather than gathered up, so merging
 // a store costs no more memory than merging a small one.
@@ -899,7 +916,10 @@ func mergeInto(path string, victims []*diskSegment, dropTombstones bool) (map[st
 
 		var writeErr error
 		scanErr := seg.scan(func(pos int64, raw []byte, r Record) bool {
-			if r.Type != RecordTypeNormal && dropTombstones {
+			// An expired record goes on the same terms as a tombstone: it says
+			// there is no value, and anything older that was left out of this
+			// run could still hold the one it is hiding.
+			if (r.Type != RecordTypeNormal || r.Expired()) && dropTombstones {
 				return true
 			}
 			if loc, ok := live[string(r.Key)]; !ok || loc.seg != seg || loc.pos != pos {

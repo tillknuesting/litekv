@@ -235,6 +235,9 @@ func (d *diskSegment) read(key []byte) ([]byte, error) {
 	if record.Type != RecordTypeNormal {
 		return nil, ErrorKeyDeleted
 	}
+	if record.Expired() {
+		return nil, ErrorKeyExpired
+	}
 
 	// The bytes were read into a buffer of this record's own, so there is
 	// nothing to copy: no one else holds it.

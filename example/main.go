@@ -98,6 +98,31 @@ func main() {
 	// An update appends a new record and points the index at it.
 	must(kvs.Write([]byte("foo"), []byte("bar2")))
 
+	// A record can be given a time after which it stops counting. Only records
+	// written this way pay for it: the expiry lives in a wider layout, so a
+	// store that never asks for one holds exactly the bytes it always did.
+	must(kvs.WriteExpiring([]byte("session"), []byte("token"), time.Now().Add(time.Hour)))
+
+	written, err = kvs.Modified([]byte("session"))
+	must(err)
+	fmt.Println("session was written", time.Since(written).Round(time.Millisecond), "ago")
+
+	// It is an instant and not a duration, so it means the same moment on every
+	// machine that reads the record — including a follower it is shipped to.
+	must(kvs.ForEach(func(key, value []byte, deleted bool) bool {
+		if string(key) == "session" {
+			fmt.Println("session is a", len(value), "byte value that expires")
+		}
+		return true
+	}))
+
+	// An expiry already past is allowed, and the key is gone the moment it
+	// lands: a way of saying "gone, and here is when".
+	must(kvs.WriteExpiring([]byte("stale"), []byte("value"), time.Now().Add(-time.Hour)))
+
+	_, err = kvs.Read([]byte("stale"))
+	fmt.Println("stale:", err)
+
 	// A delete appends a tombstone, so a deleted key reads differently from one
 	// that was never written.
 	must(kvs.Write([]byte("temporary"), []byte("value")))

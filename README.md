@@ -399,6 +399,31 @@ point and checks each state reads the same as the finished merge.
 A half-built merge left behind by a crash is discarded on the next open, since every log it was merging
 is still there.
 
+## Expiry
+
+A record can be given the moment it stops counting:
+
+```go
+err := kvs.WriteExpiring([]byte("session"), []byte("token"), time.Now().Add(time.Hour))
+```
+
+After that moment the key reads as `ErrorKeyExpired`, which means what `ErrorKeyDeleted` means — there
+is no value — and is told apart from it because one says the key was asked to go and the other says it
+was told to go by itself. `View` and `Modified` answer the same way, `DB.ForEach` skips it, and writing
+over the key brings it back, since the newest record is the one that counts.
+
+**It is an instant, not a duration**, and it is stored as one. A duration would mean something different
+on every machine that read the record, and a record that crosses to a follower has to stop counting at
+the same moment on both ends. It does: a follower is never told anything about expiry, and reaches the
+same answer from the record itself. A moment already past is allowed and writes a record that is expired
+when it lands, which is a way of saying "gone, and here is when".
+
+**An expired record is a tombstone until something is entitled to drop it.** It says there is no value,
+and an older record for the same key may still be sitting in an older log — so dropping it early brings
+that older value back. `Compact` on a single store may drop it outright, since one log has nothing older
+anywhere. A `DB` merge may only drop it when the run reaches the oldest log, which is the same rule
+tombstones have and for the same reason.
+
 ## Recovering a damaged store
 
 Three methods, in order of how much they do:
@@ -849,18 +874,35 @@ throughout and will meet its SD card long before it meets any of these.
 
 ## Binary Storage Format
 
-Each record is a 22-byte header followed by the key and the value:
+Each record is a header followed by the key and the value. A record with no expiry takes 22 bytes of
+header:
 
 | Offset | Size | Field                                        |
 | ------ | ---- | -------------------------------------------- |
 | 0      | 4    | CRC-32 (IEEE), little-endian                 |
-| 4      | 1    | Record version                               |
+| 4      | 1    | Record version, 2                            |
 | 5      | 1    | Record type: 0 = normal, 1 = deleted         |
 | 6      | 8    | Timestamp, nanoseconds since the Unix epoch  |
 | 14     | 4    | Key length, little-endian uint32             |
 | 18     | 4    | Value length, little-endian uint32           |
 | 22     | *n*  | Key                                          |
 | 22+*n* | *m*  | Value                                        |
+
+One written with an expiry takes 30, with the extra field after the timestamp and the version raised
+to 3:
+
+| Offset | Size | Field                                        |
+| ------ | ---- | -------------------------------------------- |
+| 6      | 8    | Timestamp, nanoseconds since the Unix epoch  |
+| 14     | 8    | Expires, nanoseconds since the Unix epoch    |
+| 22     | 4    | Key length                                   |
+| 26     | 4    | Value length                                 |
+
+The two sit in the same log and always have — the version byte is how a reader tells them apart, and it
+is why the wider layout could be added without orphaning anything. It is a version rather than a field
+on every record because most records never expire, and eight bytes on each of them is not free: the
+timestamp alone took an in-memory write from roughly 50 ns to 110. A store that never sets an expiry
+holds exactly the bytes it always did.
 
 The checksum covers everything after itself, so it does not depend on the layout of what follows. Keys
 and values are limited to 4 GiB by the uint32 length fields, and `Write` returns `ErrorRecordTooLarge`
@@ -889,6 +931,9 @@ anything either.
 
 ## Limitations
 
+- **Expiry is checked on read, not swept.** Nothing walks the store looking for records whose time has
+  come; they stop answering the moment they are due and the space comes back at the next compaction or
+  merge. A store full of expired records is as large as a store full of live ones until then.
 - **A timestamp costs about 60 ns a write.** Reading the clock is 28 ns of it and the wider header the
   rest, which took an in-memory write from roughly 50 ns to 110. It is invisible against a file, where
   the write itself is microseconds, and it is the price of every record knowing when it was written.

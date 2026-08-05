@@ -123,6 +123,20 @@ thing, and answering it the same way deletes what could not be read. This was
 real: one refused read per log truncated all thirteen logs to zero and reported
 a healthy, empty store. `endOfLog` in `segment.go` is the whole fix.
 
+**An expired record is a tombstone until something may drop it.** It says there
+is no value, and an older record for the same key may be sitting in an older
+log, so dropping it early brings that older value back. `Compact` may drop it
+outright — one log has nothing older anywhere — and a merge may only drop it
+when the run reaches the oldest log, exactly as for a tombstone.
+`TestDBTieredKeepsExpiredRecords` is `TestDBTieredKeepsTombstones` with an
+expiry, and merging everything is not enough to test it: only a run that stops
+short can tell the two rules apart.
+
+**Whether a record survives compaction is `latestOffsets`' decision alone.** The
+same test used to sit in `Compact`'s scan as well, and the two hid each other:
+removing either one left the other doing the work, so a mutation of either
+survived. One place, and the scan asks the map.
+
 **A follower's position is checked before a leader sends it anything.** An
 offset alone cannot say which log it is an offset into, and two stores of the
 same length holding different records would otherwise be spliced into one log
@@ -385,7 +399,17 @@ invariant above is phrased as slow-never-wrong rather than as a rule to follow.
 
 ## Traps this codebase has already sprung
 
-- **Hard-coded header offsets.** Bit twice. Ask `decodeHeader`.
+- **Hard-coded header offsets.** Bit three times now. The third was a test doing
+  pointer arithmetic with `headerSize` to find where a value sat, which was
+  right until a second layout existed and `headerSize` became the largest of
+  them rather than the one a plain `Write` uses. Ask `decodeHeader`, or ask
+  `parseRecordAt` for the record and use what it hands back.
+- **A mutation whose pattern matches two files.** The scripts pick a target by
+  searching for the text to replace, and once `db.go` and `dbreplica.go` both
+  had the same line, two mutations were silently edited into the wrong file and
+  reported as surviving. They now refuse an ambiguous pattern rather than
+  choosing. If a mutation "survives" and the fix looks obviously tested, check
+  which file it landed in before believing it.
 - **Timing assertions in tests.** `TestCompactionStall` once failed CI at 193 ms
   against 75 ms, which said nothing about the store. Measure and log; do not
   assert a latency.
@@ -493,6 +517,12 @@ consecutive runs of untouched code gave 178, 156 and 186 ns for the same row.
 Compare those only within a session, and do not go hunting for what changed
 between two of them.
 
+The clock has a seam too, in `kv.go`: `now` is where this package reads it and
+the only place it does. Expiry is the one thing here whose answer changes
+without anybody writing anything, so a test that cannot move the clock has to
+sleep — slow when it passes, flaky when the machine is busy, and only ever able
+to check the coarse case. `at` in `expiry_test.go` is the harness.
+
 For anything about durability or ordering, use the seam in `fs.go`. It records
 every open, write, sync, truncate, close, rename, remove, list and read in
 order, and can be told to fail any of them, or to run out of room part way
@@ -538,6 +568,9 @@ discarded. It needs no election algorithm — only one place handing out terms,
 which under promotion by hand is whoever is doing the promoting. It is about a
 day, and it removes the outcome that costs data.
 
+Expiry is done: `WriteExpiring` and the `recordV2` layout, version-gated so a
+store that never uses one is byte for byte what it was.
+
 **Reads that are not stale.** `Position` is already the primitive for
 read-your-writes and monotonic reads: take the leader's after a write, hand it
 back to the client, refuse a replica behind it. Twenty lines and some tests, and
@@ -551,8 +584,16 @@ writer goroutine behind a queue is the shape, and it is much easier to decide
 before the API exists than after.
 
 **A batch write**, which needs a commit marker in the format to be atomic across
-a crash — and so belongs in the window while format changes are cheap. **Expiry**
-is the other cheap one, now that records carry a time.
+a crash — and so belongs in the window while format changes are cheap.
+
+The format byte is the cheap part and the semantics are not. "Is this record
+inside a batch that was never committed?" has to be answered by `Recover`,
+`RebuildIndex`, `latestOffsets`, `indexSegment`, `mergeInto` and the replication
+apply path — six scanners — and a follower has to buffer a batch rather than
+apply half of one. The likely shape is a marker record opening a batch with the
+byte span that follows, so recovery either has all of it or discards from the
+marker on, and records outside a span stay ordinary writes needing no flag.
+Estimate it as its own piece of work, not an afternoon.
 
 **Range and prefix queries** are the awkward one. The index is a hash map, so
 keys have no order, and the radix tree that would give it was measured and
