@@ -4,6 +4,28 @@ The README says what the store does and what it costs. This says what is easy to
 break, what has already been tried, and how things are checked here. It is meant
 to save you a day, not to introduce the code.
 
+## Where this is going
+
+This is not meant to stay a library. The intent is a standalone database with a
+real API over HTTP, and what is here is the storage engine it will sit on. That
+changes which of the missing things matter, so it is written down rather than
+left to be inferred:
+
+- **Read scaling and failover stop being theoretical.** For an embedded store
+  the readers are in the same process and a replica buys little. For a server
+  the readers are clients, and a replica behind a load balancer is the ordinary
+  way to serve more of them — and a database that cannot survive losing a node
+  is a hard sell.
+- **Keep the engine free of a wire.** Nothing in this package opens a socket and
+  nothing should; the server owns the protocol. `tcp_test.go` is a working
+  sketch of the replication endpoint that server will need, and is the thing to
+  promote into a package rather than reinvent.
+- **Format changes are cheapest now.** A batch commit marker, a TTL field, a
+  per-record sequence number: anything touching the record layout costs less
+  before there is data anyone minds losing. The version byte exists for this,
+  and each change still costs compatibility work. Server-layer decisions can
+  wait; on-disk ones cannot.
+
 ## Where things are
 
 | file         | owns                                                                     |
@@ -479,9 +501,14 @@ a crash survivable and none of them show up in the result of a call.
 
 ## Open
 
-- **One fuzz run failed and was never explained.** No reproducer was written,
-  and it has not recurred in tens of millions of executions. If it returns it
-  will leave the input in `testdata/fuzz`, and that is the thing to chase.
+- **Two fuzz runs have failed and neither was explained.** Different targets,
+  months apart: one of the original targets, and once `FuzzDBSince` reported
+  FAIL at the end of a long verification run. Neither wrote anything to
+  `testdata/fuzz`, which a target that actually found an input always does, so
+  neither was the fuzzing finding a bug — something else about the run failed.
+  The second did not recur in thirteen further runs, alone, in sequence, and
+  under load. If it returns, look for `testdata/fuzz` first: if there is nothing
+  there, it is not the store.
 - **`os.Stat` and directory syncing** still go straight to the OS in one or two
   places. Everything else goes through `fs.go`.
 - **The fuzz corpus lives in the local build cache**, not the repository. CI
@@ -491,7 +518,52 @@ a crash survivable and none of them show up in the result of a call.
 ## What to build next, and what it needs
 
 Replication is finished in both halves, for a single store and for a `DB`. What
-is left is the operational apparatus around it, and none of it is small.
+follows is ordered for the destination above rather than for a library, which
+puts some small things ahead of some interesting ones.
+
+**Fencing, before anything else that touches failover.** This is the one that
+loses data today and the one that is nearly free.
+
+Two nodes both taking writes after a partition cannot be reconciled. The
+position check catches it — a follower will not splice one log onto another —
+but that is integrity, not durability: writes acknowledged by the wrong leader
+are discovered to be worthless and thrown away. The check was deliberately built
+without a term (a checksum handshake needs no persistent identity, which was the
+point), and a checksum cannot tell you that a leader has no business being one.
+
+What it needs is a monotonically increasing term, durable per node: a promoted
+replica raises it, followers refuse a leader below theirs, and writes carry it so
+an old leader that comes back is refused rather than accepted and later
+discarded. It needs no election algorithm — only one place handing out terms,
+which under promotion by hand is whoever is doing the promoting. It is about a
+day, and it removes the outcome that costs data.
+
+**Reads that are not stale.** `Position` is already the primitive for
+read-your-writes and monotonic reads: take the leader's after a write, hand it
+back to the client, refuse a replica behind it. Twenty lines and some tests, and
+it prevents the way this design most often confuses people — write to the
+leader, read from a replica, do not see your own write.
+
+**The server's writer.** Two goroutines writing do not merely fail to go faster,
+they halve throughput: 114 ns a write becomes 228, and more of them change little
+after that. A handler-per-request calling `Write` walks straight into that. One
+writer goroutine behind a queue is the shape, and it is much easier to decide
+before the API exists than after.
+
+**A batch write**, which needs a commit marker in the format to be atomic across
+a crash — and so belongs in the window while format changes are cheap. **Expiry**
+is the other cheap one, now that records carry a time.
+
+**Range and prefix queries** are the awkward one. The index is a hash map, so
+keys have no order, and the radix tree that would give it was measured and
+reverted for costing 3 to 4.5x on point lookups — right for an embedded
+point-lookup store, an open question for something answering `?prefix=`. A
+separate ordered index beside the map is the likelier answer than replacing it.
+
+**Semi-synchronous replication**, which is what stops a failover losing
+acknowledged writes. It needs an acknowledgement from a follower, which needs
+the leader to know its followers, which is the first state the leader does not
+currently keep.
 
 **Carrying a stranded position forward** is what is left of the retention
 problem. `Hold` covers a follower that is connected — `Snapshot` takes one and
@@ -511,21 +583,34 @@ merged and be a different file behind the same name — a segment that was never
 merge output has the contents it has always had, and the position would be safe.
 Knowing which is which across a restart needs the same durable note.
 
-**Semi-synchronous replication.** Everything here is asynchronous: a write
-returns as soon as the leader has it, and a leader that dies loses whatever its
-followers had not received. The book is pointed about this. It needs an
-acknowledgement from a follower, which needs the leader to know its followers,
-which is the first piece of state the leader does not currently keep.
+### Consensus, and why it is not on that list
 
-**Reads that are not stale.** `Position` is the right primitive for
-read-your-writes and monotonic reads — take the leader's position after a write
-and refuse a follower behind it — and none of it is built.
+Automatic failover needs agreement on who the leader is, and there are three
+ways to get it. They are not the same size and only one of them composes with
+what is here.
 
-Failover is a different project again: it needs a way to agree on who the leader
-is, which is consensus, and this is a storage engine.
+**An external lease** — etcd, Consul, ZooKeeper — does the consensus elsewhere
+and tells these nodes who is leading. Everything in `dbreplica.go` survives
+untouched; the data path is unchanged. It costs an operational dependency, which
+is a little ironic for a standalone database but is the pragmatic answer.
 
-Smaller: expiry, now that records carry a time; or a batch write, which needs a
-commit marker in the format to be atomic across a crash.
+**Raft for leader election only**, implemented here, is the same shape without
+the dependency: the record shipping stays the data path and consensus decides
+only who runs it. This is what PostgreSQL with Patroni does.
+
+**Raft for the data path is a different system, and it supersedes this one.**
+The Raft log would hold the commands, every node would apply committed entries
+to its local store, and the store's own replication would go unused — you would
+not ship these logs at all. `dbreplica.go` and half of `replica.go` become dead
+code, a write becomes a quorum round trip plus an fsync on a majority instead of
+a local one, and three nodes is the floor, since a quorum of two is not a thing.
+Anyone reaching for Raft should know it replaces this work rather than sitting
+on top of it.
+
+For one machine and perhaps a second, none of that fits: two-node Raft gives
+nothing a single node did not have. Promotion by hand with fencing is the honest
+arrangement at that size, which is why fencing is first on the list and
+consensus is not on it.
 
 ## Conventions
 

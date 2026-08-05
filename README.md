@@ -931,9 +931,13 @@ anything either.
 - **Replication is asynchronous, and only that.** A write returns as soon as the leader has it, so a
   leader that dies loses whatever its followers had not received yet. There is no synchronous or
   semi-synchronous mode, no acknowledgement from a follower, and nothing waits for one.
-- **There is no failover, and no leader election.** Which store is the leader is your decision and
-  nobody else's. A follower promoted by hand is just a store you start writing to; two of them written
-  to at once diverge, and the divergence is reported rather than resolved.
+- **There is no failover, and no fencing.** Which store is the leader is your decision and nobody
+  else's. A follower promoted by hand is just a store you start writing to. Two of them written to at
+  once diverge, and the divergence is *reported* rather than resolved — a follower will refuse to splice
+  one log onto another, so nothing is corrupted, but writes acknowledged by the wrong leader are
+  discovered to be worthless and thrown away. Nothing here carries a term, so nothing can tell a leader
+  it has stopped being one. `AGENTS.md` has what fencing would take, and why it comes before consensus
+  rather than after.
 - **A follower is a whole copy.** There is no partial replication, no filtering by key, and no way to
   follow one part of a store. The unit is the log.
 - **A replica costs the leader a copy.** Each batch is copied out of `Data` under the read lock before
