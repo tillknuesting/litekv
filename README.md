@@ -30,7 +30,7 @@ the store outgrows memory, or when compacting one log in one go has become a sta
 | Compaction               | stops the world      | merges in the background                 |
 | After `Close`            | still reads          | refuses: its values are behind shut files |
 | Data as a byte slice     | yes, `Data`          | no, it is several files                  |
-| Replication              | yes, ship the log    | not yet                                  |
+| Replication              | ship the log, byte for byte | ship the records; the files differ |
 
 ## Getting Started
 
@@ -493,7 +493,8 @@ one batch and a return — and costs a round trip per batch:
 next, err := leader.Since(pos, w, litekv.ReplicaOptions{})   // one batch
 ```
 
-`example/` wires a leader and a follower over a connection, end to end, in about fifty lines.
+`example/` wires a leader and a follower over a connection, end to end, in about fifty lines, and shows
+a `DB` followed by another further down.
 
 ### A position is not an offset
 
@@ -615,7 +616,7 @@ snapshot covers is on the disk and immutable, and anything written from then on 
 part of the snapshot. Writes and rotation carry on throughout. Merging does not, since a merge may
 remove a log and this is reading them.
 
-### Every position names a record
+### Every position names a record, almost
 
 A `DBPosition` is which log and where in it, and the log part is an ordinary `Position` carrying the
 same check. That check needs a record to check against, which is what makes the start of a log awkward:
@@ -629,9 +630,30 @@ that a batch may overshoot its size by one record at each log it crosses.
 One position escapes this: a snapshot of a store whose active log is empty has nowhere to point but the
 start of that log. Used before the log fills it is fine, because a log being written is never merged. If
 the log fills and freezes first, the leader says `ErrorDiverged` rather than guess, and the follower
-takes another snapshot. That is also what a follower gets when it falls so far behind that the log it
-was reading has been merged away, and it is the honest answer: without something like PostgreSQL's
-replication slots to hold the log open, a badly lagging follower cannot be caught up, only replaced.
+takes another snapshot.
+
+**A follower must always be able to take another snapshot.** That is not only for the case above. A
+follower that has caught up rests wherever it read last, and when the log being written is empty that is
+the end of the last frozen log — which a merge may take. So an idle follower can be stranded by routine
+merging, and one that falls behind past a merge certainly is. Without something like PostgreSQL's
+replication slots holding a log open, a lagging follower cannot be caught up, only replaced, and the
+loop that follows a `DB` has to be written with that in it. The one in `example/` is.
+
+### What replicating a DB costs
+
+| | |
+| --------------------------------------------- | ---------- |
+| Reading a snapshot out of the logs             | 940 MB/s   |
+| Taking one, 1 KiB values                       | 106 MB/s   |
+| Taking one, 16-byte values                     | 23 MB/s    |
+
+Taking a snapshot is the slower side and deliberately so: it empties the store first, and every record
+is decoded and checked against its own checksum before it is kept. The small-value figure is mostly the
+per-record cost of that; at 1 KiB the bytes dominate.
+
+The position file is synced only under `SyncAlways`. It must never be more durable than the records it
+claims — a position that survived a power cut naming records that did not would be a follower quietly
+missing data, where the other way round costs one batch applied twice.
 
 ## Concurrency
 
@@ -966,7 +988,7 @@ repository, so CI starts from the seeds in the code every time. Finding anything
 for minutes on a laptop. A failure writes the input that caused it into `testdata/fuzz`, where it
 becomes a regression test and travels with the code.
 
-There are four targets, and each one points at something that reads bytes it has no reason to trust.
+Every target points at something that reads bytes it has no reason to trust.
 
 `FuzzKeyValueStore_Data` feeds arbitrary bytes in through the `Data` slice, which is how a store backed
 by a file or by shared memory is restored: no input may panic, hang, or make the store forget a key it
@@ -976,3 +998,17 @@ other: an offset the one accepted, the other has to be able to read, with the ke
 `FuzzHint` feeds arbitrary bytes to the hint parser, where refusing is always allowed and accepting an
 offset outside the log is not, since a hint is taken at its word. `FuzzKeyValueStore_WriteReadDelete`
 fuzzes the write path.
+
+The rest are replication, which is the part that reads bytes off a wire. `FuzzApply` hands a single
+store arbitrary bytes as a batch; `FuzzDBApply` and `FuzzDBApplySnapshot` do the same to a `DB`
+follower, where the thing that must never happen is a store claiming a position it does not hold the
+records for. `FuzzDBSince` goes the other way and hands a leader arbitrary positions, which is what a
+follower that has been tampered with sends: refusing is always allowed, but whatever does come back has
+to be whole, verified records. `FuzzDBPosition` feeds the position parser itself.
+
+Name a target exactly. `-fuzz FuzzApply` now matches `FuzzApplySnapshot` as well, and the go tool
+refuses to run rather than pick one:
+
+```bash
+go test -run xxx -fuzz '^FuzzApply$' -fuzztime 60s
+```

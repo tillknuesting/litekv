@@ -677,11 +677,16 @@ func (m *memSegment) take(batch []byte, index map[string]int64, last int64) erro
 	return m.kvs.takeRecords(batch, index, last)
 }
 
-// setApplied writes down how far through the leader this store has got, and
-// makes it durable before returning: a position that is not on the disk is a
-// position a crash turns into records applied twice.
+// setApplied writes down how far through the leader this store has got.
+//
+// It waits for the disk exactly when the records did. The position must never
+// be more durable than the records it claims: under SyncNever the records are
+// with the operating system and no further, and a position synced past them
+// would leave a store that survived losing power claiming records that did not.
+// Losing the position instead costs a batch applied twice, which is the same
+// records in the same order.
 func (db *DB) setApplied(pos DBPosition) error {
-	if err := writeApplied(db.dir, pos); err != nil {
+	if err := writeApplied(db.dir, pos, db.opts.Sync == SyncAlways); err != nil {
 		return err
 	}
 
@@ -785,7 +790,7 @@ const (
 	appliedSize = 4 + 1 + dbPositionSize + 4
 )
 
-func writeApplied(dir string, pos DBPosition) error {
+func writeApplied(dir string, pos DBPosition, durable bool) error {
 	encoded, err := pos.MarshalBinary()
 	if err != nil {
 		return err
@@ -814,8 +819,10 @@ func writeApplied(dir string, pos DBPosition) error {
 	if _, err := file.Write(buf[:]); err != nil {
 		return failed(err)
 	}
-	if err := file.Sync(); err != nil {
-		return failed(err)
+	if durable {
+		if err := file.Sync(); err != nil {
+			return failed(err)
+		}
 	}
 	if err := file.Close(); err != nil {
 		disk.Remove(temp)
@@ -826,7 +833,9 @@ func writeApplied(dir string, pos DBPosition) error {
 		return err
 	}
 
-	syncDir(dir)
+	if durable {
+		syncDir(dir)
+	}
 	return nil
 }
 

@@ -713,13 +713,18 @@ func sameStores(t *testing.T, leader, follower *DB, absent []string) {
 // the follower keeps only the keys in memory, as the leader does, and lays its
 // records out however its own rotations and merges decide.
 func TestDBFollower(t *testing.T) {
-	leader, err := OpenDB(t.TempDir(), DBOptions{Sync: SyncNever, SegmentSize: 512})
+	// Merging off, so that "it did not need another snapshot" is a fact about
+	// replication rather than about whether a background merge happened to run
+	// first. A follower resting at the end of a frozen log is stranded by a
+	// merge that takes it, which is real and deliberate — TestDBFollowerModel
+	// and TestDBTailDivergesOnAMerge are where that belongs.
+	leader, err := OpenDB(t.TempDir(), DBOptions{Sync: SyncNever, SegmentSize: 512, MergeTrigger: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer leader.Close()
 
-	follower, err := OpenDB(t.TempDir(), DBOptions{Sync: SyncNever, SegmentSize: 300})
+	follower, err := OpenDB(t.TempDir(), DBOptions{Sync: SyncNever, SegmentSize: 300, MergeTrigger: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -842,13 +847,17 @@ func recordTime(t *testing.T, db *DB, key string) int64 {
 func TestDBFollowerSurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
 
-	leader, err := OpenDB(t.TempDir(), DBOptions{Sync: SyncNever, SegmentSize: 512})
+	// Merging off: this is about the position surviving a close, not about
+	// what a merge does to a follower resting on a frozen log. With merging on,
+	// whether the last step needs a snapshot depends on when a background merge
+	// runs, which on one core is when the writes stop.
+	leader, err := OpenDB(t.TempDir(), DBOptions{Sync: SyncNever, SegmentSize: 512, MergeTrigger: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer leader.Close()
 
-	follower, err := OpenDB(dir, DBOptions{Sync: SyncNever, SegmentSize: 400})
+	follower, err := OpenDB(dir, DBOptions{Sync: SyncNever, SegmentSize: 400, MergeTrigger: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -868,7 +877,7 @@ func TestDBFollowerSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reopened, err := OpenDB(dir, DBOptions{Sync: SyncNever, SegmentSize: 400})
+	reopened, err := OpenDB(dir, DBOptions{Sync: SyncNever, SegmentSize: 400, MergeTrigger: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1507,4 +1516,369 @@ func TestDBFollowerRefusesATruncatedSnapshot(t *testing.T) {
 		t.Error("a follower with a refused snapshot did not take another")
 	}
 	sameStores(t, leader, follower, nil)
+}
+
+// TestDBFollowerAppliesTwiceAfterACrash is the at-least-once claim, run rather
+// than asserted in a comment. The records reach the disk before the position
+// that claims them, so a crash in between leaves a follower holding records it
+// does not admit to — and the same batch arrives again. What must come out of
+// that is the same store, since it is the same records in the same order.
+func TestDBFollowerAppliesTwiceAfterACrash(t *testing.T) {
+	leader, err := OpenDB(t.TempDir(), smallSegments(4096))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer leader.Close()
+
+	for i := 0; i < 20; i++ {
+		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("first")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	watcher := &watchedDisk{}
+	watcher.install(t)
+
+	dir := t.TempDir()
+
+	follower, err := OpenDB(dir, smallSegments(4096))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer follower.Close()
+
+	followDB(t, leader, follower, ReplicaOptions{})
+	before := follower.Applied()
+
+	// A batch that supersedes half of what is there, so applying it twice would
+	// show up as the wrong value rather than merely as wasted bytes.
+	for i := 0; i < 10; i++ {
+		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("second")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var wire bytes.Buffer
+	next, err := leader.Since(before, &wire, ReplicaOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch := wire.Bytes()
+
+	// The machine goes down between the records and the position: the records
+	// are written, the file that claims them is not.
+	watcher.fail["rename:"+appliedFile] = errDiskFailed
+
+	if _, err := follower.Apply(before, next, bytes.NewReader(batch), ReplicaOptions{}); !errors.Is(err, errDiskFailed) {
+		t.Fatalf("a position that could not be written reported '%v', want the disk's error", err)
+	}
+	if got := follower.Applied(); got != before {
+		t.Fatalf("the follower claims %+v after failing to write it, want %+v", got, before)
+	}
+
+	// It is holding records it does not admit to, which is the safe direction.
+	if value, ok := liveValue(t, follower, "key-00"); !ok || value != "second" {
+		t.Fatalf("key-00 is %q on the follower, want the records that were written", value)
+	}
+
+	// So the leader sends the same batch again, and it applies.
+	delete(watcher.fail, "rename:"+appliedFile)
+
+	got, err := follower.Apply(before, next, bytes.NewReader(batch), ReplicaOptions{})
+	if err != nil {
+		t.Fatalf("the same batch again: %v", err)
+	}
+	if got != next {
+		t.Fatalf("the follower reached %+v, want %+v", got, next)
+	}
+
+	sameStores(t, leader, follower, nil)
+
+	// And it survives being reopened, which is the only thing that proves the
+	// position on the disk agrees with the records beside it.
+	if err := follower.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenDB(dir, smallSegments(4096))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+
+	if got := reopened.Applied(); got != next {
+		t.Errorf("a reopened follower is at %+v, want %+v", got, next)
+	}
+	sameStores(t, leader, reopened, nil)
+}
+
+// TestDBFollowerSurvivesADisk checks that a follower whose disk refuses says so
+// and stays where it was, whichever of the writes it refuses. None of these may
+// leave the store claiming records it does not hold, which is the one direction
+// that cannot be recovered from.
+func TestDBFollowerSurvivesADisk(t *testing.T) {
+	failures := []struct {
+		name string
+		op   func(active uint64) string
+	}{
+		{"the log refuses the records", func(active uint64) string {
+			return fmt.Sprintf("write:%010d%s", active, segmentSuffix)
+		}},
+		{"the position cannot be written", func(uint64) string { return "write:" + appliedFile + mergeSuffix }},
+		{"the position cannot be renamed into place", func(uint64) string { return "rename:" + appliedFile }},
+	}
+
+	for _, test := range failures {
+		t.Run(test.name, func(t *testing.T) {
+			leader, err := OpenDB(t.TempDir(), smallSegments(4096))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer leader.Close()
+
+			for i := 0; i < 20; i++ {
+				if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			watcher := &watchedDisk{}
+			watcher.install(t)
+
+			follower, err := OpenDB(t.TempDir(), smallSegments(4096))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer follower.Close()
+
+			followDB(t, leader, follower, ReplicaOptions{})
+			before := follower.Applied()
+			keys := follower.Len()
+
+			if err := leader.Write([]byte("after"), []byte("value")); err != nil {
+				t.Fatal(err)
+			}
+
+			var wire bytes.Buffer
+			next, err := leader.Since(before, &wire, ReplicaOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			watcher.fail[test.op(follower.Position().Segment)] = errDiskFailed
+
+			if _, err := follower.Apply(before, next, &wire, ReplicaOptions{}); !errors.Is(err, errDiskFailed) {
+				t.Fatalf("a refusing disk reported '%v', want the disk's error", err)
+			}
+			if got := follower.Applied(); got != before {
+				t.Fatalf("the follower claims %+v after a failed write, want %+v", got, before)
+			}
+
+			// Once the disk works again, so does the follower.
+			watcher.fail = map[string]error{}
+
+			if resynced := followDB(t, leader, follower, ReplicaOptions{}); resynced {
+				t.Error("a follower that had merely failed a write took a whole new snapshot")
+			}
+			sameStores(t, leader, follower, nil)
+
+			if follower.Len() < keys {
+				t.Errorf("the follower ended with %d keys, fewer than the %d it had", follower.Len(), keys)
+			}
+		})
+	}
+}
+
+// TestDBSnapshotReportsADisk checks that a snapshot whose disk refuses part way
+// through says so rather than handing over the part it managed. A follower that
+// took half a snapshot and a position would be missing keys and claiming to be
+// up to date.
+func TestDBSnapshotReportsADisk(t *testing.T) {
+	watcher := &watchedDisk{}
+	watcher.install(t)
+
+	dir := t.TempDir()
+
+	db, err := OpenDB(dir, smallSegments(256))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	for i := 0; i < 60; i++ {
+		if err := db.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// One read per frozen log and then no more, so the snapshot fails part way
+	// through reading the records out.
+	db.mu.RLock()
+	oldest := filepath.Base(db.frozen[len(db.frozen)-1].path)
+	db.mu.RUnlock()
+	watcher.readsAllowed[oldest] = 0
+
+	var wire bytes.Buffer
+	if _, err := db.Snapshot(&wire, ReplicaOptions{}); !errors.Is(err, errDiskFailed) {
+		t.Fatalf("a snapshot over a refusing disk reported '%v', want the disk's error", err)
+	}
+
+	// And the store is untouched by having been asked: it still answers, and it
+	// can still be snapshotted once the disk works.
+	watcher.readsAllowed = map[string]int{}
+
+	follower, err := OpenDB(t.TempDir(), smallSegments(4096))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer follower.Close()
+
+	followDB(t, db, follower, ReplicaOptions{})
+	sameStores(t, db, follower, nil)
+}
+
+// BenchmarkDBSnapshot is what setting up a follower costs the leader: reading
+// the live record of every key out of the logs that hold it. The bytes per
+// second are the useful number, since a connection slower than this is what
+// decides how long a follower takes to start and one faster is not.
+func BenchmarkDBSnapshot(b *testing.B) {
+	value := make([]byte, 512)
+
+	db, err := OpenDB(b.TempDir(), DBOptions{Sync: SyncNever, SegmentSize: 1 << 20, MergeTrigger: 1})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	const keys = 20000
+	for i := 0; i < keys; i++ {
+		if err := db.Write([]byte(fmt.Sprintf("key-%08d", i)), value); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	var sized bytes.Buffer
+	if _, err := db.Snapshot(&sized, ReplicaOptions{}); err != nil {
+		b.Fatal(err)
+	}
+
+	b.SetBytes(int64(sized.Len()))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		if _, err := db.Snapshot(io.Discard, ReplicaOptions{}); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	b.StopTimer()
+	b.ReportMetric(float64(keys), "keys")
+}
+
+// BenchmarkDBFollowerApply is a follower taking records: what one costs beyond
+// the connection that carried it. The leader is left out on purpose — any wire
+// is slower than this.
+func BenchmarkDBFollowerApply(b *testing.B) {
+	for _, size := range []int{16, 1024} {
+		b.Run(fmt.Sprint(size), func(b *testing.B) {
+			leader, err := OpenDB(b.TempDir(), DBOptions{Sync: SyncNever, SegmentSize: 4 << 20, MergeTrigger: 1})
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer leader.Close()
+
+			value := make([]byte, size)
+			for i := 0; i < 4096; i++ {
+				if err := leader.Write([]byte(fmt.Sprintf("key-%08d", i)), value); err != nil {
+					b.Fatal(err)
+				}
+			}
+
+			var wire bytes.Buffer
+			at, err := leader.Snapshot(&wire, ReplicaOptions{})
+			if err != nil {
+				b.Fatal(err)
+			}
+			snapshot := wire.Bytes()
+
+			follower, err := OpenDB(b.TempDir(), DBOptions{Sync: SyncNever, SegmentSize: 4 << 20, MergeTrigger: 1})
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer follower.Close()
+
+			b.SetBytes(int64(len(snapshot)))
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				if err := follower.ApplySnapshot(at, bytes.NewReader(snapshot), ReplicaOptions{}); err != nil {
+					b.Fatal(err)
+				}
+			}
+
+			b.StopTimer()
+			b.ReportMetric(float64(len(snapshot))/4096, "B/record")
+		})
+	}
+}
+
+// TestDBFollowerPositionIsNoMoreDurableThanTheRecords checks that the file
+// claiming a leader's records waits for the disk exactly when those records
+// did. Syncing it under a policy that does not sync the records would leave a
+// store that survived losing power claiming records that did not survive it,
+// which is the one direction the ordering exists to rule out.
+func TestDBFollowerPositionIsNoMoreDurableThanTheRecords(t *testing.T) {
+	policies := []struct {
+		name  string
+		sync  SyncPolicy
+		syncs int
+	}{
+		{"always", SyncAlways, 1},
+		{"never", SyncNever, 0},
+		{"every", SyncEvery, 0},
+	}
+
+	for _, policy := range policies {
+		t.Run(policy.name, func(t *testing.T) {
+			leader, err := OpenDB(t.TempDir(), smallSegments(4096))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer leader.Close()
+
+			for i := 0; i < 10; i++ {
+				if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			watcher := &watchedDisk{}
+			watcher.install(t)
+
+			follower, err := OpenDB(t.TempDir(), DBOptions{
+				Sync: policy.sync, SegmentSize: 4096, MergeTrigger: 1,
+				Interval: time.Hour, // the timer must not fire during the test
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer follower.Close()
+
+			watcher.reset()
+			followDB(t, leader, follower, ReplicaOptions{})
+
+			if got := watcher.count("sync", appliedFile+mergeSuffix); got != policy.syncs {
+				t.Errorf("under %s the position was synced %d times, want %d:\n%v",
+					policy.name, got, policy.syncs, watcher.order())
+			}
+
+			// It is written and renamed into place whatever the policy: what
+			// changes is only whether the process waits for the disk.
+			if got := watcher.count("rename", appliedFile); got == 0 {
+				t.Errorf("under %s the position was never renamed into place", policy.name)
+			}
+			sameStores(t, leader, follower, nil)
+		})
+	}
 }

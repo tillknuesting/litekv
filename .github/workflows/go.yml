@@ -38,12 +38,16 @@ jobs:
     # seeds in the code every time.
     #
     # Naming a target that does not exist is not an error to the go tool, only
-    # a warning, so a stale name here fuzzes nothing and says so quietly. Both
-    # of these are checked against the targets in the tests.
+    # a warning, so a stale name here fuzzes nothing and says so quietly: check
+    # the names against the FuzzXxx functions in the tests when adding one.
     - name: Fuzz
       run: |
         go test -run xxx -fuzz FuzzKeyValueStore_Data -fuzztime 30s .
         go test -run xxx -fuzz FuzzSegmentBytes -fuzztime 30s .
         go test -run xxx -fuzz FuzzHint -fuzztime 30s .
         go test -run xxx -fuzz FuzzKeyValueStore_WriteReadDelete -fuzztime 20s .
-        go test -run xxx -fuzz FuzzApply -fuzztime 30s .
+        go test -run xxx -fuzz '^FuzzApply$' -fuzztime 30s .
+        go test -run xxx -fuzz '^FuzzDBApply$' -fuzztime 30s .
+        go test -run xxx -fuzz '^FuzzDBApplySnapshot$' -fuzztime 30s .
+        go test -run xxx -fuzz '^FuzzDBSince$' -fuzztime 20s .
+        go test -run xxx -fuzz '^FuzzDBPosition$' -fuzztime 20s .

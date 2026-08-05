@@ -1028,3 +1028,34 @@ func TestShortReadWhileIndexing(t *testing.T) {
 		t.Errorf("%d keys after the disk recovered, want 60", got)
 	}
 }
+
+// unsyncedDisk is the real filesystem with the waiting taken out. Every sync
+// this package makes is a real one on a real disk, which is the point
+// everywhere except in a fuzz target, where the durability is not what is being
+// explored and a millisecond a call is the difference between tens of
+// executions a second and tens of thousands.
+//
+// Nothing here changes what is written or in what order, only whether the
+// process waits for it, so a target using this still exercises every path.
+type unsyncedDisk struct{ fileSystem }
+
+func (u unsyncedDisk) Open(name string, flag int, perm os.FileMode) (diskFile, error) {
+	file, err := u.fileSystem.Open(name, flag, perm)
+	if err != nil {
+		return nil, err
+	}
+	return unsyncedFile{file}, nil
+}
+
+type unsyncedFile struct{ diskFile }
+
+func (unsyncedFile) Sync() error { return nil }
+
+// installUnsynced puts it in place for the duration of a fuzz target.
+func installUnsynced(f *testing.F) {
+	f.Helper()
+
+	previous := disk
+	disk = unsyncedDisk{previous}
+	f.Cleanup(func() { disk = previous })
+}

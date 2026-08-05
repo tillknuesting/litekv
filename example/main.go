@@ -1,8 +1,11 @@
 // Command example walks through litekv from one end to the other: a store in
 // memory, what it can tell you about itself, the same store saved and loaded by
 // hand, one that mirrors its writes somewhere else, one that keeps a file, one
-// split across segments for more than fits in memory, and one followed by a
-// replica over a connection.
+// followed by a replica over a connection, one split across segments for more
+// than fits in memory, and that one followed by a replica of its own.
+//
+// It calls every exported function in the package, so a call that stops working
+// stops this too.
 package main
 
 import (
@@ -430,6 +433,38 @@ func main() {
 
 	if replicaDB.Position() != db.Position() {
 		fmt.Println("and the two stores are laid out entirely differently, as they should be")
+	}
+
+	// Follow is that loop left running. It hands each batch to a callback along
+	// with the position it leads to — both have to reach the other end, since a
+	// DB follower cannot work out where it is from its own logs. Over a
+	// connection the callback is where they would be framed and written.
+	stopDB := make(chan struct{})
+	streamed := make(chan error, 1)
+
+	go func() {
+		_, err := db.Follow(replicaDB.Applied(), func(batch []byte, next litekv.DBPosition) error {
+			_, err := replicaDB.Apply(replicaDB.Applied(), next, bytes.NewReader(batch), litekv.ReplicaOptions{})
+			return err
+		}, stopDB, litekv.ReplicaOptions{})
+
+		streamed <- err
+	}()
+
+	must(db.Write([]byte("epsilon"), []byte("streamed across")))
+	waitFor(func() bool {
+		_, err := replicaDB.Read([]byte("epsilon"))
+		return err == nil
+	})
+	fmt.Println("and a record written while it streamed arrived without being asked for")
+
+	close(stopDB)
+
+	// A real follower would answer litekv.ErrorDiverged here by taking another
+	// snapshot: a merge can take the log it was resting at while it waits, and
+	// nothing holds one open for it.
+	if err := <-streamed; err != nil && !errors.Is(err, litekv.ErrorDiverged) {
+		must(err)
 	}
 
 	// Reset empties a follower, which is what it does when a leader says there

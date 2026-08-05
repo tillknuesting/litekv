@@ -37,8 +37,12 @@ go test -race ./...
 GOMAXPROCS=1 go test ./...   # the lock degrades to one shard; that path is real
 go run ./example      # it exercises every exported call
 go test -run xxx -fuzz FuzzSegmentBytes -fuzztime 30s .
-go test -run xxx -fuzz FuzzApply -fuzztime 30s .   # what arrives over a wire
+go test -run xxx -fuzz '^FuzzApply$' -fuzztime 30s .     # what arrives over a wire
+go test -run xxx -fuzz '^FuzzDBApply$' -fuzztime 30s .   # and into a DB
 ```
+
+The `^...$` matters: `-fuzz FuzzApply` now matches `FuzzApplySnapshot` too, and
+the go tool refuses to run rather than choosing.
 
 `GOMAXPROCS=1` is not paranoia. The lock shards on `GOMAXPROCS`, so a one-core
 machine takes a different path through it, and background merging stops being in
@@ -106,6 +110,15 @@ snapshot of a store whose active log is empty, which is refused if that log has
 since frozen. `TestDBSnapshotOfAnEmptyStore` is the exception,
 `TestDBTailCrossesFrozenLogs` is the rule.
 
+**A `DB` follower's position is never more durable than the records it claims.**
+`writeApplied` syncs only under `SyncAlways`, which is the policy that has
+already synced the records. Syncing it under `SyncNever` — which it did, until a
+benchmark showed the cost and the reason for it — would leave a store that
+survived losing power claiming records that did not survive it. That is the one
+direction the ordering below exists to rule out, and having it hold in the
+process and break at the disk would have been the worst of both.
+`TestDBFollowerPositionIsNoMoreDurableThanTheRecords`.
+
 **A `DB` follower writes the records before the position that claims them.**
 Crashing in between means the same batch arrives again, which is the same
 records in the same order and changes nothing it holds. The other order claims
@@ -162,6 +175,33 @@ take another write.
 full log is housekeeping that happens after the record is safe; a failure there
 is remembered in `db.rotateErr` and reported by `Sync` and `Close`.
 
+## Fuzzing the replication paths
+
+Everything that takes bytes from a wire has a target, and they are worth running
+for minutes rather than the seconds CI gives them:
+
+| target                 | what it feeds                                        |
+| ---------------------- | ---------------------------------------------------- |
+| `FuzzApply`            | arbitrary bytes as a batch, to a single store         |
+| `FuzzDBApply`          | the same, to a `DB` follower, with a made-up position |
+| `FuzzDBApplySnapshot`  | arbitrary bytes as a snapshot                         |
+| `FuzzDBSince`          | arbitrary positions to a leader                       |
+| `FuzzDBPosition`       | arbitrary bytes to the position parser                |
+
+`FuzzDBApply` and `FuzzDBApplySnapshot` reuse one store rather than opening one
+per execution, and install `unsyncedDisk` from `fs_test.go`, which is the real
+filesystem with the waiting taken out. Both matter more than they look: opening
+a store per execution and syncing the position file took the target from eight
+and a half thousand executions a second to fifty-eight. Nothing about what is
+written or in what order changes, only whether the process waits for it, so the
+paths explored are the same ones.
+
+`FuzzDBSince` is the leader side, which is the half that faces a follower that
+has been tampered with. What it asserts is not that a position is refused —
+refusing is always allowed — but that whatever comes back is whole, verified
+records, since a follower takes what it is given and this is the only place that
+can tell.
+
 ## The replication tests were checked by breaking the code
 
 Tests that pass on the first run have said nothing yet. Each of these edits was
@@ -183,6 +223,16 @@ whether the suite still has hold of it, this is the list to work through again.
 | Follower drops the unapplied tail between reads                | `TestReplicaModel`                    |
 | Follower keeps the first record for a key rather than the last | `TestReplicaSupersededAcrossBatches`  |
 | Follower appends to the log but not to the index               | `TestReplicaCatchUp`                  |
+
+And twelve more for the `DB` half, in `dbreplica.go`: a leader accepting a
+position it cannot check, a frozen log skipping the handshake or checking the
+offsets but not the checksum, a snapshot shipping tombstones or superseded
+records or reading before it froze, stepping to the start of an empty log,
+taking the newest following log rather than the next, a batch that does not give
+up the record it has no room for, a follower that does not check where it is or
+that writes the position before the records, a position that is never written or
+is believed when damaged, a snapshot that does not empty the store first, and a
+reset that leaves the logs or the position behind. All twenty-four are caught.
 
 Three of those are worth knowing about beyond the list.
 

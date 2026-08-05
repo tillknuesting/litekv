@@ -2,6 +2,8 @@ package litekv
 
 import (
 	"bytes"
+	"fmt"
+	"sync"
 	"testing"
 )
 
@@ -103,6 +105,251 @@ func FuzzSegmentBytes(f *testing.F) {
 		}
 		if seen < len(index) {
 			t.Fatalf("the walk saw %d records for %d indexed keys", seen, len(index))
+		}
+	})
+}
+
+// FuzzDBPosition feeds arbitrary bytes to the parser for a position that came
+// off a wire. Refusing is always allowed; what is not allowed is accepting one
+// whose fields cannot describe a log, since everything downstream reads it as
+// though they do.
+func FuzzDBPosition(f *testing.F) {
+	for _, pos := range []DBPosition{{}, {Segment: 3, Log: Position{Offset: 40, Last: 12, Crc: 99}}} {
+		encoded, err := pos.MarshalBinary()
+		if err != nil {
+			f.Fatal(err)
+		}
+		f.Add(encoded)
+	}
+	f.Add([]byte{})
+	f.Add(make([]byte, dbPositionSize))
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		var pos DBPosition
+		if err := pos.UnmarshalBinary(data); err != nil {
+			return
+		}
+
+		if pos.Log.Offset < 0 || pos.Log.Last < 0 {
+			t.Fatalf("accepted a position with a negative offset: %+v", pos)
+		}
+		if pos.Log.Offset != 0 && pos.Log.Last >= pos.Log.Offset {
+			t.Fatalf("accepted a position whose last record starts at or past the end: %+v", pos)
+		}
+
+		// And it survives the round trip it was built for.
+		again, err := pos.MarshalBinary()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var back DBPosition
+		if err := back.UnmarshalBinary(again); err != nil {
+			t.Fatalf("a position this package accepted does not re-parse: %v", err)
+		}
+		if back != pos {
+			t.Fatalf("a position came back as %+v, want %+v", back, pos)
+		}
+	})
+}
+
+// FuzzDBApply feeds arbitrary bytes to a DB follower as though a leader had
+// sent them. A batch is all or nothing here, so the store must either take the
+// whole thing and say so, or take none of it and stay exactly where it was.
+// What must never happen is a store that claims a position it does not hold the
+// records for, since nothing afterwards can find that out.
+func FuzzDBApply(f *testing.F) {
+	installUnsynced(f)
+
+	leader, err := OpenDB(f.TempDir(), smallSegments(4096))
+	if err != nil {
+		f.Fatal(err)
+	}
+	leader.Write([]byte("alpha"), []byte("one"))
+	leader.Write([]byte("beta"), []byte("two"))
+	leader.Delete([]byte("alpha"))
+
+	var wire bytes.Buffer
+	if _, err := leader.Snapshot(&wire, ReplicaOptions{}); err != nil {
+		f.Fatal(err)
+	}
+	leader.Close()
+
+	whole := wire.Bytes()
+	f.Add(whole, uint64(1), int64(0))
+	f.Add(whole[:len(whole)/2], uint64(1), int64(0))
+	f.Add([]byte{}, uint64(0), int64(0))
+	f.Add([]byte("not a record at all"), uint64(7), int64(40))
+	f.Add(make([]byte, headerSizeV1), uint64(1), int64(22))
+
+	// One store, emptied between executions rather than opened again: opening a
+	// DB is a directory read and a handful of files, and doing it per execution
+	// took the fuzzer from thousands a second to tens.
+	db, err := OpenDB(f.TempDir(), smallSegments(4096))
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Cleanup(func() { db.Close() })
+
+	var one sync.Mutex
+
+	f.Fuzz(func(t *testing.T, batch []byte, segment uint64, offset int64) {
+		if offset < 0 {
+			offset = -offset
+		}
+
+		one.Lock()
+		defer one.Unlock()
+
+		if err := db.Reset(); err != nil {
+			t.Fatal(err)
+		}
+
+		// A position that could plausibly have come from a leader: the fields
+		// have to be consistent with each other or Apply is not the thing being
+		// tested.
+		next := DBPosition{Segment: segment, Log: Position{Offset: offset + 1, Last: offset, Crc: 1}}
+
+		got, err := db.Apply(DBPosition{}, next, bytes.NewReader(batch), ReplicaOptions{})
+
+		if err != nil {
+			if got != (DBPosition{}) {
+				t.Fatalf("a refused batch reported %+v, want the position it was at", got)
+			}
+			if applied := db.Applied(); applied != (DBPosition{}) {
+				t.Fatalf("a refused batch left the store claiming %+v", applied)
+			}
+			if db.Len() != 0 {
+				t.Fatalf("a refused batch left %d keys behind", db.Len())
+			}
+			return
+		}
+
+		if got != next || db.Applied() != next {
+			t.Fatalf("an applied batch left the store at %+v, want %+v", db.Applied(), next)
+		}
+
+		// Whatever it took, the store still answers for it.
+		if err := db.ForEach(func(key, value []byte) bool {
+			if _, err := db.Read(key); err != nil {
+				t.Fatalf("%q was applied but reads as %v", key, err)
+			}
+			return true
+		}); err != nil {
+			t.Fatalf("the store is not readable after applying %d bytes: %v", len(batch), err)
+		}
+	})
+}
+
+// FuzzDBApplySnapshot feeds arbitrary bytes to a follower as though they were a
+// leader's snapshot. Half a snapshot with a position on it would be a store
+// missing keys and saying it was up to date, which nothing afterwards could
+// notice, so the position must only be claimed once the whole thing is in.
+func FuzzDBApplySnapshot(f *testing.F) {
+	installUnsynced(f)
+
+	leader, err := OpenDB(f.TempDir(), smallSegments(4096))
+	if err != nil {
+		f.Fatal(err)
+	}
+	for i := 0; i < 8; i++ {
+		leader.Write([]byte(fmt.Sprintf("key-%d", i)), []byte("value"))
+	}
+
+	var wire bytes.Buffer
+	if _, err := leader.Snapshot(&wire, ReplicaOptions{}); err != nil {
+		f.Fatal(err)
+	}
+	leader.Close()
+
+	whole := wire.Bytes()
+	f.Add(whole)
+	f.Add(whole[:len(whole)-3])
+	f.Add([]byte{})
+	f.Add([]byte("rubbish"))
+
+	// One store, emptied by ApplySnapshot itself, rather than a new one per
+	// execution: see the note in FuzzDBApply.
+	db, err := OpenDB(f.TempDir(), smallSegments(4096))
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Cleanup(func() { db.Close() })
+
+	var one sync.Mutex
+
+	f.Fuzz(func(t *testing.T, snapshot []byte) {
+		one.Lock()
+		defer one.Unlock()
+
+		at := DBPosition{Segment: 4, Log: Position{Offset: 40, Last: 12, Crc: 7}}
+
+		if err := db.ApplySnapshot(at, bytes.NewReader(snapshot), ReplicaOptions{}); err != nil {
+			if applied := db.Applied(); applied != (DBPosition{}) {
+				t.Fatalf("a refused snapshot left the store claiming %+v", applied)
+			}
+			return
+		}
+
+		if applied := db.Applied(); applied != at {
+			t.Fatalf("an applied snapshot left the store at %+v, want %+v", applied, at)
+		}
+		if err := db.ForEach(func(key, value []byte) bool { return true }); err != nil {
+			t.Fatalf("the store is not readable after a snapshot of %d bytes: %v", len(snapshot), err)
+		}
+	})
+}
+
+// FuzzDBSince feeds arbitrary positions to a leader, which is what a follower
+// that has been tampered with, or that is following an entirely different
+// store, would send. Refusing is always allowed. What is not allowed is a panic,
+// or handing back bytes that are not whole records — a follower takes what it is
+// given, and this is the only place that can tell.
+func FuzzDBSince(f *testing.F) {
+	installUnsynced(f)
+
+	leader, err := OpenDB(f.TempDir(), DBOptions{Sync: SyncNever, SegmentSize: 256, MergeTrigger: 1})
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Cleanup(func() { leader.Close() })
+
+	for i := 0; i < 60; i++ {
+		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+			f.Fatal(err)
+		}
+	}
+
+	at := leader.Position()
+	f.Add(at.Segment, at.Log.Offset, at.Log.Last, at.Log.Crc, int64(1<<20))
+	f.Add(uint64(1), int64(0), int64(0), uint32(0), int64(64))
+	f.Add(uint64(0), int64(-1), int64(-1), uint32(0), int64(0))
+
+	f.Fuzz(func(t *testing.T, segment uint64, offset, last int64, crc uint32, size int64) {
+		pos := DBPosition{Segment: segment, Log: Position{Offset: offset, Last: last, Crc: crc}}
+
+		var wire bytes.Buffer
+		next, err := leader.Since(pos, &wire, ReplicaOptions{BatchSize: size})
+		if err != nil {
+			return
+		}
+
+		// Whatever came back has to be whole records, or the follower applying
+		// them would stop part way and blame the wire.
+		batch := wire.Bytes()
+		var walked int64
+		for walked < int64(len(batch)) {
+			record, end, err := parseRecordAt(batch, walked)
+			if err != nil {
+				t.Fatalf("position %+v gave back %d bytes that stop being records at %d", pos, len(batch), walked)
+			}
+			if record.Crc != checksumSerialized(batch[walked:end]) {
+				t.Fatalf("position %+v gave back a record at %d that does not verify", pos, walked)
+			}
+			walked = end
+		}
+
+		if len(batch) > 0 && next == pos {
+			t.Fatalf("position %+v gave back %d bytes but did not move", pos, len(batch))
 		}
 	})
 }
