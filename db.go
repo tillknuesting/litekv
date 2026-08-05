@@ -597,14 +597,33 @@ func (db *DB) rotateIfFull(written *memSegment) {
 //
 // Freezing hands the records over to the disk: the store and the Data slice it
 // was holding go, and what stays in memory is the index.
+//
+// The new log is opened before the old one is ended, for the same reason freeze
+// opens its read handle before closing the store it is freezing. Ending the old
+// one first and then failing to open the new one leaves the store with no log
+// it can write to and no way back: the active log is closed, nothing retries
+// the open, and every write from then on reports a closed store however well
+// the disk is working by that point. Opened this way round, a failure leaves
+// the store writing exactly where it was, and the next write tries again.
 func (db *DB) rotateLocked() error {
-	frozen, err := freeze(db.active, db.opts.Sync, db.opts.bloomMinKeys())
+	id := db.nextID
+
+	kvs, err := Open(db.path(id), Options{Sync: db.opts.Sync, Interval: db.opts.Interval})
 	if err != nil {
 		return err
 	}
 
+	frozen, err := freeze(db.active, db.opts.Sync, db.opts.bloomMinKeys())
+	if err != nil {
+		kvs.Close()
+		disk.Remove(db.path(id))
+		return err
+	}
+
 	db.frozen = append([]*diskSegment{frozen}, db.frozen...)
-	return db.start(db.nextID)
+	db.active = &memSegment{segID: id, kvs: kvs}
+	db.nextID = id + 1
+	return nil
 }
 
 // mergeInBackground starts a merge if enough logs have piled up and one is not
@@ -707,26 +726,42 @@ func (db *DB) mergeLocked(victims []*diskSegment, dropTombstones bool) error {
 		return err
 	}
 
+	// The merged log is opened before it is renamed into place, for the same
+	// reason freeze opens its read handle before closing the store and
+	// rotateLocked opens the new log before ending the old one. Opening it
+	// afterwards leaves a failure with the file already renamed over the oldest
+	// victim while this store still holds that victim's segment — an index
+	// describing a file that has been replaced, which answers every lookup with
+	// whatever record now happens to lie at that offset. Stale values, keys that
+	// read as deleted, and nothing anywhere to say so.
+	//
+	// The merge knows where it put every record, so there is nothing to read
+	// back: the index it built is the index of the new log.
+	merged, err := adoptMerged(oldest.id(), temp, db.path(oldest.id()), index, size, db.opts.bloomMinKeys())
+	if err != nil {
+		disk.Remove(temp)
+		return err
+	}
+
 	// The hint beside the log about to be replaced describes what is there now.
 	// It has to go before the rename, or a crash in between would leave it
 	// beside a log it does not describe.
 	if err := removeHint(db.path(oldest.id())); err != nil {
+		merged.close()
 		disk.Remove(temp)
 		return err
 	}
 
 	if err := disk.Rename(temp, db.path(oldest.id())); err != nil {
+		merged.close()
 		disk.Remove(temp)
 		return err
 	}
 	syncDir(db.dir)
 
-	// The merge knows where it put every record, so there is nothing to read
-	// back: the index it built is the index of the new log.
-	merged, err := adoptMerged(oldest.id(), db.path(oldest.id()), index, size, db.opts.bloomMinKeys())
-	if err != nil {
-		return err
-	}
+	// Written once the log is where it says it is, so a hint never describes a
+	// file under a name it has not reached yet.
+	writeHint(db.path(oldest.id()), size, index)
 
 	db.mu.Lock()
 	replaced := make(map[uint64]bool, len(victims))
@@ -747,14 +782,33 @@ func (db *DB) mergeLocked(victims []*diskSegment, dropTombstones bool) error {
 	db.frozen = kept
 	db.mu.Unlock()
 
-	// Oldest first, so that what is left on disk is always answerable. None of
-	// these is worth syncing: the oldest has already been renamed over and the
-	// rest are about to be removed.
+	// Oldest first, so that what is left on disk is always answerable, and
+	// stopping at the first log that will not go. None of these is worth
+	// syncing: the oldest has already been renamed over and the rest are about
+	// to be removed.
+	//
+	// The order is the whole of what makes an interrupted merge harmless, and
+	// carrying on past a refusal breaks it. What has to be left is the merged
+	// log plus the newest few of its inputs: those are asked first and hold the
+	// newest version of anything they mention. Skipping a log that would not go
+	// and removing a newer one instead leaves an older input in front of the
+	// merged log, answering with records the merge superseded — including a
+	// tombstone the merge dropped, which brings a deleted key back, and a value
+	// the merge replaced, which brings an old one back. Neither says anything.
+	//
+	// The logs are closed either way, since they are out of db.frozen and this
+	// store will not read them again. Only the files stay.
+	keep := false
 	for i := len(victims) - 1; i >= 0; i-- {
 		victims[i].closeNoSync()
-		if victims[i].id() != oldest.id() {
-			removeHint(db.path(victims[i].id()))
-			disk.Remove(db.path(victims[i].id()))
+
+		if keep || victims[i].id() == oldest.id() {
+			continue
+		}
+
+		removeHint(db.path(victims[i].id()))
+		if err := disk.Remove(db.path(victims[i].id())); err != nil {
+			keep = true
 		}
 	}
 	syncDir(db.dir)
@@ -851,15 +905,18 @@ func mergeInto(path string, victims []*diskSegment, dropTombstones bool) (map[st
 }
 
 // adoptMerged opens a log the merge has just written, taking the index the
-// merge already built rather than reading the log again, and writes the hint
-// that saves the next open from reading it either.
-func adoptMerged(id uint64, path string, index map[string]int64, size int64, bloomMin int) (*diskSegment, error) {
-	file, err := disk.Open(path, os.O_RDWR, 0o644)
+// merge already built rather than reading the log again.
+//
+// It is given both where the file is now and where it is going, because it is
+// opened before it is renamed into place: an open handle follows the file
+// through a rename, and opening it afterwards would leave a failure with the
+// log swapped and the store still holding the segment it replaced. The hint is
+// written by the caller, once the rename has happened.
+func adoptMerged(id uint64, at, path string, index map[string]int64, size int64, bloomMin int) (*diskSegment, error) {
+	file, err := disk.Open(at, os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
 	}
-
-	writeHint(path, size, index)
 
 	return &diskSegment{segID: id, path: path, file: file, index: index, bytes: size, filter: maybeBloom(index, bloomMin)}, nil
 }

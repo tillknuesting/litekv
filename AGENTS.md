@@ -69,10 +69,26 @@ tombstone hides. Dropping it brings a deleted key back to life.
 `TestDBTieredKeepsTombstones`.
 
 **A merge renames over the oldest log it replaces, then removes the rest oldest
-first.** At every point in between, what is on disk is the merged log plus the
-newest few of its inputs, which are asked first and answer correctly, with
-anything they do not hold falling through to the merged log.
-`TestDBMergeInterrupted` stops the removals at each point and checks all of them.
+first — and stops at the first one that will not go.** At every point in
+between, what is on disk is the merged log plus the newest few of its inputs,
+which are asked first and answer correctly, with anything they do not hold
+falling through to the merged log. `TestDBMergeInterrupted` stops the removals
+at each point and checks all of them.
+
+The stopping is the part that was missing. The loop ignored a refusal and
+carried on, so a log that would not go was skipped and a newer one removed
+instead, leaving an *older* input in front of the merged log — answering with
+records the merge superseded, including a tombstone it dropped, which brings a
+deleted key back on the next open. Nothing says so.
+`TestDBMergeStopsRemovingAtTheFirstRefusal`.
+
+**A merge opens its output before renaming it into place.** Opening it
+afterwards leaves a failure with the file already swapped over the oldest victim
+while `db.frozen` still holds that victim's segment: an index describing a file
+that no longer exists, whose offsets land on whatever the merge happened to put
+there. Lookups come back with older values, or with a tombstone, and every
+checksum passes because the records are real — just not the ones asked for.
+`TestDBMergeFailureDoesNotStrandAnIndex`.
 
 **A hint is removed before the log it describes is replaced.** A hint is taken
 at its word, so one left beside a different log is the only way a wrong answer
@@ -167,13 +183,58 @@ perfectly while dropping the entire store on compaction.
 merge will touch are chosen while `mergeMu` is held: choosing first and locking
 after lets a background merge delete them in between.
 
-**`freeze` opens the read handle before closing the store.** The other way
-round, a failure in between leaves the active log closed and the store unable to
-take another write.
+**A rotation leaves the store writable however it fails.** Three things had to
+be true for that, and only the first was. `freeze` opens the read handle before
+closing the store, or a failure in between leaves the active log closed and
+nothing to write to. `rotateLocked` opens the *new* log before ending the old
+one, for exactly the same reason — it used to do it the other way round, so one
+refused open closed the active log for the life of the process. And `freeze`
+ignores a close that fails, because `closeNoSync` marks the store closed before
+it touches the file: there is no carrying on with it either way, and refusing to
+finish leaves the same store with no log at all. All three were found by failing
+the leader's disk one operation at a time while a follower asked for a snapshot,
+and `TestDBRotationFailureLeavesTheStoreWritable` holds the first two.
 
 **`Write` reports whether the record is stored, and nothing else.** Rotating a
 full log is housekeeping that happens after the record is safe; a failure there
 is remembered in `db.rotateErr` and reported by `Sync` and `Close`.
+
+## Chaos: faults in the way of every operation
+
+`chaos_test.go` puts a fault in the way of each disk operation in turn and
+checks one thing — that a follower given a working disk afterwards ends up
+holding what its leader holds. That is the only promise worth making about a
+fault. Losing a batch, applying one twice, refusing a position, needing a whole
+new snapshot: all allowed, some expected. Settling into a quiet disagreement is
+not.
+
+The sweeps are what find things, not the hand-picked cases. Five of them: every
+operation failed once, every operation failed from there on, writes cut off part
+way at eleven different lengths, the same against a leader instead of a
+follower, and a randomised run where the leader keeps being written to while the
+follower fails and restarts. The randomised one earns its keep — it found two
+bugs the ordered sweeps could not, because they need a merge and a restart in
+the same run.
+
+Four bugs came out of it, and only one was in replication:
+
+- a rotation that ended the old log before opening the new one, so one refused
+  open closed the store to writes for the life of the process;
+- a `freeze` that refused to finish when a close failed, leaving the same store
+  with no log at all;
+- a merge that opened its output after renaming it into place, stranding an
+  index over a replaced file;
+- a merge that carried on removing logs past a refusal, leaving an older input
+  in front of the merged one.
+
+All four are the same mistake: **do the thing that can fail before the thing
+that cannot be undone.** The package already knew it — it is why `freeze` opens
+its read handle first — and had it wrong in three other places.
+
+The fifth was in replication, and is the one that took longest to see: `Reset`
+removed the logs and then the position, so a refusal on the position left a
+store that came back claiming a leader's records it had just deleted. It is the
+same rule turned round. Delete the claim before the thing claimed.
 
 ## Fuzzing the replication paths
 

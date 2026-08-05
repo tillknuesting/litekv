@@ -41,8 +41,59 @@ func replicaOf(t *testing.T, db *DB, opts ReplicaOptions) (*KeyValueStore, DBPos
 	return follower, tailInto(t, db, follower, at, opts)
 }
 
+// syncInto brings a store standing in for a follower up to date, taking a
+// snapshot when it has nowhere to carry on from, and reports whether it had to.
+//
+// It handles ErrorDiverged wherever it turns up rather than probing for it
+// first: a merge can land between a probe and the tail that follows it, and a
+// follower that treats that as a failure is a follower that has not been
+// written properly.
+func syncInto(t *testing.T, db *DB, follower *KeyValueStore, pos DBPosition, opts ReplicaOptions) (DBPosition, bool) {
+	t.Helper()
+
+	resynced := false
+
+	for {
+		var wire bytes.Buffer
+
+		next, err := db.Since(pos, &wire, opts)
+		if pos == (DBPosition{}) || errors.Is(err, ErrorDiverged) {
+			wire.Reset()
+
+			at, err := db.Snapshot(&wire, opts)
+			if err != nil {
+				t.Fatalf("Snapshot: %v", err)
+			}
+			if err := follower.Reset(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := follower.Apply(Position{}, &wire, opts); err != nil {
+				t.Fatalf("applying a snapshot: %v", err)
+			}
+			pos, resynced = at, true
+			continue
+		}
+		if err != nil {
+			t.Fatalf("Since(%+v): %v", pos, err)
+		}
+		if next == pos {
+			return pos, resynced
+		}
+		pos = next
+
+		if wire.Len() == 0 {
+			continue // a log ended; the next one starts where it left off
+		}
+		if _, err := follower.Apply(follower.Position(), &wire, opts); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+	}
+}
+
 // tailInto streams whatever the leader has after pos into the follower, and
-// reports where that leaves it.
+// reports where that leaves it. It is for stores with merging off, where a
+// position cannot be taken away underneath it; syncInto is the one to use
+// otherwise.
 func tailInto(t *testing.T, db *DB, follower *KeyValueStore, pos DBPosition, opts ReplicaOptions) DBPosition {
 	t.Helper()
 
@@ -543,29 +594,11 @@ func TestDBReplicaModel(t *testing.T) {
 		case n < 97:
 			opts := ReplicaOptions{BatchSize: int64(1 + random.Intn(400))}
 
-			// The follower's loop as it would really be written: carry on from
-			// where it is, and when the leader says that place is gone, empty
-			// itself and take a new snapshot.
-			var wire bytes.Buffer
-
-			_, err := db.Since(pos, &wire, opts)
-			if pos == (DBPosition{}) || errors.Is(err, ErrorDiverged) {
-				wire.Reset()
-				if pos, err = db.Snapshot(&wire, opts); err != nil {
-					t.Fatalf("step %d: Snapshot: %v", step, err)
-				}
-				if err := follower.Reset(); err != nil {
-					t.Fatal(err)
-				}
-				if _, err := follower.Apply(Position{}, &wire, opts); err != nil {
-					t.Fatalf("step %d: applying a snapshot: %v", step, err)
-				}
+			var resynced bool
+			pos, resynced = syncInto(t, db, follower, pos, opts)
+			if resynced {
 				snapshots++
-			} else if err != nil {
-				t.Fatalf("step %d: Since: %v", step, err)
 			}
-
-			pos = tailInto(t, db, follower, pos, opts)
 			tails++
 
 			for key, want := range live {
@@ -1715,7 +1748,7 @@ func TestDBSnapshotReportsADisk(t *testing.T) {
 	db.mu.RLock()
 	oldest := filepath.Base(db.frozen[len(db.frozen)-1].path)
 	db.mu.RUnlock()
-	watcher.readsAllowed[oldest] = 0
+	watcher.refuseReads(oldest, 0)
 
 	var wire bytes.Buffer
 	if _, err := db.Snapshot(&wire, ReplicaOptions{}); !errors.Is(err, errDiskFailed) {
@@ -1724,7 +1757,7 @@ func TestDBSnapshotReportsADisk(t *testing.T) {
 
 	// And the store is untouched by having been asked: it still answers, and it
 	// can still be snapshotted once the disk works.
-	watcher.readsAllowed = map[string]int{}
+	watcher.calm()
 
 	follower, err := OpenDB(t.TempDir(), smallSegments(4096))
 	if err != nil {
@@ -1881,4 +1914,91 @@ func TestDBFollowerPositionIsNoMoreDurableThanTheRecords(t *testing.T) {
 			sameStores(t, leader, follower, nil)
 		})
 	}
+}
+
+// TestDBFollowerResetDropsThePositionFirst checks the order Reset works in,
+// which is the order that writing the records before the position works in,
+// turned round: delete the claim before the thing claimed.
+//
+// Removing the logs and then failing to remove the position leaves a store that
+// comes back claiming a stretch of a leader whose records it has just deleted.
+// Nothing downstream can notice — the leader is asked for what comes after a
+// position it recognises, answers correctly, and the follower settles a whole
+// snapshot short with every check passing. It was found by a chaos run that
+// restarted a follower often enough to hit it.
+func TestDBFollowerResetDropsThePositionFirst(t *testing.T) {
+	leader, err := OpenDB(t.TempDir(), smallSegments(1024))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer leader.Close()
+
+	for i := 0; i < 60; i++ {
+		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	watcher := &watchedDisk{}
+	watcher.install(t)
+
+	dir := t.TempDir()
+
+	follower, err := OpenDB(dir, smallSegments(1024))
+	if err != nil {
+		t.Fatal(err)
+	}
+	followDB(t, leader, follower, ReplicaOptions{})
+
+	if follower.Applied() == (DBPosition{}) {
+		t.Fatal("the follower has no position to lose")
+	}
+
+	// The disk refuses to let go of the position.
+	watcher.fail["remove:"+appliedFile] = errDiskFailed
+
+	if err := follower.Reset(); !errors.Is(err, errDiskFailed) {
+		t.Fatalf("a reset that could not drop the position reported '%v'", err)
+	}
+
+	// Nothing else may have happened: the store still holds what it held, and
+	// still says so, which is a store that can be reset again later.
+	if follower.Len() == 0 {
+		t.Error("a refused reset emptied the store anyway")
+	}
+	if follower.Applied() == (DBPosition{}) {
+		t.Error("a refused reset forgot the position in memory while leaving it on the disk")
+	}
+	sameStores(t, leader, follower, nil)
+
+	// And once the disk lets go, the reset takes everything with it — including
+	// on the disk, which is the half a restart would otherwise resurrect.
+	watcher.calm()
+	watcher.fail = map[string]error{}
+
+	if err := follower.Reset(); err != nil {
+		t.Fatal(err)
+	}
+	if err := follower.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenDB(dir, smallSegments(1024))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+
+	if got := reopened.Applied(); got != (DBPosition{}) {
+		t.Fatalf("a reopened store claims %+v after a reset", got)
+	}
+	if got := reopened.Len(); got != 0 {
+		t.Fatalf("a reopened store holds %d keys after a reset", got)
+	}
+
+	// Which means it asks for a snapshot rather than a tail, and ends up whole.
+	if resynced := followDB(t, leader, reopened, ReplicaOptions{}); !resynced {
+		t.Error("a reset follower carried on from a position instead of taking a snapshot")
+	}
+	sameStores(t, leader, reopened, nil)
 }

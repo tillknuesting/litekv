@@ -715,6 +715,21 @@ func (db *DB) Reset() error {
 		return ErrorClosed
 	}
 
+	// The record of where this store had got to goes first, and nothing else
+	// happens if it cannot go.
+	//
+	// Removing the logs and then failing to remove this would leave a store
+	// that comes back claiming a stretch of a leader it has just deleted — and
+	// that is the one kind of wrong nothing downstream can notice. The leader is
+	// asked for what comes after a position it recognises, answers correctly,
+	// and the follower settles a whole snapshot short with every check passing.
+	// It is the same rule as writing the records before the position that claims
+	// them, turned round: delete the claim before the thing claimed.
+	if err := disk.Remove(filepath.Join(db.dir, appliedFile)); err != nil {
+		return err
+	}
+	db.applied = DBPosition{}
+
 	err := db.closeSegments()
 	db.active, db.frozen = nil, nil
 
@@ -735,10 +750,6 @@ func (db *DB) Reset() error {
 		}
 	}
 
-	if rerr := disk.Remove(filepath.Join(db.dir, appliedFile)); err == nil {
-		err = rerr
-	}
-	db.applied = DBPosition{}
 	db.notify()
 
 	if serr := db.start(db.nextID); err == nil {

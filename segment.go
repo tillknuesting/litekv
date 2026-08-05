@@ -169,10 +169,15 @@ func freeze(m *memSegment, policy SyncPolicy, bloomMin int) (*diskSegment, error
 	}
 
 	// The records are on the disk, so the store and its Data slice can go.
-	if err := m.kvs.closeNoSync(); err != nil {
-		file.Close()
-		return nil, err
-	}
+	//
+	// This is the point of no return, and a close that fails does not undo it:
+	// closeNoSync marks the store closed before it touches the file, so there is
+	// no carrying on with it either way. Refusing to finish here would leave the
+	// DB holding a log it cannot write to and no replacement for it, which no
+	// later recovery of the disk puts right — every write from then on reports a
+	// closed store. The records are already as durable as the sync policy
+	// promised, so a close that fails costs a descriptor and nothing else.
+	_ = m.kvs.closeNoSync()
 
 	// The index is already built, so writing it down here saves opening the
 	// store from ever having to read this log.

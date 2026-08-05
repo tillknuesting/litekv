@@ -918,6 +918,70 @@ func TestDBMemory(t *testing.T) {
 	}
 }
 
+// TestDBRotationFailureLeavesTheStoreWritable checks that a rotation which
+// cannot open its new log leaves the store writing where it was.
+//
+// It used to end the old log first and then open the new one, so a single
+// refused open closed the active log, left db.active pointing at it, and made
+// every write from then on report a closed store — for the life of the process,
+// however well the disk was working by then. Nothing retries the open. It was
+// found by failing the leader's disk one operation at a time while a follower
+// asked it for a snapshot, which is a rotation nobody had thought to fail.
+func TestDBRotationFailureLeavesTheStoreWritable(t *testing.T) {
+	watcher := &watchedDisk{}
+	watcher.install(t)
+
+	dir := t.TempDir()
+
+	db, err := OpenDB(dir, DBOptions{Sync: SyncNever, SegmentSize: 256, MergeTrigger: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// The log the rotation will try to open next.
+	watcher.fail["open:"+fmt.Sprintf("%010d%s", db.Position().Segment+1, segmentSuffix)] = errDiskFailed
+
+	for i := 0; i < 40; i++ {
+		if err := db.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+			t.Fatalf("write %d, with the next log refused: %v", i, err)
+		}
+	}
+
+	// It could not rotate, so it is one log larger than it meant to be, and it
+	// says so when asked rather than when written to.
+	if err := db.Sync(); !errors.Is(err, errDiskFailed) {
+		t.Errorf("Sync reported '%v', want the rotation's error", err)
+	}
+	if got := db.Segments(); got != 1 {
+		t.Errorf("%d logs, want the one it could not rotate away from", got)
+	}
+
+	for i := 0; i < 40; i++ {
+		key := fmt.Sprintf("key-%02d", i)
+		if _, err := db.Read([]byte(key)); err != nil {
+			t.Fatalf("%s: %v", key, err)
+		}
+	}
+
+	// And once the disk works, the next write rotates and the store carries on.
+	watcher.fail = map[string]error{}
+
+	if err := db.Write([]byte("after"), []byte("value")); err != nil {
+		t.Fatalf("the first write after the disk recovered: %v", err)
+	}
+	if got := db.Segments(); got < 2 {
+		t.Errorf("%d logs after the disk recovered, want it to have rotated", got)
+	}
+	if err := db.Sync(); err != nil {
+		t.Errorf("Sync after the disk recovered: %v", err)
+	}
+
+	if value, ok := liveValue(t, db, "key-00"); !ok || value != "value" {
+		t.Errorf("key-00 is %q after all that", value)
+	}
+}
+
 // TestDBMergeTriggerBelowTwoDisablesMerging checks the option against what it
 // says it does. A trigger of one used to mean the opposite: pickMerge takes any
 // run of at least the trigger, so one took every pair of logs of a size, and
@@ -1908,4 +1972,192 @@ func BenchmarkDB_Open(b *testing.B) {
 			b.StartTimer()
 		}
 	})
+}
+
+// TestDBMergeFailureDoesNotStrandAnIndex checks that a merge which cannot open
+// its output leaves the store answering correctly.
+//
+// It used to rename the merged log over the oldest one it replaced and then open
+// it. A failure at that open returned with the file already swapped while the
+// store still held the replaced segment — an index describing a file that no
+// longer exists, whose offsets now land on whatever records the merge happened
+// to put there. Lookups came back with older values, or with a tombstone, and
+// nothing anywhere said so. Found by a chaos run that failed one disk operation
+// at a time under a follower, about one run in fourteen.
+func TestDBMergeFailureDoesNotStrandAnIndex(t *testing.T) {
+	watcher := &watchedDisk{}
+	watcher.install(t)
+
+	db, err := OpenDB(t.TempDir(), DBOptions{Sync: SyncNever, SegmentSize: 256, MergeTrigger: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// The same keys over and over, so a merge has most of the log to throw away
+	// and every offset after the first moves.
+	want := map[string]string{}
+	for round := 0; round < 40; round++ {
+		for _, key := range []string{"alpha", "beta", "gamma", "delta"} {
+			value := fmt.Sprintf("%s-%02d", key, round)
+			if err := db.Write([]byte(key), []byte(value)); err != nil {
+				t.Fatal(err)
+			}
+			want[key] = value
+		}
+	}
+	if err := db.Delete([]byte("delta")); err != nil {
+		t.Fatal(err)
+	}
+	delete(want, "delta")
+
+	if db.Segments() < 4 {
+		t.Fatalf("%d logs, want several to merge", db.Segments())
+	}
+
+	// The merged log is written and then cannot be opened.
+	db.mu.RLock()
+	oldest := db.frozen[len(db.frozen)-1].id()
+	db.mu.RUnlock()
+
+	merging := fmt.Sprintf("%010d%s%s", oldest, segmentSuffix, mergeSuffix)
+	watcher.fail["open:"+merging] = errDiskFailed
+
+	if err := db.Merge(); !errors.Is(err, errDiskFailed) {
+		t.Fatalf("a merge that could not open its output reported '%v'", err)
+	}
+
+	// Every key still answers with what was last written to it. A stranded
+	// index shows up here and nowhere else.
+	for key, value := range want {
+		got, ok := liveValue(t, db, key)
+		if !ok {
+			t.Errorf("%s reads as missing after a failed merge, want %q", key, value)
+			continue
+		}
+		if got != value {
+			t.Errorf("%s reads as %q after a failed merge, want %q", key, got, value)
+		}
+	}
+	if _, ok := liveValue(t, db, "delta"); ok {
+		t.Error("a deleted key came back after a failed merge")
+	}
+
+	// And once the disk works, merging finishes and the answers do not move.
+	watcher.fail = map[string]error{}
+
+	if err := db.Merge(); err != nil {
+		t.Fatalf("merging after the disk recovered: %v", err)
+	}
+	for key, value := range want {
+		got, ok := liveValue(t, db, key)
+		if !ok || got != value {
+			t.Errorf("%s reads as %q after the merge finished, want %q", key, got, value)
+		}
+	}
+}
+
+// TestDBMergeStopsRemovingAtTheFirstRefusal checks the order an interrupted
+// merge leaves the disk in, which is the whole of what makes one harmless.
+//
+// What has to be left is the merged log plus the newest few of its inputs:
+// those are asked first and hold the newest version of anything they mention.
+// The removals used to ignore a refusal and carry on, so a log that would not
+// go was skipped and a newer one removed instead — leaving an older input in
+// front of the merged log. It then answers with records the merge superseded,
+// including a tombstone the merge dropped, which brings a deleted key back to
+// life on the next open. Found by chaos, at about one run in eight.
+func TestDBMergeStopsRemovingAtTheFirstRefusal(t *testing.T) {
+	watcher := &watchedDisk{}
+	watcher.install(t)
+
+	dir := t.TempDir()
+
+	db, err := OpenDB(dir, DBOptions{Sync: SyncNever, SegmentSize: 256, MergeTrigger: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A key deleted part way through and written again afterwards, so that an
+	// older log holds a tombstone which a newer log has already superseded.
+	// That tombstone is what comes back if the removals go out of order.
+	want := map[string]string{}
+	for round := 0; round < 30; round++ {
+		for _, key := range []string{"alpha", "beta"} {
+			value := fmt.Sprintf("%s-%02d", key, round)
+			if err := db.Write([]byte(key), []byte(value)); err != nil {
+				t.Fatal(err)
+			}
+			want[key] = value
+		}
+		if round == 12 {
+			if err := db.Delete([]byte("alpha")); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	ids, err := segmentIDs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) < 5 {
+		t.Fatalf("%d logs, want several for the removals to walk through", len(ids))
+	}
+
+	// The removals go oldest first, skipping the oldest itself because the
+	// merged log was renamed over it. So the first one to be removed is the
+	// second oldest, and that is the one the disk will not let go.
+	refused := fmt.Sprintf("%010d%s", ids[1], segmentSuffix)
+	watcher.fail["remove:"+refused] = errDiskFailed
+
+	if err := db.Merge(); err != nil {
+		t.Fatalf("a merge whose removals were refused reported %v", err)
+	}
+
+	// Every log newer than the one that would not go has to still be there.
+	left, err := segmentIDs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	kept := map[uint64]bool{}
+	for _, id := range left {
+		kept[id] = true
+	}
+	for _, id := range ids[1:] {
+		if !kept[id] {
+			t.Errorf("log %d was removed after log %d refused to go; what is left is %v", id, ids[1], left)
+		}
+	}
+
+	// And the store answers correctly, now and after a restart, which is when
+	// the leftover logs are read again.
+	watcher.fail = map[string]error{}
+
+	for key, value := range want {
+		if got, ok := liveValue(t, db, key); !ok || got != value {
+			t.Errorf("%s reads as %q, want %q", key, got, value)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenDB(dir, DBOptions{Sync: SyncNever, SegmentSize: 256, MergeTrigger: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+
+	for key, value := range want {
+		got, ok := liveValue(t, reopened, key)
+		if !ok {
+			t.Errorf("%s reads as deleted after reopening, want %q", key, value)
+			continue
+		}
+		if got != value {
+			t.Errorf("%s reads as %q after reopening, want %q", key, got, value)
+		}
+	}
 }

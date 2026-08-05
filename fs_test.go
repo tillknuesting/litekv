@@ -31,6 +31,31 @@ type watchedDisk struct {
 	// the first.
 	readsAllowed map[string]int
 	reads        map[string]int
+
+	// failNth fails the nth operation counted, whatever it turns out to be, and
+	// failFrom fails that one and every one after it — a disk that hiccupped
+	// against a machine that went away. Both are one-based; zero is off.
+	//
+	// They are how a test sweeps every point a fault could land at rather than
+	// guessing at the interesting ones, which is the same thing
+	// TestDBMergeInterrupted does to a merge by hand.
+	failNth  int
+	failFrom int
+
+	// failWithin narrows all of that to files under one directory, so that a
+	// chaos run against a follower does not also take its leader down. It
+	// narrows tornAfter as well.
+	failWithin string
+
+	// tornAfter stops every file under failWithin taking more than so many
+	// bytes, so a write that crosses the line is half done and then refused.
+	// That is what losing power in the middle of one looks like, and it is a
+	// different fault from a write that never started.
+	tornAfter int64
+
+	// counted is how many operations have been considered for failure, which is
+	// what failNth and failFrom index into.
+	counted int
 }
 
 type diskOp struct {
@@ -43,7 +68,32 @@ func (w *watchedDisk) record(what, name string) error {
 	defer w.mu.Unlock()
 
 	w.ops = append(w.ops, diskOp{what: what, name: filepath.Base(name)})
-	return w.fail[what+":"+filepath.Base(name)]
+
+	if err := w.fail[what+":"+filepath.Base(name)]; err != nil {
+		return err
+	}
+
+	if w.failWithin != "" && !strings.HasPrefix(name, w.failWithin) {
+		return nil
+	}
+
+	w.counted++
+	if w.failNth > 0 && w.counted == w.failNth {
+		return errDiskFailed
+	}
+	if w.failFrom > 0 && w.counted >= w.failFrom {
+		return errDiskFailed
+	}
+	return nil
+}
+
+// operations is how many have been considered for failure since the last reset,
+// which is the range a sweep has to cover.
+func (w *watchedDisk) operations() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return w.counted
 }
 
 // install puts the watcher in place for the duration of a test.
@@ -122,22 +172,29 @@ func (w *watchedDisk) allowWrite(name string, n int) (int, bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	limit, capped := w.writeLimit[filepath.Base(name)]
+	key := filepath.Base(name)
+
+	limit, capped := w.writeLimit[key]
+	if !capped && w.tornAfter > 0 && w.failWithin != "" && strings.HasPrefix(name, w.failWithin) {
+		// Keyed by the whole path, since two stores in a chaos run have logs
+		// with the same names and only one of them is being torn.
+		key, limit, capped = name, w.tornAfter, true
+	}
 	if !capped {
 		return n, true
 	}
 
-	already := w.written[filepath.Base(name)]
+	already := w.written[key]
 	room := limit - already
 	if room < 0 {
 		room = 0
 	}
 	if int64(n) <= room {
-		w.written[filepath.Base(name)] = already + int64(n)
+		w.written[key] = already + int64(n)
 		return n, true
 	}
 
-	w.written[filepath.Base(name)] = limit
+	w.written[key] = limit
 	return int(room), false
 }
 
@@ -200,6 +257,42 @@ func (w *watchedDisk) reset() {
 	defer w.mu.Unlock()
 
 	w.ops = nil
+	w.counted = 0
+}
+
+// inject sets the faults to put in the way, under the lock. A background merge
+// may be inside record at that moment, so setting the fields directly is a race
+// — and one the race detector only finds on the runs where a merge happens to
+// be going, which is exactly the kind that gets shipped.
+func (w *watchedDisk) inject(within string, nth, from int, torn int64) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.failWithin, w.failNth, w.failFrom, w.tornAfter = within, nth, from, torn
+	w.counted = 0
+	w.written = map[string]int64{}
+}
+
+// refuseReads lets a file be read so many times and then stops, under the lock,
+// for the same reason.
+func (w *watchedDisk) refuseReads(name string, allowed int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.readsAllowed = map[string]int{name: allowed}
+	w.reads = map[string]int{}
+}
+
+// calm stops injecting faults, for the half of a chaos run that has to be given
+// a working disk to recover on.
+func (w *watchedDisk) calm() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.failNth, w.failFrom, w.counted, w.tornAfter = 0, 0, 0, 0
+	w.written = map[string]int64{}
+	w.readsAllowed = map[string]int{}
+	w.reads = map[string]int{}
 }
 
 type watchedFile struct {

@@ -910,7 +910,8 @@ anything either.
 ## Working on it
 
 `AGENTS.md` has the notes for that: the invariants that must not be broken and
-the test behind each, the mistakes this codebase has already made, what has been
+the test behind each, the chaos sweeps and what they found, the mistakes this
+codebase has already made, what has been
 measured and rejected so it is not tried again, and how to check a change before
 pushing it.
 
