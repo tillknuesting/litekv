@@ -558,6 +558,55 @@ atomic now.
 default. Since a stream costs no round trip per batch, it is a memory setting rather than a latency one.
 A record larger than a batch still crosses whole, or a log holding one could never be replicated at all.
 
+### Replicating a DB
+
+A `DB` cannot ship its log the way a single store does, and the reason is worth being precise about. Its
+logs are merged in the background, and a merge renames its output over the oldest log it replaces — so
+the file called `0000000005.seg` can become a different file, with different contents, at a different
+length, while a follower thinks it has read forty kilobytes of it. Merging also discards: superseded
+records always, tombstones when the run reaches the oldest log. The bytes are not a stream and the
+history is not kept.
+
+So what crosses is records, not bytes. The follower appends them to a store of its own and rotates and
+merges on its own schedule; the two ends agree on every key and on nothing about their files. That is
+the *logical* replication log of DDIA's four, chosen for the reason the book gives — it is not tied to
+how either end stores things — and it has the side benefit that leader and follower need not be running
+the same build.
+
+Because a merge destroys history, a leader cannot replay its writes from arbitrarily far back, and no
+protocol can make it. Replication is therefore a snapshot and then the tail after it:
+
+```go
+at, err := leader.Snapshot(w, litekv.ReplicaOptions{})  // the live records
+...
+at, err = leader.Follow(at, conn, stop, litekv.ReplicaOptions{})
+```
+
+`Snapshot` writes one record per live key — the newest version, tombstones skipped, since a follower
+starting from nothing has no older value for one to hide — and returns the position they are current as
+of. It is consistent without stopping the store: the active log is frozen first, so everything the
+snapshot covers is on the disk and immutable, and anything written from then on is the tail rather than
+part of the snapshot. Writes and rotation carry on throughout. Merging does not, since a merge may
+remove a log and this is reading them.
+
+### Every position names a record
+
+A `DBPosition` is which log and where in it, and the log part is an ordinary `Position` carrying the
+same check. That check needs a record to check against, which is what makes the start of a log awkward:
+it names nothing, and a frozen log may have been merged and be a different file behind the same name.
+
+So the tail never rests there. A batch crosses from one log into the next rather than stopping at the
+boundary, and a follower that has read a log to its end stays at that end rather than stepping to the
+start of the next — the end of a log names its last record, the start of one names nothing. The cost is
+that a batch may overshoot its size by one record at each log it crosses.
+
+One position escapes this: a snapshot of a store whose active log is empty has nowhere to point but the
+start of that log. Used before the log fills it is fine, because a log being written is never merged. If
+the log fills and freezes first, the leader says `ErrorDiverged` rather than guess, and the follower
+takes another snapshot. That is also what a follower gets when it falls so far behind that the log it
+was reading has been merged away, and it is the honest answer: without something like PostgreSQL's
+replication slots to hold the log open, a badly lagging follower cannot be caught up, only replaced.
+
 ## Concurrency
 
 `KeyValueStore` embeds a reader-writer lock and every method takes it, so the methods are safe to call
@@ -787,10 +836,15 @@ anything either.
   writes, and the stall it was meant to remove comes back.
 - **A closed `DB` cannot read.** Its values are on the disk and closing shuts the files. A closed
   `KeyValueStore` goes on answering, because its records are in memory.
-- **Only a `KeyValueStore` replicates.** A `DB` cannot, because its offsets are per log and merging
-  rewrites and removes logs, so no offset in one survives. Doing it needs a logical stream rather than
-  this physical one — the follower building its own segments from the records rather than copying the
-  leader's bytes. `AGENTS.md` has what that would take.
+- **A `DB` has a leader but not yet a follower.** `Snapshot`, `Since` and `Follow` hand out the records;
+  what applies them is still a `KeyValueStore`, which means a `DB` can only be replicated into something
+  its live records fit into. A `DB` follower needs somewhere durable to keep the leader position it has
+  applied, since unlike a single store it cannot work that out from its own log. `AGENTS.md` has what
+  is left.
+- **A `DB` follower that falls behind a merge starts again.** There is nothing like a replication slot
+  holding a log open for it, so a log it was reading can be merged away, and the answer is another
+  snapshot of the whole store. A follower that keeps up never sees this: it sits on the log being
+  written, which is never merged.
 - **Replication is asynchronous, and only that.** A write returns as soon as the leader has it, so a
   leader that dies loses whatever its followers had not received yet. There is no synchronous or
   semi-synchronous mode, no acknowledgement from a follower, and nothing waits for one.

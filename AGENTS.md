@@ -15,6 +15,7 @@ to save you a day, not to introduce the code.
 | `hint.go`    | the index of a frozen log, written beside it                             |
 | `bloom.go`   | the filter in front of that index, once a log is big enough to want one   |
 | `replica.go` | `Position`, and shipping the log to a follower: `Since`, `Follow`, `Apply` |
+| `dbreplica.go` | `DBPosition`, and shipping a `DB`'s records: `Snapshot`, `Since`, `Follow` |
 | `fs.go`      | the one seam through which this package touches a disk                    |
 
 `KeyValueStore` and `DB` are deliberately separate. The first is one log with
@@ -94,6 +95,25 @@ decodes and checksums the whole batch first, and a record it will not vouch for
 stops it there. A leader is not a reason to trust the wire, and a record kept
 without checking is one no later read can question. `FuzzApply` is the same
 claim against arbitrary bytes.
+
+**Every position a `DB` hands out names a record.** The check a position carries
+needs a record to check against, so the start of a log — which names nothing —
+cannot be checked, and a frozen log may have been merged and be a different file
+behind the same name. `db.batch` goes out of its way for this: it crosses into
+the next log rather than stopping at a boundary, and it stays at the end of a
+log rather than stepping to the start of an empty one. The single exception is a
+snapshot of a store whose active log is empty, which is refused if that log has
+since frozen. `TestDBSnapshotOfAnEmptyStore` is the exception,
+`TestDBTailCrossesFrozenLogs` is the rule.
+
+**A `DB` snapshot freezes before it reads.** Everything it covers is then on the
+disk and cannot change, and the position it reports is the end of the log it
+just froze — not the start of the new one, which would name no record and be
+unusable the moment that log filled. It holds `mergeMu`, not `db.mu`: writes and
+rotation carry on, and only merging waits. Holding `db.mu` instead would stall
+writes, because Go's RWMutex blocks new readers once a writer is waiting and
+`db.Write` takes it for reading while rotation takes it for writing.
+`TestDBSnapshotKeepsWritingCheck`.
 
 **A follower that crashed says where it got to, and the leader takes it.** A
 batch is one write, so losing power part way through leaves a record half on the
@@ -308,24 +328,29 @@ a crash survivable and none of them show up in the result of a call.
 
 ## What to build next, and what it needs
 
-**Replicating a `DB`** is what replication left undone. A `KeyValueStore` ships
-its log as bytes, which works because the log only ever grows. A `DB` cannot do
-that: its offsets are per segment, and merging rewrites and removes segments, so
-no position in one survives.
+**A `DB` follower** is what is left. The leader half is done — `Snapshot` hands
+out the live records, `Since` and `Follow` hand out the tail after them — and
+what applies those records is still a `KeyValueStore`, so a `DB` can only be
+replicated into something its live records fit into, which is the opposite of
+why `DB` exists.
 
-The way through is the other kind of replication log the book describes — a
-logical stream rather than this physical one. Ship the records and let the
-follower build its own segments and do its own merging, so the two stores agree
-on what they hold without agreeing on their bytes. A new follower needs a
-snapshot and the position it was taken at, which for a `DB` is `ForEach` plus
-`(active segment id, offset)` captured under `db.mu`, and then the stream from
-there. Rotation is the only event the follower has to be told about, and it does
-not need to be: it rotates on its own when its active log fills.
+Two things it needs that the single-store follower did not.
 
-What that costs is that `sameStore`, the test helper that compares two logs byte
-for byte, stops being available, and every test has to compare what the stores
-answer instead. That is the honest trade of logical replication and worth
-knowing before starting rather than after.
+Somewhere durable to keep the leader position it has applied. A `KeyValueStore`
+follower gets that for free, because its log *is* the leader's log and its own
+length answers the question. A `DB` follower's files have nothing to do with the
+leader's, so the position has to be written down beside the segments and must
+never claim more than has actually been applied. Crashing between the records
+and that file means replaying a few, which is harmless — the same records in the
+same order — so at-least-once is the contract to aim for rather than exactly
+once.
+
+A way to append a leader's record bytes to the active log without going through
+`Write`, which would re-serialise them and give them a new timestamp. The
+records must cross unchanged. `applyWhole` in `replica.go` already does the
+appending; what it also does is check the store is at the position the batch was
+cut for, and a `DB` follower's own position is not the leader's, so that check
+has to move up a level.
 
 Nothing here does failover, and adding it is a different project: it needs a way
 to agree on who the leader is, which is consensus, and this is a storage engine.

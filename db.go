@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -51,6 +52,11 @@ type DB struct {
 	// triggered it was stored either way, so it is not the writer's error to
 	// hear; Sync and Close report it instead.
 	rotateErr error
+
+	// waiters is closed to wake whatever is following this store, and replaced
+	// the next time anything asks. A follower of a DB cannot wait on the active
+	// log's own channel, because rotation replaces the log. See dbreplica.go.
+	waiters atomic.Pointer[chan struct{}]
 
 	// mergeMu lets only one merge run at a time. Two at once would build the
 	// same file under the same temporary name and rename it out from under
@@ -360,6 +366,8 @@ func (db *DB) Write(key, value []byte) error {
 		return err
 	}
 
+	db.notify()
+
 	// The record is stored. Rotating is housekeeping, and a failure at it is
 	// not a reason to tell the caller their write did not happen.
 	db.rotateIfFull(active)
@@ -383,6 +391,7 @@ func (db *DB) Delete(key []byte) error {
 		return err
 	}
 
+	db.notify()
 	db.rotateIfFull(active)
 	return nil
 }
@@ -567,22 +576,29 @@ func (db *DB) rotateIfFull(written *memSegment) {
 		return
 	}
 
-	// Freezing hands the records over to the disk: the store and the Data
-	// slice it was holding go, and what stays in memory is the index.
-	frozen, err := freeze(written, db.opts.Sync, db.opts.bloomMinKeys())
-	if err != nil {
-		db.rotateErr = err
-		return
-	}
-
-	db.frozen = append([]*diskSegment{frozen}, db.frozen...)
-	if err := db.start(db.nextID); err != nil {
+	if err := db.rotateLocked(); err != nil {
 		db.rotateErr = err
 		return
 	}
 
 	db.rotateErr = nil
+	db.notify() // the active log a follower was reading has ended
 	db.mergeInBackground()
+}
+
+// rotateLocked freezes the active log and starts a new one. Callers must hold
+// db.mu for writing, and must have checked that the store is open.
+//
+// Freezing hands the records over to the disk: the store and the Data slice it
+// was holding go, and what stays in memory is the index.
+func (db *DB) rotateLocked() error {
+	frozen, err := freeze(db.active, db.opts.Sync, db.opts.bloomMinKeys())
+	if err != nil {
+		return err
+	}
+
+	db.frozen = append([]*diskSegment{frozen}, db.frozen...)
+	return db.start(db.nextID)
 }
 
 // mergeInBackground starts a merge if enough logs have piled up and one is not
