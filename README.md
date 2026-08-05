@@ -305,9 +305,10 @@ is what keeps one of them from sitting in front of a write.
 
 `MergeTrigger` defaults to 2, which keeps the number of logs as low as it goes at the price of merging
 more often. That is the right way round for fast storage, where the rewriting costs little and the logs
-each cost a lookup and an index. Raise it to merge less and hold more logs. Setting it to 1 turns
+each cost a lookup and an index. Raise it to merge less and hold more logs. Anything below 2 turns
 merging off altogether, which is what an append-only workload of write-once keys wants: nothing is ever
-superseded there, so a merge would reclaim nothing.
+superseded there, so a merge would reclaim nothing. `Merge` still works when it is off, so compaction
+becomes something you ask for rather than something that happens.
 
 Two rules make a partial merge safe. Only a contiguous run of logs is merged, since the order they are
 asked in is the only thing deciding which version of a key wins. And a tombstone is dropped only by a

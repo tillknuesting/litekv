@@ -208,6 +208,16 @@ invariant above is phrased as slow-never-wrong rather than as a rule to follow.
 - **Benchmarks run back to back drift.** Two toolchains looked 6-8% apart until
   they were interleaved, at which point they were identical. That was the
   laptop warming up. Alternate the runs.
+- **An option that documented the opposite of what it did.** `MergeTrigger: 1`
+  said it turned merging off and turned it up: `pickMerge` takes any run of at
+  least the trigger, so one took every pair of logs of a size and merged more
+  eagerly than the default two did. Nothing caught it because every benchmark
+  in `db_test.go` asks for `1 << 30` instead — the workaround was in the tests,
+  which is the shape of a bug that survives. It was found by a replication test
+  wondering why a log had vanished with merging supposedly off.
+  `TestDBMergeTriggerBelowTwoDisablesMerging` now holds the option to what it
+  says, and zero-means-default with negative-means-off matches `BloomMinKeys`
+  next door.
 - **A follower asking whether there is more, through the write lock.**
   `Changed` handed out its channel under `kvs.Lock`, which takes every shard, so
   a follower waiting on a store stood in the same queue as the writers and took

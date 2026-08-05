@@ -918,6 +918,67 @@ func TestDBMemory(t *testing.T) {
 	}
 }
 
+// TestDBMergeTriggerBelowTwoDisablesMerging checks the option against what it
+// says it does. A trigger of one used to mean the opposite: pickMerge takes any
+// run of at least the trigger, so one took every pair of logs of a size, and
+// the setting documented as turning merging off merged more eagerly than the
+// default did. Every benchmark in this file works around it by asking for a
+// billion.
+func TestDBMergeTriggerBelowTwoDisablesMerging(t *testing.T) {
+	for _, trigger := range []int{1, -1} {
+		t.Run(fmt.Sprint(trigger), func(t *testing.T) {
+			dir := t.TempDir()
+
+			db, err := OpenDB(dir, DBOptions{Sync: SyncNever, SegmentSize: 256, MergeTrigger: trigger})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+
+			// The same few keys over and over, which is what a merge would have
+			// most to gain from and so what it would take first.
+			for round := 0; round < 60; round++ {
+				for _, key := range []string{"alpha", "beta", "gamma"} {
+					if err := db.Write([]byte(key), []byte(fmt.Sprintf("%s-%02d", key, round))); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+
+			ids, err := segmentIDs(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(ids) < 8 {
+				t.Fatalf("%d logs after 180 writes into 256-byte segments, want plenty", len(ids))
+			}
+
+			// Nothing merged means the ids run without a gap: a merge is the
+			// only thing that removes one.
+			for i, id := range ids {
+				if want := uint64(i + 1); id != want {
+					t.Fatalf("log ids are %v: %d is missing, so something merged", ids, want)
+				}
+			}
+			if got := db.Segments(); got != len(ids) {
+				t.Errorf("the store reports %d logs, the directory holds %d", got, len(ids))
+			}
+
+			// And merging by hand still works, which is the point of having it
+			// off: you choose when.
+			if err := db.Merge(); err != nil {
+				t.Fatal(err)
+			}
+			if got := db.Segments(); got != 2 {
+				t.Errorf("%d logs after merging by hand, want the merged one and the active one", got)
+			}
+			if value, ok := liveValue(t, db, "alpha"); !ok || value != "alpha-59" {
+				t.Errorf("alpha is %q after merging, want alpha-59", value)
+			}
+		})
+	}
+}
+
 // TestDBTieredKeepsTombstones is the rule that makes a partial merge safe. A
 // merge that does not reach the oldest log must carry its tombstones into the
 // merged log: an older log left out of it can still hold the value one hides,

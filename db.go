@@ -73,7 +73,10 @@ type DBOptions struct {
 	SegmentSize int64
 
 	// MergeTrigger is how many logs of a size may pile up before they are
-	// merged into one. Zero means two, and one disables merging.
+	// merged into one. Zero means the default of two, and anything below two
+	// turns merging off, as a negative BloomMinKeys turns filters off: a run of
+	// one log is not something to merge, and merging it would write out what is
+	// already there.
 	//
 	// Merging is size tiered: only logs of roughly the same size are merged
 	// together, so a large one is rewritten only when enough of its own size
@@ -139,7 +142,7 @@ func (o DBOptions) bloomMinKeys() int {
 }
 
 func (o DBOptions) mergeTrigger() int {
-	if o.MergeTrigger <= 0 {
+	if o.MergeTrigger == 0 {
 		return defaultMergeTrigger
 	}
 	return o.MergeTrigger
@@ -174,6 +177,13 @@ func sizeTier(size, base int64) int {
 func (db *DB) pickMerge() (victims []*diskSegment, dropTombstones, ok bool) {
 	trigger := db.opts.mergeTrigger()
 	base := db.opts.segmentSize()
+
+	// Merging turned off. Without this a trigger of one takes any run at all,
+	// which is every pair of logs of a size, so the option documented as
+	// disabling merging merged more eagerly than the default did.
+	if trigger < 2 {
+		return nil, false, false
+	}
 
 	from, to, tier := 0, 0, 0
 	for i := 0; i < len(db.frozen); {
