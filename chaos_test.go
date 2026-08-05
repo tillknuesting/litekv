@@ -37,7 +37,9 @@ func chaosFollow(leader, follower *DB, opts ReplicaOptions) error {
 		if pos == (DBPosition{}) || errors.Is(err, ErrorDiverged) {
 			wire.Reset()
 
-			at, err := leader.Snapshot(&wire, opts)
+			at, releaseAt, err := leader.Snapshot(&wire, opts)
+
+			defer releaseAt()
 			if err != nil {
 				return fmt.Errorf("snapshot: %w", err)
 			}
@@ -588,7 +590,8 @@ func TestDBLeaderChaosRefusedReads(t *testing.T) {
 			watcher.refuseReads(log, allowed)
 
 			var wire bytes.Buffer
-			_, err := leader.Snapshot(&wire, ReplicaOptions{})
+			_, release, err := leader.Snapshot(&wire, ReplicaOptions{})
+			release()
 
 			if err != nil {
 				refused++

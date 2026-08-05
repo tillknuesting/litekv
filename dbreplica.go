@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // Replicating a DB is not replicating a KeyValueStore across several files.
@@ -102,8 +103,16 @@ func (db *DB) position() DBPosition {
 }
 
 // Snapshot writes the store's live records to w and returns the position they
-// are current as of. It is how a follower starts: apply the snapshot, then
-// stream from the position it came with.
+// are current as of, along with the function that lets go of the log that
+// position names. It is how a follower starts: apply the snapshot, then stream
+// from the position it came with.
+//
+// The hold is the difference between that working and not. Shipping a snapshot
+// takes as long as it takes, and merging carries on throughout, so a position
+// handed back unheld can already have been merged away by the time the follower
+// is ready to stream from it — and the snapshot taken in answer to that would go
+// the same way. Held, the log stays where it is. Release it once the stream is
+// running, or once you have given up on it; releasing twice is harmless.
 //
 // What crosses is one record per live key — the newest version of it — and
 // nothing else. Superseded records do not go, and neither do tombstones, since
@@ -116,7 +125,7 @@ func (db *DB) position() DBPosition {
 // the snapshot. Writes and rotation carry on throughout. Merging does not — a
 // merge may remove a log, and this is reading them — so a snapshot of a large
 // store holds merging off for as long as it takes.
-func (db *DB) Snapshot(w io.Writer, opts ReplicaOptions) (DBPosition, error) {
+func (db *DB) Snapshot(w io.Writer, opts ReplicaOptions) (DBPosition, func(), error) {
 	// No merge may take a log away while it is being read out. This is also
 	// the lock order the rest of the package uses: mergeMu, then db.mu.
 	db.mergeMu.Lock()
@@ -124,8 +133,13 @@ func (db *DB) Snapshot(w io.Writer, opts ReplicaOptions) (DBPosition, error) {
 
 	at, frozen, err := db.freezeForSnapshot()
 	if err != nil {
-		return DBPosition{}, err
+		return DBPosition{}, func() {}, err
 	}
+
+	// Taken here rather than by the caller afterwards, because here there is no
+	// gap: this stretch already excludes merging, so the log the position names
+	// cannot go between deciding on it and holding it.
+	release := db.hold(at)
 
 	// Buffered, or a store of small records is a write to w per key.
 	writer := bufio.NewWriterSize(w, int(opts.batchSize()))
@@ -165,14 +179,16 @@ func (db *DB) Snapshot(w io.Writer, opts ReplicaOptions) (DBPosition, error) {
 		})
 
 		if failed != nil {
-			return DBPosition{}, failed
+			release()
+			return DBPosition{}, func() {}, failed
 		}
 	}
 
 	if err := writer.Flush(); err != nil {
-		return DBPosition{}, err
+		release()
+		return DBPosition{}, func() {}, err
 	}
-	return at, nil
+	return at, release, nil
 }
 
 // freezeForSnapshot ends the active log and reports the position a snapshot
@@ -247,9 +263,85 @@ func (db *DB) Since(pos DBPosition, w io.Writer, opts ReplicaOptions) (DBPositio
 	return next, nil
 }
 
+// Hold keeps the log a position names, and every log after it, from being
+// merged away, and returns the function that lets them go again. Releasing
+// twice is harmless.
+//
+// From that log onwards, and not only that log: a follower walks forward
+// through the logs, and the newest frozen ones are exactly what merging takes
+// first, so pinning one at a time would leave it reading into a run that was
+// being rewritten as it went. This is the thing PostgreSQL calls a replication
+// slot, and it pins the same way.
+//
+// Without one, a follower is at the mercy of the merging that goes on
+// underneath it. A follower that has fallen behind is reading a frozen log and
+// a merge can take it; one that has caught up rests wherever it read last,
+// which when the log being written is empty is the end of the last frozen log —
+// and a merge can take that too. Either way the answer is ErrorDiverged and a
+// snapshot of the whole store, which for an idle follower on a store that
+// merges is a routine and expensive surprise.
+//
+// Follow takes one for the length of a connection, so a connected follower does
+// not need to ask for it. Hold is for a leader answering with Since instead,
+// where there is no connection for anything to hang off.
+//
+// What it costs is logs, and the cost is not small: everything written since
+// the oldest follower's position stays on the disk, unmerged, and every lookup
+// asks each of those logs in turn. A follower that goes quiet without releasing
+// leaves the leader carrying them indefinitely. That is why this is a hold with
+// a release rather than a list of followers the leader keeps: nothing here pins
+// a disk for a follower that has gone away.
+//
+// Merge ignores holds. It is an explicit request to compact the whole store,
+// and a follower reading one of those logs will have to take a new snapshot.
+func (db *DB) Hold(pos DBPosition) (release func()) {
+	// Wait for a merge that is already running. One that has chosen its victims
+	// cannot be called off, so a hold taken while it ran would look like it had
+	// been honoured and would not have been. This is also the lock order the
+	// rest of the package uses: mergeMu, then db.mu.
+	db.mergeMu.Lock()
+	defer db.mergeMu.Unlock()
+
+	return db.hold(pos)
+}
+
+// hold is Hold with db.mergeMu already held, for the callers that are inside
+// their own merge-free stretch and would deadlock taking it again.
+func (db *DB) hold(pos DBPosition) func() {
+	db.mu.Lock()
+
+	if db.held == nil {
+		db.held = make(map[uint64]int)
+	}
+	db.held[pos.Segment]++
+
+	db.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			db.mu.Lock()
+			defer db.mu.Unlock()
+
+			if db.held[pos.Segment]--; db.held[pos.Segment] <= 0 {
+				delete(db.held, pos.Segment)
+			}
+
+			// What was blocked may now be worth doing.
+			db.mergeInBackground()
+		})
+	}
+}
+
 // Follow hands the records after pos to send, and goes on handing them over as
 // they are written to this store, until until is closed or send reports an
 // error. It returns the position it had got as far as.
+//
+// holding is the release returned by Snapshot, or nil when the position did not
+// come from one. Follow takes a hold of its own before calling it, so the log
+// the stream starts from is never unheld for an instant. The stream then moves
+// its hold forward as it reads, which is what lets the leader merge everything
+// behind it.
 //
 // send takes the position those records leave a follower at, as well as the
 // records, and both have to reach the other end. A follower of a DB cannot work
@@ -260,9 +352,26 @@ func (db *DB) Since(pos DBPosition, w io.Writer, opts ReplicaOptions) (DBPositio
 //
 // A slow follower does not slow this store down: each batch is copied out under
 // the lock and handed over outside it.
-func (db *DB) Follow(pos DBPosition, send func(batch []byte, next DBPosition) error, until <-chan struct{}, opts ReplicaOptions) (DBPosition, error) {
+func (db *DB) Follow(pos DBPosition, holding func(), send func(batch []byte, next DBPosition) error, until <-chan struct{}, opts ReplicaOptions) (DBPosition, error) {
 	bufp := sendBuffers.Get().(*[]byte)
 	defer func() { sendBuffers.Put(bufp) }()
+
+	// The log being read is held for as long as this stream is on it, so
+	// merging cannot take the follower's place away underneath it. The hold
+	// moves as the stream does, and is taken on the new log before it is let go
+	// on the old one.
+	release := db.Hold(pos)
+	defer func() { release() }()
+
+	// The hold Snapshot took is handed over here rather than by the caller,
+	// because the caller cannot tell when this one has been taken. Letting go
+	// of the snapshot's hold first leaves a moment with nothing holding the log
+	// the stream is about to start from — and on a machine with one core that
+	// moment is however long it takes this goroutine to be scheduled, which is
+	// long enough to lose it every time.
+	if holding != nil {
+		holding()
+	}
 
 	for {
 		// Before asking, never after: a record written in between closes the
@@ -281,6 +390,12 @@ func (db *DB) Follow(pos DBPosition, send func(batch []byte, next DBPosition) er
 			}
 			if err := send(batch, next); err != nil {
 				return pos, err
+			}
+
+			if next.Segment != pos.Segment {
+				moved := db.Hold(next)
+				release()
+				release = moved
 			}
 			pos = next
 		}

@@ -53,6 +53,11 @@ type DB struct {
 	// hear; Sync and Close report it instead.
 	rotateErr error
 
+	// held counts the followers reading each log, by id. Nothing from the oldest
+	// of them onwards is merged, so a follower walking forward through the logs
+	// never has one taken out from under it — see Hold in dbreplica.go.
+	held map[uint64]int
+
 	// applied is how far through a leader's records this store has taken, for
 	// one being used as a follower, and is nothing for one that is not. Unlike
 	// a single store it cannot be worked out from the logs, so it is written
@@ -160,6 +165,18 @@ func (o DBOptions) mergeTrigger() int {
 	return o.MergeTrigger
 }
 
+// holdFloor is the oldest log any follower is reading, or zero for none.
+// Callers must hold db.mu.
+func (db *DB) holdFloor() uint64 {
+	floor := uint64(0)
+	for id, count := range db.held {
+		if count > 0 && (floor == 0 || id < floor) {
+			floor = id
+		}
+	}
+	return floor
+}
+
 // sizeTier puts a log into a size class: how many times its size divides by
 // tierRatio before it is down to a freshly rotated one.
 func sizeTier(size, base int64) int {
@@ -197,8 +214,23 @@ func (db *DB) pickMerge() (victims []*diskSegment, dropTombstones, ok bool) {
 		return nil, false, false
 	}
 
+	// Nothing from the oldest log a follower is reading onwards may be merged.
+	// Holding only the log a follower sits in is not enough: a follower walks
+	// forward through the logs, and the newest frozen ones are exactly what
+	// merging takes first, so it would be reading into a run that was being
+	// rewritten as it went. This is what a replication slot pins.
+	//
+	// db.frozen runs newest first, so the held logs are a prefix of it and
+	// everything a merge may consider starts after them.
+	start := 0
+	if floor := db.holdFloor(); floor != 0 {
+		for start < len(db.frozen) && db.frozen[start].id() >= floor {
+			start++
+		}
+	}
+
 	from, to, tier := 0, 0, 0
-	for i := 0; i < len(db.frozen); {
+	for i := start; i < len(db.frozen); {
 		runTier := sizeTier(db.frozen[i].bytes, base)
 
 		j := i

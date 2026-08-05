@@ -169,8 +169,10 @@ func FuzzDBApply(f *testing.F) {
 	leader.Delete([]byte("alpha"))
 
 	var wire bytes.Buffer
-	if _, err := leader.Snapshot(&wire, ReplicaOptions{}); err != nil {
+	if _, release, err := leader.Snapshot(&wire, ReplicaOptions{}); err != nil {
 		f.Fatal(err)
+	} else {
+		release()
 	}
 	leader.Close()
 
@@ -256,8 +258,10 @@ func FuzzDBApplySnapshot(f *testing.F) {
 	}
 
 	var wire bytes.Buffer
-	if _, err := leader.Snapshot(&wire, ReplicaOptions{}); err != nil {
+	if _, release, err := leader.Snapshot(&wire, ReplicaOptions{}); err != nil {
 		f.Fatal(err)
+	} else {
+		release()
 	}
 	leader.Close()
 

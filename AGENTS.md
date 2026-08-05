@@ -126,6 +126,20 @@ snapshot of a store whose active log is empty, which is refused if that log has
 since frozen. `TestDBSnapshotOfAnEmptyStore` is the exception,
 `TestDBTailCrossesFrozenLogs` is the rule.
 
+**A hold pins from a follower's log onwards, not just that log.** Holding one at
+a time looks like enough and is not: a follower walks forward through the logs,
+and the newest frozen ones are exactly what merging takes first, so it would be
+reading into a run being rewritten as it went. `holdFloor` is the oldest held id
+and `pickMerge` will not touch anything from there on.
+`TestDBFollowIsNotStrandedByAMerge` streams against a store that is being written
+and merged throughout; without the floor it is knocked off within a second.
+
+**`Follow` adopts the hold rather than the caller releasing it.** The caller
+cannot tell when `Follow` has taken its own, and letting go first leaves the log
+the stream starts from unheld — for however long that goroutine takes to be
+scheduled, which on one core is long enough to lose it every time. That is why
+`Follow` takes the release as an argument and calls it after holding.
+
 **A `DB` follower's position is never more durable than the records it claims.**
 `writeApplied` syncs only under `SyncAlways`, which is the policy that has
 already synced the records. Syncing it under `SyncNever` — which it did, until a
@@ -451,22 +465,23 @@ a crash survivable and none of them show up in the result of a call.
 Replication is finished in both halves, for a single store and for a `DB`. What
 is left is the operational apparatus around it, and none of it is small.
 
-**A replication slot**, or something like one, is the biggest gap. A follower
-that falls behind far enough for the log it was reading to be merged away has to
-take a whole new snapshot, and nothing here holds a log open for it. Worse, a
-follower that has *caught up* is not safe either: when the log being written is
-empty it rests at the end of the last frozen log, and a merge can take that one
-as well. It is only out of reach while the store is written steadily, since it
-then rests inside the log being written.
+**Carrying a stranded position forward** is what is left of the retention
+problem. `Hold` covers a follower that is connected — `Snapshot` takes one and
+`Follow` adopts it and moves it forward — but a follower that was away while the
+merging happened still has to take a whole new snapshot.
 
-Three tests had to turn merging off to assert "this needed no new snapshot", and
-that is the honest measure of the gap rather than a testing inconvenience.
-PostgreSQL's answer is a slot, and it costs the leader unbounded disk when a
-follower dies quietly, which is why it is a decision rather than an obvious
-improvement. The cheaper half might be worth doing first: a merge already writes
-its victims out oldest-first and in order, so it knows the offset in its output
-where each input log's records end, and recording that would let a position at
-the end of a merged log be mapped forward instead of refused.
+The cheaper half of a fix is already sitting there: a merge writes its victims
+out oldest-first and in order, so it knows the offset in its output where each
+input log's records end. Recording that would let a position in a merged log be
+mapped forward instead of refused. What makes it more than an afternoon is that
+the mappings have to survive a restart and to chain, since a merged log is
+merged again later, and something has to eventually forget them.
+
+The same missing fact is what keeps `db.batch` refusing a position at the start
+of a frozen log. That refusal is only needed because a frozen log may have been
+merged and be a different file behind the same name — a segment that was never a
+merge output has the contents it has always had, and the position would be safe.
+Knowing which is which across a restart needs the same durable note.
 
 **Semi-synchronous replication.** Everything here is asynchronous: a write
 returns as soon as the leader has it, and a leader that dies loses whatever its

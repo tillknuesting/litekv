@@ -579,8 +579,8 @@ protocol can make it. Replication is therefore a snapshot and then the tail afte
 
 ```go
 // the leader
-at, err := leader.Snapshot(w, litekv.ReplicaOptions{})   // the live records
-at, err = leader.Follow(at, send, stop, litekv.ReplicaOptions{})
+at, release, err := leader.Snapshot(w, litekv.ReplicaOptions{})  // the live records
+at, err = leader.Follow(at, release, send, stop, litekv.ReplicaOptions{})
 
 // the follower
 err = replica.ApplySnapshot(at, r, litekv.ReplicaOptions{})
@@ -632,12 +632,43 @@ start of that log. Used before the log fills it is fine, because a log being wri
 the log fills and freezes first, the leader says `ErrorDiverged` rather than guess, and the follower
 takes another snapshot.
 
-**A follower must always be able to take another snapshot.** That is not only for the case above. A
-follower that has caught up rests wherever it read last, and when the log being written is empty that is
-the end of the last frozen log — which a merge may take. So an idle follower can be stranded by routine
-merging, and one that falls behind past a merge certainly is. Without something like PostgreSQL's
-replication slots holding a log open, a lagging follower cannot be caught up, only replaced, and the
-loop that follows a `DB` has to be written with that in it. The one in `example/` is.
+### Holding the logs a follower still needs
+
+Without something holding them, a follower is at the mercy of the merging going on underneath it. One
+that has fallen behind is reading a frozen log and a merge can take it; one that has caught up rests
+wherever it read last, which when the log being written is empty is the end of the last frozen log — and
+a merge can take that too. Either way the answer is `ErrorDiverged` and a snapshot of the whole store,
+which for an idle follower is a routine and expensive surprise.
+
+So `Snapshot` holds the log its position names, and every log after it, and hands that hold to `Follow`,
+which takes one of its own and then moves it forward as it reads:
+
+```go
+at, release, err := leader.Snapshot(w, opts)  // holds from here on
+...                                            // ship it, however long that takes
+leader.Follow(at, release, send, stop, opts)   // takes over, and the hold follows the stream
+```
+
+From that log onwards, and not only that log: a follower walks forward through the logs, and the newest
+frozen ones are exactly what merging takes first, so pinning one at a time would leave it reading into a
+run being rewritten as it went. This is what PostgreSQL calls a replication slot, and it pins the same
+way. `Hold` is exported for a leader answering with `Since` rather than holding a connection open.
+
+The handover matters and is the one place it can be got wrong. `Follow` takes its own hold before
+calling the one it was given, so the log the stream starts from is never unheld for an instant.
+Releasing the snapshot's hold yourself and then calling `Follow` leaves a gap — on a machine with one
+core, however long it takes that goroutine to be scheduled, which is long enough to lose it every time.
+
+**What it costs is logs.** Everything written since the oldest follower's position stays on the disk,
+unmerged, and every lookup asks each of those logs in turn. A follower that goes quiet without releasing
+leaves the leader carrying them indefinitely. That is why this is a hold with a release rather than a
+list of followers the leader keeps: nothing here pins a disk for a follower that has gone away. `Merge`
+ignores holds — it is an explicit request to compact the whole store, and a follower reading one of
+those logs will have to take a new snapshot.
+
+**A follower must still always be able to take another snapshot.** A hold covers a follower that is
+connected. One that was away while the merging happened, or whose hold was released, is stranded exactly
+as before, and the loop that follows a `DB` has to be written with that in it. The one in `example/` is.
 
 ### What replicating a DB costs
 

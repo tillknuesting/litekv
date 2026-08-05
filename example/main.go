@@ -387,8 +387,13 @@ func main() {
 	// A follower with no position needs a snapshot: the live records, and the
 	// position they are current as of.
 	var snapshot bytes.Buffer
-	at, err := db.Snapshot(&snapshot, litekv.ReplicaOptions{})
+
+	// Snapshot holds the log its position names, and every log after it, so
+	// that merging cannot take the follower's starting point away while the
+	// snapshot is being shipped. Shipping one takes as long as it takes.
+	at, release, err := db.Snapshot(&snapshot, litekv.ReplicaOptions{})
 	must(err)
+
 	must(replicaDB.ApplySnapshot(at, &snapshot, litekv.ReplicaOptions{}))
 
 	// Len counts tombstones as well as live keys, and a snapshot carries no
@@ -443,7 +448,11 @@ func main() {
 	streamed := make(chan error, 1)
 
 	go func() {
-		_, err := db.Follow(replicaDB.Applied(), func(batch []byte, next litekv.DBPosition) error {
+		// The snapshot's hold is handed to Follow, which takes one of its own
+		// before letting it go and then moves it forward as it reads. Left in
+		// place it would pin every log written since, and the leader would
+		// never merge again.
+		_, err := db.Follow(replicaDB.Applied(), release, func(batch []byte, next litekv.DBPosition) error {
 			_, err := replicaDB.Apply(replicaDB.Applied(), next, bytes.NewReader(batch), litekv.ReplicaOptions{})
 			return err
 		}, stopDB, litekv.ReplicaOptions{})

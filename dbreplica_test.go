@@ -28,7 +28,9 @@ func replicaOf(t *testing.T, db *DB, opts ReplicaOptions) (*KeyValueStore, DBPos
 
 	var wire bytes.Buffer
 
-	at, err := db.Snapshot(&wire, opts)
+	at, releaseAt, err := db.Snapshot(&wire, opts)
+
+	defer releaseAt()
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
@@ -60,7 +62,9 @@ func syncInto(t *testing.T, db *DB, follower *KeyValueStore, pos DBPosition, opt
 		if pos == (DBPosition{}) || errors.Is(err, ErrorDiverged) {
 			wire.Reset()
 
-			at, err := db.Snapshot(&wire, opts)
+			at, releaseAt, err := db.Snapshot(&wire, opts)
+
+			defer releaseAt()
 			if err != nil {
 				t.Fatalf("Snapshot: %v", err)
 			}
@@ -232,10 +236,11 @@ func TestDBSnapshotKeepsWritingCheck(t *testing.T) {
 	}
 
 	var wire bytes.Buffer
-	at, err := db.Snapshot(&wire, ReplicaOptions{})
+	at, releaseAt, err := db.Snapshot(&wire, ReplicaOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer releaseAt()
 
 	// Written after the snapshot was taken, so none of it may be in it.
 	for i := 0; i < 100; i++ {
@@ -462,10 +467,12 @@ func TestDBSnapshotOfAnEmptyStore(t *testing.T) {
 	defer db.Close()
 
 	var wire bytes.Buffer
-	at, err := db.Snapshot(&wire, ReplicaOptions{})
+	at, releaseAt, err := db.Snapshot(&wire, ReplicaOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer releaseAt()
+
 	if wire.Len() != 0 {
 		t.Errorf("a snapshot of an empty store carried %d bytes", wire.Len())
 	}
@@ -663,7 +670,9 @@ func followDB(t *testing.T, leader, follower *DB, opts ReplicaOptions) (resynced
 		if pos == (DBPosition{}) || errors.Is(err, ErrorDiverged) {
 			wire.Reset()
 
-			at, err := leader.Snapshot(&wire, opts)
+			at, releaseAt, err := leader.Snapshot(&wire, opts)
+
+			defer releaseAt()
 			if err != nil {
 				t.Fatalf("Snapshot: %v", err)
 			}
@@ -1152,10 +1161,11 @@ func TestDBFollowerStreams(t *testing.T) {
 
 	// A snapshot to start from, taken before anything is streamed.
 	var snapshot bytes.Buffer
-	at, err := leader.Snapshot(&snapshot, ReplicaOptions{})
+	at, releaseAt, err := leader.Snapshot(&snapshot, ReplicaOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer releaseAt()
 	if err := follower.ApplySnapshot(at, &snapshot, ReplicaOptions{}); err != nil {
 		t.Fatal(err)
 	}
@@ -1188,7 +1198,7 @@ func TestDBFollowerStreams(t *testing.T) {
 		// follower. This is the loop a real one runs.
 		pos := at
 		for {
-			if _, err := leader.Follow(pos, send, done, ReplicaOptions{}); !errors.Is(err, ErrorDiverged) {
+			if _, err := leader.Follow(pos, nil, send, done, ReplicaOptions{}); !errors.Is(err, ErrorDiverged) {
 				failed <- err
 				return
 			}
@@ -1196,11 +1206,12 @@ func TestDBFollowerStreams(t *testing.T) {
 
 			var fresh bytes.Buffer
 
-			resumeAt, err := leader.Snapshot(&fresh, ReplicaOptions{})
+			resumeAt, releaseResume, err := leader.Snapshot(&fresh, ReplicaOptions{})
 			if err != nil {
 				failed <- err
 				return
 			}
+			defer releaseResume()
 			if err := follower.ApplySnapshot(resumeAt, &fresh, ReplicaOptions{}); err != nil {
 				failed <- err
 				return
@@ -1365,10 +1376,11 @@ func TestDBFollowerWritesRecordsBeforeThePosition(t *testing.T) {
 	defer follower.Close()
 
 	var wire bytes.Buffer
-	at, err := leader.Snapshot(&wire, ReplicaOptions{})
+	at, releaseAt, err := leader.Snapshot(&wire, ReplicaOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer releaseAt()
 
 	watcher.reset()
 	if err := follower.ApplySnapshot(at, &wire, ReplicaOptions{}); err != nil {
@@ -1522,10 +1534,11 @@ func TestDBFollowerRefusesATruncatedSnapshot(t *testing.T) {
 	}
 
 	var wire bytes.Buffer
-	at, err := leader.Snapshot(&wire, ReplicaOptions{})
+	at, releaseAt, err := leader.Snapshot(&wire, ReplicaOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer releaseAt()
 	whole := wire.Bytes()
 
 	follower, err := OpenDB(t.TempDir(), smallSegments(4096))
@@ -1751,7 +1764,7 @@ func TestDBSnapshotReportsADisk(t *testing.T) {
 	watcher.refuseReads(oldest, 0)
 
 	var wire bytes.Buffer
-	if _, err := db.Snapshot(&wire, ReplicaOptions{}); !errors.Is(err, errDiskFailed) {
+	if _, _, err := db.Snapshot(&wire, ReplicaOptions{}); !errors.Is(err, errDiskFailed) {
 		t.Fatalf("a snapshot over a refusing disk reported '%v', want the disk's error", err)
 	}
 
@@ -1790,18 +1803,23 @@ func BenchmarkDBSnapshot(b *testing.B) {
 	}
 
 	var sized bytes.Buffer
-	if _, err := db.Snapshot(&sized, ReplicaOptions{}); err != nil {
+
+	_, release, err := db.Snapshot(&sized, ReplicaOptions{})
+	if err != nil {
 		b.Fatal(err)
 	}
+	release()
 
 	b.SetBytes(int64(sized.Len()))
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		if _, err := db.Snapshot(io.Discard, ReplicaOptions{}); err != nil {
+		_, release, err := db.Snapshot(io.Discard, ReplicaOptions{})
+		if err != nil {
 			b.Fatal(err)
 		}
+		release()
 	}
 
 	b.StopTimer()
@@ -1828,10 +1846,13 @@ func BenchmarkDBFollowerApply(b *testing.B) {
 			}
 
 			var wire bytes.Buffer
-			at, err := leader.Snapshot(&wire, ReplicaOptions{})
+
+			at, release, err := leader.Snapshot(&wire, ReplicaOptions{})
 			if err != nil {
 				b.Fatal(err)
 			}
+			defer release()
+
 			snapshot := wire.Bytes()
 
 			follower, err := OpenDB(b.TempDir(), DBOptions{Sync: SyncNever, SegmentSize: 4 << 20, MergeTrigger: 1})
@@ -2001,4 +2022,400 @@ func TestDBFollowerResetDropsThePositionFirst(t *testing.T) {
 		t.Error("a reset follower carried on from a position instead of taking a snapshot")
 	}
 	sameStores(t, leader, reopened, nil)
+}
+
+// holdFrozen picks a frozen log, counting back from the oldest, and holds it —
+// checking that there are enough logs and taking the hold under the same lock,
+// writing more through more() until there are.
+//
+// Every part of that matters. Picking a log and then holding it is a race: a
+// merge can take it in the gap, and the position built from it would name
+// contents that are already gone. Counting the logs and then picking is the
+// same race one step earlier, since merging is running the whole time and can
+// collapse the store to a single log between the two. Snapshot does it this way
+// for the same reason.
+//
+// A negative index counts down from the newest instead of up from the oldest.
+func holdFrozen(t *testing.T, db *DB, fromOldest int, more func()) (DBPosition, func()) {
+	t.Helper()
+
+	deadline := time.Now().Add(20 * time.Second)
+
+	for {
+		pos, release, ok := tryHoldFrozen(db, fromOldest)
+		if ok {
+			return pos, release
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("never had a log at %d from the oldest to hold", fromOldest)
+		}
+		more()
+	}
+}
+
+// tryHoldFrozen is one attempt, with the lock held throughout.
+func tryHoldFrozen(db *DB, fromOldest int) (DBPosition, func(), bool) {
+	db.mergeMu.Lock()
+	defer db.mergeMu.Unlock()
+
+	db.mu.RLock()
+
+	want := len(db.frozen) - 1 - fromOldest
+	if fromOldest < 0 {
+		want = 0
+	}
+	if want < 0 || want >= len(db.frozen) {
+		db.mu.RUnlock()
+		return DBPosition{}, nil, false
+	}
+
+	seg := db.frozen[want]
+	record, raw, err := readRecordAt(seg.file, seg.bytes, 0)
+	id := seg.id()
+	db.mu.RUnlock()
+
+	if err != nil {
+		return DBPosition{}, nil, false
+	}
+
+	pos := DBPosition{Segment: id, Log: Position{Offset: int64(len(raw)), Last: 0, Crc: record.Crc}}
+	return pos, db.hold(pos), true
+}
+
+// TestDBHoldKeepsALogFromMerging checks the thing a hold is for: the log a
+// follower is reading stays where it is, and the position naming it goes on
+// working, however much merging the store does around it.
+func TestDBHoldKeepsALogFromMerging(t *testing.T) {
+	db, err := OpenDB(t.TempDir(), DBOptions{Sync: SyncNever, SegmentSize: 512})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// The same few keys over and over, so merging has plenty to do.
+	round := 0
+	write := func(int) {
+		for _, key := range []string{"alpha", "beta", "gamma"} {
+			if err := db.Write([]byte(key), []byte(fmt.Sprintf("%s-%03d", key, round))); err != nil {
+				t.Fatal(err)
+			}
+		}
+		round++
+	}
+	for round < 40 {
+		write(0)
+	}
+
+	// Not the oldest log, but one with an older log beneath it: a hold has to
+	// pin the log it names as well as the ones after it, and the oldest has
+	// nothing to be merged with, so holding that one would not tell the
+	// difference.
+	held, release := holdFrozen(t, db, 1, func() { write(0) })
+
+	// Enough writing and merging to have taken that log several times over.
+	for i := 0; i < 200; i++ {
+		write(0)
+	}
+
+	for attempt := 0; attempt < 50; attempt++ {
+		if _, err := db.Since(held, io.Discard, ReplicaOptions{}); err != nil {
+			t.Fatalf("a held position stopped working: %v", err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// And a follower reading from it gets the whole store, which is the point
+	// of the position still being good.
+	follower := &KeyValueStore{}
+	if _, err := follower.Apply(Position{}, bytes.NewReader(nil), ReplicaOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	tailInto(t, db, follower, held, ReplicaOptions{})
+
+	for _, key := range []string{"alpha", "beta", "gamma"} {
+		want := fmt.Sprintf("%s-%03d", key, round-1)
+		got, err := follower.Read([]byte(key))
+		if err != nil {
+			t.Fatalf("%s: %v", key, err)
+		}
+		if string(got) != want {
+			t.Errorf("%s reads as %q on the follower, want %q", key, got, want)
+		}
+	}
+
+	// Letting go lets the merging that was blocked happen.
+	before := db.Segments()
+	release()
+	release() // releasing twice is harmless
+
+	deadline := time.Now().Add(10 * time.Second)
+	for db.Segments() >= before && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := db.Segments(); got >= before {
+		t.Errorf("%d logs after the hold was released, want fewer than the %d it was blocking at", got, before)
+	}
+}
+
+// TestDBHoldIsCounted checks that two followers on one log both have to let go
+// before merging comes back, which is what a leader with more than one of them
+// needs.
+func TestDBHoldIsCounted(t *testing.T) {
+	db, err := OpenDB(t.TempDir(), DBOptions{Sync: SyncNever, SegmentSize: 512})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	write := func(from, to int) {
+		t.Helper()
+		for round := from; round < to; round++ {
+			for _, key := range []string{"alpha", "beta"} {
+				if err := db.Write([]byte(key), []byte(fmt.Sprintf("%s-%03d", key, round))); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+
+	settle := func() int {
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			was := db.Segments()
+			time.Sleep(20 * time.Millisecond)
+			if db.Segments() == was || time.Now().After(deadline) {
+				return was
+			}
+		}
+	}
+
+	write(0, 60)
+
+	// Held before anything is allowed to settle, and picked inside the same
+	// lock: picking a log and then holding it races the merging that is already
+	// running.
+	at, first := holdFrozen(t, db, 0, func() { write(0, 1) })
+	second := db.Hold(at)
+
+	write(60, 200)
+	held := settle()
+
+	first()
+	write(200, 260)
+	stillHeld := settle()
+
+	if _, err := db.Since(at, io.Discard, ReplicaOptions{}); err != nil {
+		t.Errorf("the held log was merged while one of its two holders still had it: %v", err)
+	}
+	if stillHeld < held {
+		t.Errorf("merging resumed at %d logs while one of two holders still had it, from %d", stillHeld, held)
+	}
+
+	second()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for db.Segments() >= stillHeld && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := db.Segments(); got >= stillHeld {
+		t.Errorf("%d logs after both holders let go, want fewer than the %d they were holding at", got, stillHeld)
+	}
+}
+
+// TestDBFollowIsNotStrandedByAMerge is the case the hold exists for, end to
+// end: a stream running against a store that is being written to and merged
+// throughout, which without a hold is knocked off its position sooner or later
+// and has to take a whole new snapshot.
+func TestDBFollowIsNotStrandedByAMerge(t *testing.T) {
+	leader, err := OpenDB(t.TempDir(), DBOptions{Sync: SyncNever, SegmentSize: 400})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer leader.Close()
+
+	follower, err := OpenDB(t.TempDir(), DBOptions{Sync: SyncNever, SegmentSize: 600})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer follower.Close()
+
+	// Something in the store before the snapshot, so the position it comes with
+	// names a record. A snapshot of a store whose active log is empty has
+	// nowhere to point but the start of that log, and that position stops being
+	// checkable the moment the log freezes — which on one core is before this
+	// goroutine is next scheduled.
+	for i := 0; i < 20; i++ {
+		if err := leader.Write([]byte(fmt.Sprintf("early-%02d", i)), []byte("value")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var wire bytes.Buffer
+	at, releaseAt, err := leader.Snapshot(&wire, ReplicaOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := follower.ApplySnapshot(at, &wire, ReplicaOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	failed := make(chan error, 1)
+
+	// The snapshot's hold goes to Follow, which takes one of its own before
+	// letting this one go. Releasing it here instead leaves a moment with the
+	// log the stream starts from unheld — which on one core is however long the
+	// goroutine takes to be scheduled, and is lost every time.
+	go func() {
+		_, err := leader.Follow(at, releaseAt, func(batch []byte, next DBPosition) error {
+			_, err := follower.Apply(follower.Applied(), next, bytes.NewReader(batch), ReplicaOptions{})
+			return err
+		}, done, ReplicaOptions{})
+		failed <- err
+	}()
+
+	// Write in bursts with pauses between them, so the stream spends time
+	// caught up and waiting — which is exactly when it is resting on a log that
+	// merging would otherwise take.
+	live := map[string]string{}
+	for burst := 0; burst < 40; burst++ {
+		for i := 0; i < 20; i++ {
+			key := fmt.Sprintf("key-%02d", i)
+			value := fmt.Sprintf("value-%d-%d", burst, i)
+			if err := leader.Write([]byte(key), []byte(value)); err != nil {
+				t.Fatal(err)
+			}
+			live[key] = value
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	deadline := time.Now().Add(20 * time.Second)
+	for follower.Applied() != leader.Position() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+
+	close(done)
+
+	if err := <-failed; err != nil {
+		t.Fatalf("the stream was stranded: %v", err)
+	}
+
+	for key, want := range live {
+		got, err := follower.Read([]byte(key))
+		if err != nil {
+			t.Fatalf("%s: %v", key, err)
+		}
+		if string(got) != want {
+			t.Errorf("%s is %q on the follower, want %q", key, got, want)
+		}
+	}
+	// Nothing is held now, so merging is free to catch up. Waiting for it to
+	// settle is the only honest way to ask: merges run in the background and
+	// there is nothing to assert about when.
+	deadline = time.Now().Add(20 * time.Second)
+	for {
+		was := leader.Segments()
+		time.Sleep(20 * time.Millisecond)
+		if leader.Segments() == was || time.Now().After(deadline) {
+			break
+		}
+	}
+
+	leader.mu.RLock()
+	stillHeld := len(leader.held)
+	leader.mu.RUnlock()
+
+	logs := leader.Segments()
+	t.Logf("the leader settled at %d logs after 800 writes, and the stream was never knocked off", logs)
+
+	if stillHeld != 0 {
+		t.Errorf("%d logs are still held after the stream ended: %v", stillHeld, leader.held)
+	}
+	if logs > 20 {
+		t.Errorf("%d logs once nothing is held, which is not a store that merged", logs)
+	}
+}
+
+// TestDBHoldPinsFromTheOldestHolder checks that two followers at different
+// places pin from the older of them, not the newer. Taking the newest would
+// leave the log the slower follower is still reading free to be merged, which
+// is the reader a hold exists for.
+func TestDBHoldPinsFromTheOldestHolder(t *testing.T) {
+	db, err := OpenDB(t.TempDir(), DBOptions{Sync: SyncNever, SegmentSize: 512})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	write := func(rounds int) {
+		t.Helper()
+		for round := 0; round < rounds; round++ {
+			for _, key := range []string{"alpha", "beta"} {
+				if err := db.Write([]byte(key), []byte(fmt.Sprintf("%s-%03d", key, round))); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+
+	settle := func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			was := db.Segments()
+			time.Sleep(20 * time.Millisecond)
+			if db.Segments() == was || time.Now().After(deadline) {
+				return
+			}
+		}
+	}
+
+	usable := func(pos DBPosition) bool {
+		_, err := db.Since(pos, io.Discard, ReplicaOptions{})
+		return err == nil
+	}
+
+	// The slow follower goes first, and is held before anything is allowed to
+	// settle: picking a log and then waiting is a race with the merging that is
+	// already running, and there may be only one log left by the time it stops.
+	write(60)
+
+	behindAt, slow := holdFrozen(t, db, 0, func() { write(1) })
+	behind := behindAt.Segment
+	defer slow()
+
+	// Now logs pile up behind the hold rather than being merged away, so there
+	// is something newer to be the second follower.
+	write(200)
+	settle()
+
+	aheadAt, quick := holdFrozen(t, db, -1, func() { write(1) }) // the newest
+	ahead := aheadAt.Segment
+	if ahead == behind {
+		t.Fatalf("no newer log to hold: %d is the one already held", ahead)
+	}
+
+	write(400)
+	settle()
+
+	// With the floor at the older of the two, both positions still work. Taking
+	// the newer as the floor would leave everything older than it — the slow
+	// follower's log among them — free to be merged, and that log would keep
+	// its id while becoming a different file.
+	if !usable(behindAt) {
+		t.Errorf("the position in log %d stopped working while the follower behind was reading it", behind)
+	}
+	if !usable(aheadAt) {
+		t.Errorf("the position in log %d stopped working while a follower was reading it", ahead)
+	}
+
+	// And the follower that is ahead letting go changes nothing, because the
+	// floor was never it.
+	quick()
+	write(500)
+	settle()
+
+	if !usable(behindAt) {
+		t.Errorf("the position in log %d stopped working after only the follower ahead of it let go", behind)
+	}
 }
