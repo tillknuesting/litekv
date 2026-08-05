@@ -1145,21 +1145,35 @@ func TestDBTiers(t *testing.T) {
 
 	db.mu.RLock()
 	var sizes []int64
-	tiers := map[int]int{}
+	var classes []int
 	for _, seg := range db.frozen {
 		sizes = append(sizes, seg.bytes)
-		tiers[sizeTier(seg.bytes, 32<<10)]++
+		classes = append(classes, sizeTier(seg.bytes, 32<<10))
 	}
 	db.mu.RUnlock()
 
-	t.Logf("%d frozen logs of sizes %v, in %d size classes", len(sizes), sizes, len(tiers))
+	t.Logf("%d frozen logs of sizes %v, in size classes %v", len(sizes), sizes, classes)
 
-	// With the trigger at two, no size class may hold two logs once merging has
-	// settled: they would have been merged.
-	for tier, count := range tiers {
-		if count >= 2 {
-			t.Errorf("size class %d still holds %d logs", tier, count)
+	// With the trigger at two, no contiguous run of one size class may hold two
+	// logs once merging has settled: a run is what pickMerge looks for and what
+	// the loop above drained.
+	//
+	// Contiguous is the word that matters, and asserting on the count per class
+	// instead is wrong. Two logs of a size with a log of another size between
+	// them are not a run, and they are left alone on purpose: merging across a
+	// gap would put records of different ages into one log, and the order logs
+	// are asked in is the only thing deciding which version of a key wins. That
+	// arrangement is uncommon but perfectly legal, and a count-per-class check
+	// calls it a failure about one run in thirty.
+	for i := 0; i < len(classes); {
+		j := i
+		for j < len(classes) && classes[j] == classes[i] {
+			j++
 		}
+		if j-i >= 2 {
+			t.Errorf("size class %d holds a run of %d logs, which should have merged: %v", classes[i], j-i, classes)
+		}
+		i = j
 	}
 	// And the whole store is a handful of logs, not one per rotation.
 	if len(sizes) > 6 {
