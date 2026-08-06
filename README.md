@@ -861,6 +861,49 @@ The position file is synced only under `SyncAlways`. It must never be more durab
 claims — a position that survived a power cut naming records that did not would be a follower quietly
 missing data, where the other way round costs one batch applied twice.
 
+### One writer in front of many callers
+
+Writes take every shard of the lock, so two goroutines writing do not merely fail to go faster: they
+halve the store's throughput. A server with a handler per request is exactly that shape. `Writer` puts
+one goroutine in front of the store and lets the handlers queue behind it:
+
+```go
+w := db.Writer(litekv.WriterOptions{})
+defer w.Close()
+
+err := w.Write(key, value)   // blocks until stored, as db.Write does
+```
+
+Its methods block until the records are stored, including the wait for the disk the sync policy asks
+for, so a caller has the same promise it always had and may reuse its slices as soon as one returns.
+
+What makes it worth more than an orderly queue is **group commit**: everything waiting when the writer
+wakes goes down as one batch, so a hundred callers cost one write to the log and one sync between them.
+It never waits for a group to fill — a store nobody else is writing to is one handoff behind a direct
+write and nothing else — so the busier the store, the larger the groups, which is the right way round.
+
+| ten goroutines writing 128 bytes | direct  | through a `Writer` |
+| -------------------------------- | ------- | ------------------ |
+| `SyncAlways`                     | 4.2 ms  | 0.80 ms            |
+| `SyncEvery`                      | 4.0 µs  | 2.1 µs             |
+| `SyncNever`, with a file         | 5.9 µs  | 2.4 µs             |
+| in memory, no file               | 0.53 µs | 1.2 µs             |
+
+The last row is the one to read carefully. What the queue amortizes is the cost of a write to the log,
+and when there is no log there is nothing to amortize — only a channel handoff where there used to be a
+contended lock, which is the worse of the two. **Put a `Writer` in front of a store with a file, not in
+front of one in memory**, and the more the sync policy waits for the disk the more it is worth.
+
+A group is a batch, so it is atomic: a crash loses the whole group or none of it, and no caller is ever
+told a write failed while its record survives. A caller's own `WriteBatch` keeps its atomicity inside
+the group, its records together and in order. Everything else the store would have said still comes
+back — a fenced store still reports `ErrorFenced` through a `Writer`, because it is a queue in front of
+the same call and not a different one.
+
+`Close` writes what is already queued and answers those callers before the goroutine goes; anything
+arriving afterwards reports `ErrorClosed`. It does not close the store, which is yours to close after
+it.
+
 ## Concurrency
 
 `KeyValueStore` embeds a reader-writer lock and every method takes it, so the methods are safe to call
@@ -1125,7 +1168,8 @@ anything either.
 - **One writer at a time, and a second one costs.** Writes take every shard of the lock, so they
   serialize with each other, and for a single `KeyValueStore` with compaction as well. Two goroutines
   writing do not merely fail to go faster, they halve the store's throughput — 114 ns a write becomes
-  228 — and more of them change little after that. Write from one goroutine.
+  228 — and more of them change little after that. Write from one goroutine, or put a `Writer` in front
+  of the store and let it be the one goroutine: see "One writer in front of many callers".
 - **Merging still rewrites.** Merging by size bounds the cost at about log₄ of the store rather than
   letting it grow with it, but every record is still rewritten a few times over its life. An append-only
   workload should turn merging off rather than pay for it.

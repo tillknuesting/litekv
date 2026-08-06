@@ -35,6 +35,7 @@ left to be inferred:
 | `db.go`      | `DB`: segments, rotation, merging by size                                 |
 | `segment.go` | the two kinds of segment, and reading a log without holding it in memory  |
 | `batch.go`   | write batches: the marker, and what makes one all or nothing             |
+| `writer.go`  | one writer goroutine in front of many callers, and group commit          |
 | `hint.go`    | the index of a frozen log, written beside it                             |
 | `bloom.go`   | the filter in front of that index, once a log is big enough to want one   |
 | `replica.go` | `Position`, shipping the log to a follower: `Since`, `Follow`, `Apply`, and `Reached` |
@@ -180,6 +181,21 @@ all write it, each reading its own snapshot of the three numbers in it, so two
 of them interleaving would put one path's stale copy of a field on the disk
 underneath the other path's fresh one. `stateMu` is held across the read and the
 write.
+
+**A Writer answers everybody it accepted.** A caller that got onto the queue is
+written and answered, including by a `Close` on its way out: `Close` takes the
+lock that guards the queue, closes it, and the goroutine drains what is left
+before it goes. That is why `submit` waits on its own channel with nothing to
+time it out — being left there would be the one unforgivable thing a queue can
+do. `TestWriterCloseDrainsTheQueue` closes with a caller inside the store and
+five more behind it.
+
+**A group is a batch, so nobody is told a write failed while it survives.** The
+records of a group go down behind one marker, which means a crash loses the
+group or none of it. Written as several records instead, a torn write would keep
+the first few while every caller in the group heard an error — records nobody
+was told about, which is the worse half of at-least-once with none of the
+comfort. `TestWriterGroupIsOneBatchInTheLog`.
 
 **A batch is whole before any of it is handed over.** The marker says how many
 bytes of records follow it, and `scan` and `scanSegment` check all of them —
@@ -515,6 +531,16 @@ That last one is the reason `advance` exists, and it is caught by the fault
 sweep rather than by any assertion about a call's result: splitting the write in
 two breaks nothing a test can see until a fault lands between the halves.
 
+And seven for the writer, against `writer_test.go`: the writer taking one caller
+at a time, a caller in a group hearing about another write, the group not being
+emptied between writes, a caller's batch flattened to its first record, `Close`
+abandoning what it accepted, a write after `Close` taken anyway, and a delete
+through the writer written as a write. All seven are caught. `Close` survived
+first: the test waited for the answers, so it could not tell a `Close` that waits
+from one that returns and leaves the writer to finish. It asserts the ordering
+now — that `Close` has not returned while a caller it accepted cannot yet have
+been written, and that everything is written by the time it has.
+
 And thirteen for write batches, against `batch_test.go`: an incomplete batch
 read as far as it goes, a span longer than the log believed, a damaged record
 inside a batch condemning only itself (in memory and again in a frozen log), a
@@ -777,11 +803,21 @@ was cut against, where before there was nothing to look for. It is still not
 free — something has to find it without scanning the log — but the fact the
 scheme needed is now on the disk.
 
-**The server's writer.** Two goroutines writing do not merely fail to go faster,
-they halve throughput: 114 ns a write becomes 228, and more of them change little
-after that. A handler-per-request calling `Write` walks straight into that. One
-writer goroutine behind a queue is the shape, and it is much easier to decide
-before the API exists than after.
+**The server's writer** is done: `Writer`, on both halves, one goroutine behind
+a queue, storing everything waiting as one batch. The numbers are in the README
+and one of them is worth knowing before reaching for it — in front of a store
+with no file it is *slower*, 0.53 µs a write against 1.2, because what a queue
+amortizes is the cost of a write to the log and there is no log. With one it is
+2x under `SyncEvery` and 5.2x under `SyncAlways`, and the ratio grows with the
+sync and with the number of callers, which is the shape group commit always has.
+
+The leader-and-followers arrangement — the first caller waiting becomes the
+writer, writes everybody's records and wakes them, rather than a goroutine of its
+own — would take the uncontended handoff back out and is what RocksDB does. It
+was not built: it costs a leadership handover to keep one caller from writing for
+everybody indefinitely, and the case it wins is the case that should not be using
+a queue at all. Worth doing if a `Writer` in front of an in-memory store ever
+stops being a mistake.
 
 **A batch write** is done: `Batch`, `WriteBatch` on both halves, and a marker
 record opening a span. It cost no new record layout in the end — the marker is

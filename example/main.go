@@ -527,6 +527,29 @@ func main() {
 		streamed <- err
 	}()
 
+	// A Writer is what a server puts in front of the store: one goroutine
+	// writing, everybody else queued behind it, and everything waiting when it
+	// wakes stored as one batch. Two goroutines writing directly do not merely
+	// fail to go faster — they halve the store's throughput.
+	queue := db.Writer(litekv.WriterOptions{})
+
+	var writers sync.WaitGroup
+	for id := 0; id < 4; id++ {
+		writers.Add(1)
+		go func(id int) {
+			defer writers.Done()
+			for i := 0; i < 5; i++ {
+				must(queue.Write([]byte(fmt.Sprintf("queued-%d-%d", id, i)), []byte("value")))
+			}
+		}(id)
+	}
+	writers.Wait()
+
+	// Close writes what is still queued and answers those callers before it
+	// returns. It does not close the store.
+	must(queue.Close())
+	fmt.Println("four goroutines wrote through one writer:", db.Len(), "keys in the store")
+
 	// A DB takes a batch too, and always into one log: rotating is housekeeping
 	// that happens after the records are stored, so a batch is never split
 	// across the log that filled and the one that replaced it.
