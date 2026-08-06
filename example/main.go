@@ -133,6 +133,25 @@ func main() {
 	_, err = kvs.Read([]byte("never written"))
 	fmt.Println("never written:", err)
 
+	// Several records stored together or not at all. A crash part way through
+	// leaves none of them: they go down behind a marker saying how many bytes
+	// to expect, and recovery discards from that marker on unless all of it is
+	// there. It is not a transaction — nothing is read, nothing is isolated,
+	// and there is nothing to roll back afterwards.
+	var moved litekv.Batch
+	moved.Write([]byte("to"), []byte("the value"))
+	moved.Delete([]byte("from"))
+
+	must(kvs.WriteBatch(&moved))
+	fmt.Printf("a batch of %d records went down as one\n", moved.Len())
+
+	value, err = kvs.Read([]byte("to"))
+	must(err)
+	fmt.Println("to =", string(value))
+
+	// The batch is reusable once it has been written.
+	moved.Reset()
+
 	// Every version of every key is still there until compaction.
 	fmt.Println("records before compaction:")
 	must(kvs.PrintAllKeyValuePairs())
@@ -507,6 +526,14 @@ func main() {
 
 		streamed <- err
 	}()
+
+	// A DB takes a batch too, and always into one log: rotating is housekeeping
+	// that happens after the records are stored, so a batch is never split
+	// across the log that filled and the one that replaced it.
+	var together litekv.Batch
+	together.Write([]byte("zeta"), []byte("written with eta"))
+	together.Write([]byte("eta"), []byte("written with zeta"))
+	must(db.WriteBatch(&together))
 
 	must(db.Write([]byte("epsilon"), []byte("streamed across")))
 	waitFor(func() bool {

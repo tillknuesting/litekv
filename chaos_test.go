@@ -103,6 +103,21 @@ func chaosLeader(t *testing.T) *DB {
 		t.Fatal(err)
 	}
 
+	// A write batch or two, so that every fault in the sweeps lands somewhere
+	// near one: a follower that applies half of a batch is a disagreement the
+	// records themselves cannot show, since the ones that arrived read
+	// perfectly well on their own.
+	for round := 0; round < 2; round++ {
+		var b Batch
+		for i := 0; i < 8; i++ {
+			b.Write([]byte(fmt.Sprintf("batched-%d-%d", round, i)), []byte("together"))
+		}
+		b.Delete([]byte(fmt.Sprintf("key-%03d", 190+round)))
+		if err := leader.WriteBatch(&b); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	return leader
 }
 

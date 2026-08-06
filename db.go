@@ -462,6 +462,38 @@ func (db *DB) write(key, value []byte, at time.Time) error {
 	return nil
 }
 
+// WriteBatch stores every record in b, or none of them, on the same terms as
+// KeyValueStore.WriteBatch.
+//
+// A batch always lands in one log. Rotating is housekeeping that happens after
+// the records are stored, as it does for a write, so a batch is never split
+// across the log that filled and the one that replaced it — which matters,
+// because half a batch in a frozen log is exactly what the marker exists to
+// make impossible.
+func (db *DB) WriteBatch(b *Batch) error {
+	db.mu.RLock()
+	if db.closed {
+		db.mu.RUnlock()
+		return ErrorClosed
+	}
+	if db.isFenced() {
+		db.mu.RUnlock()
+		return ErrorFenced
+	}
+
+	active := db.active
+	err := active.kvs.WriteBatch(b)
+	db.mu.RUnlock()
+
+	if err != nil {
+		return err
+	}
+
+	db.notify()
+	db.rotateIfFull(active)
+	return nil
+}
+
 // Delete marks the key deleted, which is a record in the active log like any
 // other. It shadows whatever the older logs hold until a merge drops both.
 func (db *DB) Delete(key []byte) error {

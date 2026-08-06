@@ -25,6 +25,12 @@ const (
 
 	// RecordTypeDeleted represents a deleted record, which is marked as deleted but not removed from the Data slice.
 	RecordTypeDeleted
+
+	// RecordTypeBatch opens a write batch. It holds no key, and its value is
+	// the number of bytes of records that follow it, which is what lets
+	// recovery tell a batch that arrived whole from one a crash cut in half.
+	// Nothing else in the log refers to another record; see batch.go.
+	RecordTypeBatch
 )
 
 // Record versions, and the size of the fixed-width part of each.
@@ -827,12 +833,38 @@ func decodeHeader(buf []byte) (recordHeader, bool) {
 // *CorruptAtError as soon as a record fails to decode. Callers must hold at
 // least a read lock.
 func (kvs *KeyValueStore) scan(fn func(pos, next int64, r Record) bool) error {
+	size := int64(len(kvs.Data))
+
 	var pos int64
-	for pos < int64(len(kvs.Data)) {
+	for pos < size {
 		record, next, err := parseRecordAt(kvs.Data, pos)
 		if err != nil {
 			return err
 		}
+
+		if record.Type == RecordTypeBatch {
+			from, to, ok := spanAt(record, next, size)
+			if !ok || !kvs.wholeBatch(from, to) {
+				// A batch that is not all here is not here at all, and the log
+				// ends where it opened. Nothing in it has been handed over.
+				return &CorruptAtError{Offset: pos}
+			}
+
+			for at := from; at < to; {
+				inner, after, err := parseRecordAt(kvs.Data, at)
+				if err != nil {
+					return &CorruptAtError{Offset: pos}
+				}
+				if !fn(at, after, inner) {
+					return nil
+				}
+				at = after
+			}
+
+			pos = to
+			continue
+		}
+
 		// By value: handing a *Record to a func value would defeat escape
 		// analysis and put a record on the heap for every one scanned.
 		if !fn(pos, next, record) {
@@ -841,6 +873,35 @@ func (kvs *KeyValueStore) scan(fn func(pos, next int64, r Record) bool) error {
 		pos = next
 	}
 	return nil
+}
+
+// wholeBatch reports whether the records between from and to are all there and
+// all intact, which is what a marker's span claims and the only thing that lets
+// the records inside it be handed to anybody.
+//
+// The checksums are taken here rather than left to the caller, which is a
+// departure from the rest of this walk. A caller that checks them itself — as
+// Recover does — decides where the log ends by the first record it does not
+// like, and inside a batch that is the wrong answer: it would keep the records
+// before the bad one and lose the ones after, which is half a batch, which is
+// the one thing the marker is for. Whole or nothing has to be decided before
+// any of it is yielded, so it is decided here. The cost is that a batch's
+// records are checksummed twice on the paths that check them again.
+func (kvs *KeyValueStore) wholeBatch(from, to int64) bool {
+	for at := from; at < to; {
+		record, next, err := parseRecordAt(kvs.Data, at)
+		if err != nil || next > to {
+			return false
+		}
+		if record.Type == RecordTypeBatch {
+			return false // a batch does not open inside a batch
+		}
+		if record.Crc != checksumSerialized(kvs.Data[at:next]) {
+			return false
+		}
+		at = next
+	}
+	return true
 }
 
 // offsets returns the start offset of every record in the Data slice, in order.
@@ -854,17 +915,15 @@ func (kvs *KeyValueStore) offsets() ([]int64, error) {
 	// wildly high for a store of large values, so cap the head start.
 	offs := make([]int64, 0, min(len(kvs.Data)/headerSize+1, 4096))
 
-	var pos int64
-	for pos < int64(len(kvs.Data)) {
-		_, next, err := parseRecordAt(kvs.Data, pos)
-		if err != nil {
-			return offs, err
-		}
+	// Through scan rather than walking the records here, so that a batch is one
+	// thing to this as well: the offsets are of records, a marker is not one,
+	// and a batch that is not all there ends the walk where it opened.
+	err := kvs.scan(func(pos, next int64, r Record) bool {
 		offs = append(offs, pos)
-		pos = next
-	}
+		return true
+	})
 
-	return offs, nil
+	return offs, err
 }
 
 // SaveIndex serializes the KeyValueStore's Index (a map of keys to their position in the Data byte slice)

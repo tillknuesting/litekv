@@ -81,6 +81,41 @@ err := kvs.ForEach(func(key, value []byte, deleted bool) bool {
 which is why it reports `deleted`. The key and value alias the store's `Data` slice and are only valid
 until the callback returns. `PrintAllKeyValuePairs` is the same walk, printed.
 
+### Several records at once
+
+`Batch` collects records and `WriteBatch` stores all of them or none of them:
+
+```go
+var b litekv.Batch
+b.Write([]byte("to"), []byte("the value"))
+b.Delete([]byte("from"))
+
+err := kvs.WriteBatch(&b)   // or db.WriteBatch(&b)
+```
+
+A crash part way through leaves the store as it was. The records go down behind a **marker** — a record
+holding no key, whose value is the number of bytes of records that follow it — and recovery discards
+from that marker on unless all of it is there and every record in it matches its own checksum. There is
+one write to the log for the whole batch, so a batch of ten records is one chance for the disk to stop
+half way rather than ten, and the marker is what makes that one survivable.
+
+Later records win, as they do in the log itself: writing a key twice leaves the second value, and
+deleting a key written earlier in the same batch leaves it deleted. An empty batch writes nothing. The
+keys and values are not copied when they are added, only when the batch is written, so anything handed
+to a batch must stay unchanged until then — that is the copy the batch exists to save, and `Write`
+still copies before it returns.
+
+**A batch is not a transaction.** Nothing is read, nothing is isolated from a concurrent writer, and
+there is nothing to roll back once it is written. It is one durable, atomic append of several records,
+which is what "or none of them" means here and all it means.
+
+A `DB` always writes a batch into one log: rotating is housekeeping that happens after the records are
+stored, so a batch is never split across the log that filled and the one that replaced it. Over
+replication it crosses whole — a leader cuts its stream at the end of a batch and never inside one,
+taking a batch bigger than the wire's pieces in one go, exactly as it does a record bigger than them.
+Merging drops the markers: by then the records are durable and the merged file is renamed into place
+whole, so the atomicity the marker was carrying is being provided by something else.
+
 ## Durability
 
 The `Data` slice is the whole store, and none of this is required: the zero value keeps everything in
@@ -1029,6 +1064,13 @@ timestamp alone took an in-memory write from roughly 50 ns to 110. A store that 
 exactly the bytes it always did, which is every `KeyValueStore` — only a `DB` numbers its records, and
 only records given an expiry carry one.
 
+A **batch marker** is an ordinary record in one of those layouts, with the record type set to 2, no key,
+and an eight-byte value holding the number of bytes of records that follow it. It needed no layout of
+its own, which is why adding write batches did not add a version: every reader already decodes it, and
+the only thing that changed is what the log walkers do when they see one. A marker holding a key, a
+value that is not eight bytes, or a span that runs past the end of the log is refused like a record
+that will not decode — the log ends there.
+
 The checksum covers everything after itself, so it does not depend on the layout of what follows. Keys
 and values are limited to 4 GiB by the uint32 length fields, and `Write` returns `ErrorRecordTooLarge`
 for anything larger. Every decode validates the declared lengths against the bytes actually present, so
@@ -1056,6 +1098,10 @@ anything either.
 
 ## Limitations
 
+- **A write batch is not a transaction.** It is atomic and durable, and that is the whole of it: there
+  are no reads in it, no isolation from a concurrent writer, and nothing to roll back once it is
+  written. A batch also has to fit in memory twice over — the caller builds it, and the store holds the
+  records it serializes from it — and a reader of a log holds one batch at a time while checking it.
 - **Expiry is checked on read, not swept.** Nothing walks the store looking for records whose time has
   come; they stop answering the moment they are due and the space comes back at the next compaction or
   merge. A store full of expired records is as large as a store full of live ones until then.

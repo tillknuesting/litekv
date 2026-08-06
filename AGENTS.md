@@ -34,6 +34,7 @@ left to be inferred:
 | `file.go`    | durability for one store: `Log`, `Open`, `Attach`, sync policies          |
 | `db.go`      | `DB`: segments, rotation, merging by size                                 |
 | `segment.go` | the two kinds of segment, and reading a log without holding it in memory  |
+| `batch.go`   | write batches: the marker, and what makes one all or nothing             |
 | `hint.go`    | the index of a frozen log, written beside it                             |
 | `bloom.go`   | the filter in front of that index, once a log is big enough to want one   |
 | `replica.go` | `Position`, shipping the log to a follower: `Since`, `Follow`, `Apply`, and `Reached` |
@@ -179,6 +180,42 @@ all write it, each reading its own snapshot of the three numbers in it, so two
 of them interleaving would put one path's stale copy of a field on the disk
 underneath the other path's fresh one. `stateMu` is held across the read and the
 write.
+
+**A batch is whole before any of it is handed over.** The marker says how many
+bytes of records follow it, and `scan` and `scanSegment` check all of them —
+framing and checksums — before yielding the first. Yielding as they go and
+letting the caller stop at a bad record would keep the records before it and
+lose the ones after, which is half a batch, which is the one thing the marker
+exists to prevent. The checksums are therefore taken in the walker rather than
+left to the caller, which is a departure from everything else in this package
+and the reason a batch's records are checksummed twice on the paths that check
+them again. `TestBatchWithADamagedRecordIsDroppedWhole` and
+`TestBatchDamagedInAFrozenLog`.
+
+**Nothing outside the walkers knows a marker exists.** `scan` and `scanSegment`
+yield the records of a batch and never the marker itself, so `ForEach`,
+`Verify`, `Compact`, `latestOffsets`, `offsets`, `indexSegment` and `mergeInto`
+were correct without changes — and, more to the point, cannot be made incorrect
+by someone adding a seventh. A marker that reached one of them would be indexed
+under an empty key. If you add a walk of a log, walk it with one of those two.
+
+**A batch is one write to the log.** Ten records in ten writes would be ten
+places for the disk to stop, and the marker makes that survivable rather than
+free. `appendBatch` serializes the lot, patches the span into the marker, takes
+the marker's checksum, and then writes once.
+`TestBatchInAFileIsOneWrite` counts the writes; `TestBatchTornAtEveryLength`
+cuts that write short at every length there is and holds the store to all of the
+batch or none of it.
+
+**A position never names a record inside a batch.** A leader cuts its stream at
+the end of a record or the end of a whole batch — `unitAt` is the one place that
+decides which — and takes a batch bigger than the wire's pieces in one go, as it
+does a record bigger than them. A follower's `verifyRecords` stops its good
+bytes at the marker until the whole batch has arrived. Both halves matter: the
+leader not cutting is what keeps a follower from ever being offered half a
+batch, and the follower's check is what keeps a connection that died mid-batch
+from applying part of one. `TestBatchCrossesWhole` asserts it after every piece
+of a stream cut into sixty-four byte pieces, not only at the end.
 
 **A record's number is in the record, and only ever goes up.** Merging drops
 records, so a store that counted what it holds would count fewer than the leader
@@ -478,6 +515,18 @@ That last one is the reason `advance` exists, and it is caught by the fault
 sweep rather than by any assertion about a call's result: splitting the write in
 two breaks nothing a test can see until a fault lands between the halves.
 
+And thirteen for write batches, against `batch_test.go`: an incomplete batch
+read as far as it goes, a span longer than the log believed, a damaged record
+inside a batch condemning only itself (in memory and again in a frozen log), a
+frozen log yielding a batch before checking it, a marker handed out as a record,
+a span written before the records are counted, a marker keeping the checksum it
+had before its span, a batch written a record at a time, a refused batch keeping
+what it appended, a leader cutting wherever a record ends, a follower taking the
+records of a batch that has not finished arriving, and a follower not checking
+the records inside one. All thirteen are caught — five of them only after the
+tests grew a damaged batch to go with the torn one, since tearing a write and
+corrupting a byte are different faults and only the first was being made.
+
 And thirteen for the numbering, against `sequence_test.go`: records not numbered
 at all, every record taking the same number, a checksum that does not cover the
 number, a counter allowed to go back down, a batch taken at its last number
@@ -523,6 +572,13 @@ invariant above is phrased as slow-never-wrong rather than as a rule to follow.
 
 ## Traps this codebase has already sprung
 
+- **Damage in a length field tests the framing, not the checksum.** A test that
+  flipped a bit inside a record of a batch reported that a damaged batch was
+  dropped whole — and it was, but by the framing check, because the bit landed
+  in a key length and moved where every following record started. The mutation
+  that removed the checksum inside the walker survived it. Damage the last byte
+  of a value when the checksum is what is being tested; damage a length when the
+  framing is.
 - **A field added to a struct that is compared to its zero value.** `Position`
   gained `Seq`, and five places asking `pos == (Position{})` were really asking
   "does this name a record", which is `pos.Offset == 0`. Four were in the
@@ -727,12 +783,20 @@ after that. A handler-per-request calling `Write` walks straight into that. One
 writer goroutine behind a queue is the shape, and it is much easier to decide
 before the API exists than after.
 
-**A batch write** is the largest thing left in the format, and needs a commit
-marker to be atomic across a crash — so it belongs in the window while format
-changes are cheap. The sequence number went in ahead of it and is the shape to
-copy: a version per combination of optional fields, the offsets in `decodeHeader`
-and nowhere else, and the six scanners left alone because they ask for a record
-rather than reaching into one.
+**A batch write** is done: `Batch`, `WriteBatch` on both halves, and a marker
+record opening a span. It cost no new record layout in the end — the marker is
+an ordinary record with a type of its own — and the six scanners were left alone
+because the framing went into `scan` and `scanSegment` rather than into each of
+them. What it did cost is the first rule in this format where one record's
+meaning depends on another, which is why the walkers now checksum inside a batch
+and nothing else does.
+
+What is left of it, if anyone wants it: a batch has to fit in memory twice over,
+once in the caller's `Batch` and once in the records serialized from it, and a
+reader holds one batch while checking it. Streaming a batch larger than memory
+would need a commit record at the end rather than a marker at the front, which
+is a different format and a worse one for everything else — recovery could no
+longer tell how much to expect, only whether what it found was finished.
 
 The format byte is the cheap part and the semantics are not. "Is this record
 inside a batch that was never committed?" has to be answered by `Recover`,
@@ -800,6 +864,19 @@ For one machine and perhaps a second, none of that fits: two-node Raft gives
 nothing a single node did not have. Promotion by hand with fencing is the honest
 arrangement at that size, which is why fencing is first on the list and
 consensus is not on it.
+
+## Two things called a batch
+
+`Batch` and `WriteBatch` are several records stored together. `ReplicaOptions.
+BatchSize`, `db.batch`, `kvs.batch` and the `batch` argument to `Apply` are a
+run of records crossing a wire. They are unrelated, and both names are the right
+one for their side: every key-value store calls the first a write batch, and the
+second has been called a batch here since before the first existed.
+
+Where a sentence could mean either, this repository says **a write batch** for
+the records and **a batch of the log** for the wire. The code says `unitAt` for
+the thing a wire may not cut through, which is a record or a write batch, and
+that word is deliberate too.
 
 ## Conventions
 

@@ -742,29 +742,62 @@ func (d *diskSegment) batch(pos Position, size int64, dst []byte) ([]byte, Posit
 		return dst[:start], pos, err
 	}
 
-	// Cut at a record boundary: a follower can only take whole records.
+	// Cut at a boundary a follower can rest on: the end of a record, or the end
+	// of a whole write batch. What was read may stop inside either.
 	next := pos
 	for next.Offset-pos.Offset < want {
-		record, end, err := parseRecordAt(dst[start:], next.Offset-pos.Offset)
-		if err != nil {
-			break // the rest of this record did not fit in the batch
+		end, record, at, ok := unitAt(dst[start:], next.Offset-pos.Offset)
+		if !ok {
+			break // the rest of this record, or of this batch, did not fit
 		}
-		next = Position{Offset: pos.Offset + end, Last: next.Offset, Crc: record.Crc, Seq: after(record.Seq)}
+		next = Position{Offset: pos.Offset + end, Last: pos.Offset + at, Crc: record.Crc, Seq: after(record.Seq)}
 	}
 
-	// Not one whole record fitted, which happens when a record is larger than a
-	// batch. It has to go anyway, or a log holding one could never be
-	// replicated at all.
+	// Not one whole unit fitted, which happens when a record — or a batch — is
+	// larger than a batch of the log. It has to go anyway, or a log holding one
+	// could never be replicated at all.
 	if next == pos {
-		record, raw, err := readRecordAt(d.file, d.bytes, pos.Offset)
+		raw, record, at, err := d.unit(pos.Offset)
 		if err != nil {
 			return dst[:start], pos, err
 		}
 		dst = append(dst[:start], raw...)
-		return dst, Position{Offset: pos.Offset + int64(len(raw)), Last: pos.Offset, Crc: record.Crc, Seq: after(record.Seq)}, nil
+		return dst, Position{Offset: pos.Offset + int64(len(raw)), Last: pos.Offset + at, Crc: record.Crc, Seq: after(record.Seq)}, nil
 	}
 
 	return dst[:start+int(next.Offset-pos.Offset)], next, nil
+}
+
+// unit reads one record, or one whole write batch, out of a frozen log,
+// starting at pos. It is what the cut above falls back on when not even one of
+// them fitted in the room a batch had left.
+//
+// The batch is read whole, which is a batch's worth of memory — the same amount
+// the store that wrote it needed to build it, so it is not a new bound.
+func (d *diskSegment) unit(pos int64) (raw []byte, last Record, at int64, err error) {
+	record, head, err := readRecordAt(d.file, d.bytes, pos)
+	if err != nil {
+		return nil, Record{}, 0, err
+	}
+	if record.Type != RecordTypeBatch {
+		return head, record, 0, nil
+	}
+
+	span, ok := markerSpan(record)
+	if !ok || span > d.bytes-(pos+int64(len(head))) {
+		return nil, Record{}, 0, &CorruptAtError{Offset: pos}
+	}
+
+	raw = make([]byte, int64(len(head))+span)
+	if _, err := d.file.ReadAt(raw, pos); err != nil {
+		return nil, Record{}, 0, err
+	}
+
+	end, last, at, ok := unitAt(raw, 0)
+	if !ok || end != int64(len(raw)) {
+		return nil, Record{}, 0, &CorruptAtError{Offset: pos}
+	}
+	return raw, last, at, nil
 }
 
 // Applied is the leader position this store has taken records up to, for a

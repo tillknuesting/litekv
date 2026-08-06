@@ -413,6 +413,41 @@ func scanSegment(file io.ReaderAt, size int64, fn func(pos int64, raw []byte, r 
 			return err
 		}
 
+		if record.Type == RecordTypeBatch {
+			from, to, ok := spanAt(record, pos+int64(total), size)
+			if !ok {
+				return &CorruptAtError{Offset: pos}
+			}
+
+			// The batch is read whole before any of it is handed over, because
+			// whether any of it counts depends on all of it. That is a batch's
+			// worth of memory, which is what the writer needed to build it, so
+			// it is not a new bound on what this package will read.
+			held := make([]byte, to-from)
+			if _, err := file.ReadAt(held, from); err != nil {
+				return endOfLog(err, pos)
+			}
+			if !wholeBatch(held) {
+				return &CorruptAtError{Offset: pos}
+			}
+
+			for at := int64(0); at < int64(len(held)); {
+				inner, after, err := parseRecordAt(held, at)
+				if err != nil {
+					return &CorruptAtError{Offset: pos}
+				}
+				if !fn(from+at, held[at:after], inner) {
+					return nil
+				}
+				at = after
+			}
+
+			// The reader has been left behind by the direct read above.
+			pos = to
+			reader.Reset(io.NewSectionReader(file, pos, size-pos))
+			continue
+		}
+
 		if !fn(pos, buf, record) {
 			return nil
 		}
@@ -421,6 +456,27 @@ func scanSegment(file io.ReaderAt, size int64, fn func(pos int64, raw []byte, r 
 	}
 
 	return nil
+}
+
+// wholeBatch reports whether buf is exactly the records a marker's span
+// claimed: all of them decoding, none of them a marker, and every one matching
+// its own checksum. It is the file-side twin of the check in kv.go, and it is
+// made before any of the records are handed over for the same reason.
+func wholeBatch(buf []byte) bool {
+	for at := int64(0); at < int64(len(buf)); {
+		record, next, err := parseRecordAt(buf, at)
+		if err != nil {
+			return false
+		}
+		if record.Type == RecordTypeBatch {
+			return false // a batch does not open inside a batch
+		}
+		if record.Crc != checksumSerialized(buf[at:next]) {
+			return false
+		}
+		at = next
+	}
+	return true
 }
 
 // endOfLog turns a failure to read into the right kind of error: the log

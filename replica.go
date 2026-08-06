@@ -406,20 +406,21 @@ func (kvs *KeyValueStore) batch(pos Position, size int64, dst []byte) ([]byte, P
 		}
 	}
 
-	// Cut the batch at a record boundary. A follower can only take whole
-	// records, and the last of them is what its next position names. One record
-	// always goes, however large, or a log holding a record bigger than a batch
-	// could never be replicated at all.
+	// Cut at a boundary a follower can rest on: the end of a record, or the end
+	// of a whole write batch, since half a batch is the one thing the marker
+	// exists to stop anybody holding. One unit always goes, however large, or a
+	// log holding a record — or a batch — bigger than a batch of the log could
+	// never be replicated at all.
 	next := pos
 	for next.Offset < here.Offset {
-		record, end, err := parseRecordAt(kvs.Data, next.Offset)
-		if err != nil {
-			return dst, pos, err
+		end, record, at, ok := unitAt(kvs.Data, next.Offset)
+		if !ok {
+			return dst, pos, &CorruptAtError{Offset: next.Offset}
 		}
 		if end-pos.Offset > size && next.Offset > pos.Offset {
 			break
 		}
-		next = Position{Offset: end, Last: next.Offset, Crc: record.Crc, Seq: after(record.Seq)}
+		next = Position{Offset: end, Last: at, Crc: record.Crc, Seq: after(record.Seq)}
 	}
 
 	return append(dst, kvs.Data[pos.Offset:next.Offset]...), next, nil
@@ -590,12 +591,70 @@ func verifyRecords(batch []byte, at int64) (index map[string]int64, good, last i
 			break
 		}
 
+		// A write batch is one thing to a follower as well. Nothing in it
+		// counts until all of it has arrived, so the good bytes stop at the
+		// marker until then, and a record inside it that will not verify
+		// condemns the batch rather than the records before it.
+		if record.Type == RecordTypeBatch {
+			from, to, ok := spanAt(record, next, int64(len(batch)))
+			if !ok {
+				if _, whole := markerSpan(record); whole {
+					break // the rest of the batch has not arrived
+				}
+				damaged = &CorruptAtError{Offset: at + good}
+				break
+			}
+
+			inside, bad := verifyInside(batch[from:to], at+from)
+			if bad != nil {
+				damaged = bad
+				break
+			}
+			for key, off := range inside.index {
+				index[key] = from + off
+			}
+
+			last = from + inside.last
+			good = to
+			continue
+		}
+
 		index[string(record.Key)] = good
 		last = good
 		good = next
 	}
 
 	return index, good, last, damaged
+}
+
+// verifyInside checks the records of one write batch, which have to be whole
+// and intact together or not be taken at all.
+func verifyInside(span []byte, at int64) (struct {
+	index map[string]int64
+	last  int64
+}, error) {
+	var checked struct {
+		index map[string]int64
+		last  int64
+	}
+	checked.index = make(map[string]int64)
+
+	var pos int64
+	for pos < int64(len(span)) {
+		record, next, err := parseRecordAt(span, pos)
+		if err != nil || record.Type == RecordTypeBatch {
+			return checked, &CorruptAtError{Offset: at + pos}
+		}
+		if record.Crc != checksumSerialized(span[pos:next]) {
+			return checked, fmt.Errorf("record at offset %d: %w", at+pos, ErrorChecksumMismatch)
+		}
+
+		checked.index[string(record.Key)] = pos
+		checked.last = pos
+		pos = next
+	}
+
+	return checked, nil
 }
 
 // takeRecords appends records that have already been verified, and points the

@@ -484,14 +484,46 @@ func (kvs *KeyValueStore) appendRecord(record *Record, key []byte) error {
 		return ErrorClosed
 	}
 
+	spent := kvs.seq
+	pos := kvs.serialize(record)
+
+	if state != nil {
+		if err := kvs.writeToLog(state, kvs.Data[pos:], pos); err != nil {
+			kvs.Data = kvs.Data[:pos]
+			kvs.seq = spent
+			return err
+		}
+	}
+
+	if kvs.Index == nil {
+		kvs.Index = make(map[string]int64)
+	}
+	kvs.Index[string(key)] = pos
+
+	kvs.lastRecord = pos
+	kvs.notify()
+	return nil
+}
+
+// serialize puts a record into the Data slice, numbering it and taking its
+// checksum, and reports where it starts. It touches neither the log nor the
+// index: appendRecord and appendBatch do those, in that order, once they know
+// how much they are writing. Callers must hold the write lock.
+//
+// The number goes on here, which is the only place it can: it is what puts this
+// record after the one before it, so handing it out earlier would let two
+// writers take numbers in one order and append in the other. The checksum has
+// to follow the number, and is taken over the serialized record — one pass over
+// contiguous bytes rather than a fold of the fields, which is the cheaper of the
+// two and the reason this is not simply done twice.
+//
+// Only a record that is stored spends a number, so a caller that rolls the Data
+// slice back rolls the counter back with it. A gap would be harmless — nothing
+// here counts the numbers, it only compares them — but a log whose numbers match
+// its records is easier to trust than one that skips.
+func (kvs *KeyValueStore) serialize(record *Record) int64 {
 	pos := int64(len(kvs.Data))
 
-	// The number goes on under the lock, which is the only place it can: it is
-	// what puts this record after the one before it, so handing it out earlier
-	// would let two writers take numbers in one order and append in the other.
-	// The checksum has to follow it, and is taken over the serialized record —
-	// one pass over contiguous bytes rather than a fold of the fields, which is
-	// the cheaper of the two and the reason this is not simply done twice.
 	if kvs.numbers {
 		record.Seq = kvs.seq
 		record.Version = record.version()
@@ -502,28 +534,82 @@ func (kvs *KeyValueStore) appendRecord(record *Record, key []byte) error {
 	if kvs.numbers {
 		record.Crc = checksumSerialized(kvs.Data[pos:])
 		binary.LittleEndian.PutUint32(kvs.Data[pos:pos+4], record.Crc)
+		kvs.seq++
 	}
+
+	return pos
+}
+
+// appendBatch adds a marker and then every record behind it, in one write to
+// the log, and points the index at them. Callers must hold the write lock.
+//
+// The marker cannot be written until its span is known and the span is not
+// known until the records are serialized, so it goes down with a span of
+// nothing and is finished afterwards — before the log is written, which is the
+// only ordering that matters here. What reaches the disk is one write of a
+// marker that already says how much follows it.
+//
+// Everything else is appendRecord's ordering, over several records instead of
+// one: Data, then the log, then the index, so a log that will not take the
+// batch leaves the store exactly as it was.
+func (kvs *KeyValueStore) appendBatch(entries []Record) error {
+	state := kvs.state
+	if state != nil && state.closed {
+		return ErrorClosed
+	}
+
+	spent := kvs.seq
+	start := int64(len(kvs.Data))
+	stamp := now().UnixNano()
+
+	var span [8]byte
+	marker := Record{
+		Type:        RecordTypeBatch,
+		Timestamp:   stamp,
+		Value:       span[:],
+		ValueLength: uint32(len(span)),
+	}
+	if !kvs.numbers {
+		marker.Version = marker.version()
+	}
+	kvs.serialize(&marker)
+
+	// Where the records begin, and where the marker's span sits: the last eight
+	// bytes of the marker are its value, whichever layout the marker is in.
+	from := int64(len(kvs.Data))
+
+	at := make([]int64, len(entries))
+	for i := range entries {
+		entries[i].Timestamp = stamp
+		if !kvs.numbers {
+			entries[i].Version = entries[i].version()
+			entries[i].Crc = entries[i].calculateChecksum()
+		}
+		at[i] = kvs.serialize(&entries[i])
+	}
+
+	binary.LittleEndian.PutUint64(kvs.Data[from-8:from], uint64(int64(len(kvs.Data))-from))
+	crc := checksumSerialized(kvs.Data[start:from])
+	binary.LittleEndian.PutUint32(kvs.Data[start:start+4], crc)
 
 	if state != nil {
-		if err := kvs.writeToLog(state, kvs.Data[pos:], pos); err != nil {
-			kvs.Data = kvs.Data[:pos]
+		if err := kvs.writeToLog(state, kvs.Data[start:], start); err != nil {
+			kvs.Data = kvs.Data[:start]
+			kvs.seq = spent
 			return err
 		}
-	}
-
-	// Only a record that is stored spends a number. A gap would be harmless —
-	// nothing here counts them, it only compares them — but a log whose numbers
-	// match its records is easier to trust than one that skips.
-	if kvs.numbers {
-		kvs.seq++
 	}
 
 	if kvs.Index == nil {
 		kvs.Index = make(map[string]int64)
 	}
-	kvs.Index[string(key)] = pos
+	// In order, so that a key written twice in one batch is left at the second
+	// of them, which is what the log says too.
+	for i := range entries {
+		kvs.Index[string(entries[i].Key)] = at[i]
+	}
 
-	kvs.lastRecord = pos
+	kvs.lastRecord = at[len(at)-1]
 	kvs.notify()
 	return nil
 }

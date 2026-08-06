@@ -2,6 +2,7 @@ package litekv
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"sync"
 	"testing"
@@ -64,6 +65,23 @@ func FuzzSegmentBytes(f *testing.F) {
 	var old []byte
 	old = appendV0(old, RecordTypeNormal, []byte("old"), []byte("record"))
 	f.Add(old)
+
+	// A log holding a write batch, and one holding a marker whose span is a
+	// lie: the span is read off the disk like everything else here, so it is
+	// arbitrary bytes as far as this is concerned.
+	batched := &KeyValueStore{}
+	var group Batch
+	group.Write([]byte("one"), []byte("first"))
+	group.Write([]byte("two"), []byte("second"))
+	batched.WriteBatch(&group)
+	f.Add(batched.Data)
+
+	lying := append([]byte(nil), batched.Data...)
+	if record, next, err := parseRecordAt(lying, 0); err == nil && record.Type == RecordTypeBatch {
+		binary.LittleEndian.PutUint64(lying[next-8:next], 1<<62)
+		binary.LittleEndian.PutUint32(lying[0:4], checksumSerialized(lying[:next]))
+	}
+	f.Add(lying)
 	f.Add(append(append([]byte(nil), old...), current.Data...))
 
 	f.Add([]byte{})
