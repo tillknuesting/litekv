@@ -247,8 +247,72 @@ func TestPromotedFollowerFencesTheOldLeader(t *testing.T) {
 
 	// And it stays fenced across a restart, which is what makes it a fence
 	// rather than a note in memory.
+	//
+	// The first version of this said exactly that in a comment and then closed
+	// the store without reopening it — and the term heard of was never written
+	// down at all, so a fenced leader came back believing itself current and
+	// took writes again. A comment is not an assertion.
 	if err := old.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestFencingSurvivesARestart is the assertion the comment above used to stand
+// in for. A store that forgot it had been replaced would come back taking
+// writes, which is the whole of what fencing is for.
+func TestFencingSurvivesARestart(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := OpenDB(dir, smallSegments(4096))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.Promote(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Write([]byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fenced by something carrying a newer term.
+	ahead := db.Position()
+	ahead.Term += 4
+
+	if _, err := db.Since(ahead, io.Discard, ReplicaOptions{}); !errors.Is(err, ErrorFenced) {
+		t.Fatalf("the store was not fenced: '%v'", err)
+	}
+	if err := db.Write([]byte("key"), []byte("again")); !errors.Is(err, ErrorFenced) {
+		t.Fatalf("the store took a write while fenced: '%v'", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenDB(dir, smallSegments(4096))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+
+	if err := reopened.Write([]byte("key"), []byte("again")); !errors.Is(err, ErrorFenced) {
+		t.Errorf("a reopened store took a write, so the fence did not survive: '%v'", err)
+	}
+	if got := reopened.Term(); got != 1 {
+		t.Errorf("the reopened store is at term %d, want the 1 it was promoted to", got)
+	}
+
+	// And promoting past what it had heard of makes it a leader again, with a
+	// term above the one that fenced it rather than merely one above its own.
+	term, err := reopened.Promote()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if term != 6 {
+		t.Errorf("promotion gave term %d, want one above the 5 it had heard of", term)
+	}
+	if err := reopened.Write([]byte("key"), []byte("again")); err != nil {
+		t.Errorf("a promoted store still refuses writes: %v", err)
 	}
 }
 

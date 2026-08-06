@@ -162,6 +162,24 @@ snapshot of a store whose active log is empty, which is refused if that log has
 since frozen. `TestDBSnapshotOfAnEmptyStore` is the exception,
 `TestDBTailCrossesFrozenLogs` is the rule.
 
+**The term heard of is written down, not only the term held.** A store keeps
+two numbers: the term it is at, and the highest it has heard of anywhere. Being
+fenced is the second being above the first, and both have to survive a restart —
+the first version of this wrote only the term it was at, so a fenced leader came
+back believing itself current and took writes again, which is the whole of what
+fencing exists to stop. `TestFencingSurvivesARestart`.
+
+That went in with a comment in the test saying "and it stays fenced across a
+restart", followed by a `Close` and nothing else. A comment is not an assertion,
+and a comment claiming the thing the commit is *for* is the worst place to put
+one.
+
+**One writer of the state file at a time.** `Promote`, `noteTerm` and
+`setApplied` all write it, each reading its own snapshot of the three numbers in
+it, so two of them interleaving would put one path's stale copy of a field on
+the disk underneath the other path's fresh one. `stateMu` is held across the
+read and the write.
+
 **A term only ever goes up, and it is written down before it is believed.**
 `Promote` raises it above the highest this store has heard of and persists it
 before returning; `noteTerm` and `adoptTerm` do the same for a term heard from

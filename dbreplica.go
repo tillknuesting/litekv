@@ -136,8 +136,15 @@ func (db *DB) Term() uint64 {
 // A store that had been fenced starts taking writes again, since its term is now
 // the highest it has seen.
 func (db *DB) Promote() (uint64, error) {
-	db.mu.Lock()
+	// One writer of the state file at a time, and it decides what to write with
+	// the lock already held. Three paths write it — this, noteTerm and
+	// setApplied — each reading its own snapshot of the three numbers, and two
+	// of them interleaving would put one path's stale copy of a field on the
+	// disk under the other path's fresh one.
+	db.stateMu.Lock()
+	defer db.stateMu.Unlock()
 
+	db.mu.Lock()
 	if db.closed {
 		db.mu.Unlock()
 		return 0, ErrorClosed
@@ -150,7 +157,7 @@ func (db *DB) Promote() (uint64, error) {
 	applied := db.applied
 	db.mu.Unlock()
 
-	if err := writeReplicaState(db.dir, term, applied, db.opts.Sync == SyncAlways); err != nil {
+	if err := writeReplicaState(db.dir, term, term, applied, db.opts.Sync == SyncAlways); err != nil {
 		return 0, err
 	}
 
@@ -170,6 +177,9 @@ func (db *DB) isFenced() bool { return db.seen > db.term }
 // cannot tell that by itself, and the only place the news reaches it is a
 // follower or a leader that has moved on.
 func (db *DB) noteTerm(term uint64) error {
+	db.stateMu.Lock()
+	defer db.stateMu.Unlock()
+
 	db.mu.Lock()
 	if term <= db.seen {
 		db.mu.Unlock()
@@ -178,7 +188,11 @@ func (db *DB) noteTerm(term uint64) error {
 	applied, mine := db.applied, db.term
 	db.mu.Unlock()
 
-	if err := writeReplicaState(db.dir, mine, applied, db.opts.Sync == SyncAlways); err != nil {
+	// The term heard of is what goes down, and it is what makes this a fence
+	// rather than a note in memory: a store that forgot it on the way through a
+	// restart would come back believing itself current and take writes again,
+	// which is the whole of what fencing is for.
+	if err := writeReplicaState(db.dir, mine, term, applied, db.opts.Sync == SyncAlways); err != nil {
 		return err
 	}
 
@@ -220,12 +234,15 @@ func (db *DB) Snapshot(w io.Writer, opts ReplicaOptions) (DBPosition, func(), er
 	db.mergeMu.Lock()
 	defer db.mergeMu.Unlock()
 
+	// Asked before the log is frozen, not after: a store that is not a leader
+	// should not be quietly rotating on its way to saying so.
+	if db.isFencedLocked() {
+		return DBPosition{}, func() {}, ErrorFenced
+	}
+
 	at, frozen, err := db.freezeForSnapshot()
 	if err != nil {
 		return DBPosition{}, func() {}, err
-	}
-	if db.isFencedLocked() {
-		return DBPosition{}, func() {}, ErrorFenced
 	}
 
 	// Taken here rather than by the caller afterwards, because here there is no
@@ -871,6 +888,9 @@ func (db *DB) ApplySnapshot(at DBPosition, r io.Reader, opts ReplicaOptions) err
 // follower is not a leader, so raising its own term costs it nothing: it is not
 // taking writes either way, and Promote is what makes it one.
 func (db *DB) adoptTerm(term uint64) error {
+	db.stateMu.Lock()
+	defer db.stateMu.Unlock()
+
 	db.mu.Lock()
 	if term <= db.term {
 		db.mu.Unlock()
@@ -879,7 +899,7 @@ func (db *DB) adoptTerm(term uint64) error {
 	applied := db.applied
 	db.mu.Unlock()
 
-	if err := writeReplicaState(db.dir, term, applied, db.opts.Sync == SyncAlways); err != nil {
+	if err := writeReplicaState(db.dir, term, term, applied, db.opts.Sync == SyncAlways); err != nil {
 		return err
 	}
 
@@ -971,11 +991,14 @@ func (m *memSegment) take(batch []byte, index map[string]int64, last int64) erro
 // Losing the position instead costs a batch applied twice, which is the same
 // records in the same order.
 func (db *DB) setApplied(pos DBPosition) error {
+	db.stateMu.Lock()
+	defer db.stateMu.Unlock()
+
 	db.mu.RLock()
-	term := db.term
+	term, seen := db.term, db.seen
 	db.mu.RUnlock()
 
-	if err := writeReplicaState(db.dir, term, pos, db.opts.Sync == SyncAlways); err != nil {
+	if err := writeReplicaState(db.dir, term, seen, pos, db.opts.Sync == SyncAlways); err != nil {
 		return err
 	}
 
@@ -1088,13 +1111,14 @@ func readBatch(r io.Reader, limit int64) ([]byte, error) {
 const (
 	appliedFile    = "replica"
 	appliedMagic   = "LKVR"
-	appliedVersion = 2
+	appliedVersion = 3
 
-	// magic, version, the term, the position, and a checksum over all of it.
-	appliedSize = 4 + 1 + 8 + dbPositionSize + 4
+	// magic, version, the term, the highest term heard of, the position, and a
+	// checksum over all of it.
+	appliedSize = 4 + 1 + 8 + 8 + dbPositionSize + 4
 )
 
-func writeReplicaState(dir string, term uint64, pos DBPosition, durable bool) error {
+func writeReplicaState(dir string, term, seen uint64, pos DBPosition, durable bool) error {
 	encoded, err := pos.MarshalBinary()
 	if err != nil {
 		return err
@@ -1104,8 +1128,9 @@ func writeReplicaState(dir string, term uint64, pos DBPosition, durable bool) er
 	copy(buf[0:4], appliedMagic)
 	buf[4] = appliedVersion
 	binary.LittleEndian.PutUint64(buf[5:13], term)
-	copy(buf[13:13+dbPositionSize], encoded)
-	binary.LittleEndian.PutUint32(buf[13+dbPositionSize:], crc32.ChecksumIEEE(buf[:13+dbPositionSize]))
+	binary.LittleEndian.PutUint64(buf[13:21], seen)
+	copy(buf[21:21+dbPositionSize], encoded)
+	binary.LittleEndian.PutUint32(buf[21+dbPositionSize:], crc32.ChecksumIEEE(buf[:21+dbPositionSize]))
 
 	path := filepath.Join(dir, appliedFile)
 	temp := path + mergeSuffix
@@ -1146,21 +1171,26 @@ func writeReplicaState(dir string, term uint64, pos DBPosition, durable bool) er
 
 // readReplicaState reads that back, and reports nothing for a file that is not
 // there or cannot be trusted.
-func readReplicaState(dir string) (uint64, DBPosition) {
+func readReplicaState(dir string) (term, seen uint64, pos DBPosition) {
 	raw, err := disk.ReadFile(filepath.Join(dir, appliedFile))
 	if err != nil || len(raw) != appliedSize {
-		return 0, DBPosition{}
+		return 0, 0, DBPosition{}
 	}
 	if string(raw[0:4]) != appliedMagic || raw[4] != appliedVersion {
-		return 0, DBPosition{}
+		return 0, 0, DBPosition{}
 	}
-	if binary.LittleEndian.Uint32(raw[13+dbPositionSize:]) != crc32.ChecksumIEEE(raw[:13+dbPositionSize]) {
-		return 0, DBPosition{}
+	if binary.LittleEndian.Uint32(raw[21+dbPositionSize:]) != crc32.ChecksumIEEE(raw[:21+dbPositionSize]) {
+		return 0, 0, DBPosition{}
 	}
 
-	var pos DBPosition
-	if err := pos.UnmarshalBinary(raw[13 : 13+dbPositionSize]); err != nil {
-		return 0, DBPosition{}
+	if err := pos.UnmarshalBinary(raw[21 : 21+dbPositionSize]); err != nil {
+		return 0, 0, DBPosition{}
 	}
-	return binary.LittleEndian.Uint64(raw[5:13]), pos
+
+	term = binary.LittleEndian.Uint64(raw[5:13])
+	seen = binary.LittleEndian.Uint64(raw[13:21])
+	if seen < term {
+		seen = term
+	}
+	return term, seen, pos
 }

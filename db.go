@@ -60,6 +60,10 @@ type DB struct {
 	term uint64
 	seen uint64
 
+	// stateMu lets one writer of the file beside the logs at a time. Three
+	// paths write it and each reads its own snapshot of what to put in it.
+	stateMu sync.Mutex
+
 	// held counts the followers reading each log, by id. Nothing from the oldest
 	// of them onwards is merged, so a follower walking forward through the logs
 	// never has one taken out from under it — see Hold in dbreplica.go.
@@ -276,8 +280,8 @@ func OpenDB(dir string, opts DBOptions) (*DB, error) {
 		return nil, err
 	}
 
-	term, applied := readReplicaState(dir)
-	db := &DB{dir: dir, opts: opts, term: term, seen: term, applied: applied}
+	term, seen, applied := readReplicaState(dir)
+	db := &DB{dir: dir, opts: opts, term: term, seen: seen, applied: applied}
 
 	// An interrupted merge leaves its half built file behind. The logs it was
 	// merging are all still there, so it can simply go.
