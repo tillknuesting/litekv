@@ -582,6 +582,13 @@ a crash survivable and none of them show up in the result of a call.
   The second did not recur in thirteen further runs, alone, in sequence, and
   under load. If it returns, look for `testdata/fuzz` first: if there is nothing
   there, it is not the store.
+- **One suite run failed and the output was thrown away.** It happened in a
+  verification chain that redirected `go test` to `/dev/null` and printed only
+  the exit code, so there is nothing to go on. Thirty-seven captured runs since
+  — thirty-one on all cores, six on one — have been clean. Redirecting the
+  output of the thing you are checking is a way of learning nothing; capture it
+  and grep, and mind that a pipeline's exit status is the last command's, so
+  `go test ... | tail -1` succeeds however the tests went.
 - **`os.Stat` and directory syncing** still go straight to the OS in one or two
   places. Everything else goes through `fs.go`.
 - **The fuzz corpus lives in the local build cache**, not the repository. CI
