@@ -321,6 +321,24 @@ func main() {
 	must(err)
 	fmt.Println("and kept up:", string(value))
 
+	// A replica is behind its leader, and the client that wrote to the leader a
+	// moment ago is the one who notices. Hand that client the leader's position
+	// and take it back with its next read: a replica that has not caught up
+	// says so, rather than answering out of an older copy of the store.
+	after := leader.Position()
+	fmt.Println("the follower has reached the leader's position:", replica.Reached(after) == nil)
+
+	// Await is the same question with waiting, which is what a read wants when
+	// the client is a few milliseconds ahead of the stream. Give it a deadline;
+	// a context's Done channel is the usual one.
+	fresh := &litekv.KeyValueStore{}
+	giveUp := make(chan struct{})
+	time.AfterFunc(50*time.Millisecond, func() { close(giveUp) })
+
+	if err := fresh.Await(after, giveUp); errors.Is(err, litekv.ErrorStale) {
+		fmt.Println("a store that is following nothing waits and then says:", err)
+	}
+
 	close(stop)
 	streaming.Wait()
 
@@ -491,6 +509,20 @@ func main() {
 		return err == nil
 	})
 	fmt.Println("and a record written while it streamed arrived without being asked for")
+
+	// The same read-your-writes check one level up, and here it is a wait: the
+	// write above went to the leader and the follower is somewhere behind it.
+	// A DB position carries the term as well, so a position cut by a leader
+	// that has since been replaced is refused rather than guessed at.
+	writtenAt := db.Position()
+	waited := make(chan struct{})
+	time.AfterFunc(5*time.Second, func() { close(waited) })
+
+	if err := replicaDB.Await(writtenAt, waited); err == nil {
+		fmt.Println("the follower holds everything the leader had at", writtenAt.Segment, writtenAt.Log.Offset)
+	} else {
+		fmt.Println("the follower is behind the leader:", err)
+	}
 
 	close(stopDB)
 

@@ -36,8 +36,8 @@ left to be inferred:
 | `segment.go` | the two kinds of segment, and reading a log without holding it in memory  |
 | `hint.go`    | the index of a frozen log, written beside it                             |
 | `bloom.go`   | the filter in front of that index, once a log is big enough to want one   |
-| `replica.go` | `Position`, and shipping the log to a follower: `Since`, `Follow`, `Apply` |
-| `dbreplica.go` | `DBPosition`, and shipping a `DB`'s records: `Snapshot`, `Since`, `Follow` |
+| `replica.go` | `Position`, shipping the log to a follower: `Since`, `Follow`, `Apply`, and `Reached` |
+| `dbreplica.go` | `DBPosition`, shipping a `DB`'s records: `Snapshot`, `Since`, `Follow`, and `Reached` |
 | `fs.go`      | the one seam through which this package touches a disk                    |
 
 `KeyValueStore` and `DB` are deliberately separate. The first is one log with
@@ -174,11 +174,26 @@ restart", followed by a `Close` and nothing else. A comment is not an assertion,
 and a comment claiming the thing the commit is *for* is the worst place to put
 one.
 
-**One writer of the state file at a time.** `Promote`, `noteTerm` and
-`setApplied` all write it, each reading its own snapshot of the three numbers in
-it, so two of them interleaving would put one path's stale copy of a field on
-the disk underneath the other path's fresh one. `stateMu` is held across the
-read and the write.
+**One writer of the state file at a time.** `Promote`, `noteTerm` and `advance`
+all write it, each reading its own snapshot of the three numbers in it, so two
+of them interleaving would put one path's stale copy of a field on the disk
+underneath the other path's fresh one. `stateMu` is held across the read and the
+write.
+
+**A follower's term and its applied position are one write.** They are one fact
+from two sides — which leader, and how far through it — and `Reached` reads both
+to tell a store that has been promoted, whose term is above the term it applied
+at and whose own log is what its positions are offsets into, from one that is
+following, whose term equals it and which judges by what it has applied.
+Written separately, as `adoptTerm` then `setApplied` used to be, every fault
+between them leaves a follower looking promoted, and a crash between them leaves
+it looking promoted until the next batch arrives — at which point a leader's
+position is judged against the follower's own logs, which are a different set of
+files and answer whatever they answer. `advance` writes both, and saves the
+follower a write per batch while it is at it.
+`TestFollowerTermNeverOutrunsItsPosition` fails each disk operation of a
+catch-up in turn and holds the two to each other after every one, in memory and
+after a reopen.
 
 **A term only ever goes up, and it is written down before it is believed.**
 `Promote` raises it above the highest this store has heard of and persists it
@@ -407,6 +422,19 @@ that writes the position before the records, a position that is never written or
 is believed when damaged, a snapshot that does not empty the store first, and a
 reset that leaves the logs or the position behind. All twenty-four are caught.
 
+And nine for the freshness checks, against `fresh_test.go`: a promoted store
+judging by the position it applied rather than its own, a position from a
+replaced leader compared instead of refused, a term nobody has heard of treated
+as anything but behind, offsets compared without the log they are in, a
+single-store position believed rather than checked against the record it names,
+a store that is behind not saying so, `Await` treating giving up as arriving,
+`Apply` waking nothing when it applies, and the term written apart from the
+position again. All nine are caught.
+
+That last one is the reason `advance` exists, and it is caught by the fault
+sweep rather than by any assertion about a call's result: splitting the write in
+two breaks nothing a test can see until a fault lands between the halves.
+
 Three of those are worth knowing about beyond the list.
 
 **Two checks in `batch` look redundant and are not.** The checksum makes the
@@ -602,14 +630,32 @@ follows is ordered for the destination above rather than for a library, which
 puts some small things ahead of some interesting ones.
 
 Fencing is done: `Promote`, a term on every `DBPosition`, and `ErrorFenced` from
-a store that has heard of a newer one. Expiry is done. What is left below is
-ordered as before.
+a store that has heard of a newer one. Expiry is done. Reads that are not stale
+are done: `Reached` and `Await`, on both halves. What is left below is ordered as
+before.
 
-**Reads that are not stale.** `Position` is already the primitive for
-read-your-writes and monotonic reads: take the leader's after a write, hand it
-back to the client, refuse a replica behind it. Twenty lines and some tests, and
-it prevents the way this design most often confuses people — write to the
-leader, read from a replica, do not see your own write.
+Two things about that last one are worth knowing before building on it.
+
+**A `DB` cannot check a position, only compare it.** A follower holds none of
+the leader's bytes, so `Reached` compares log ids and offsets and the term
+decides which of the store's two positions it compares against — the applied one
+for a store that is following, its own for one that follows nobody. Handing it a
+position cut by something that was never this store's leader is a caller error
+nothing here can catch, which is the difference from the single-store version,
+where the record the position names is in `Data` to be looked at.
+
+**The boundary between two logs is answered too cautiously, and no comparison
+can do better.** A position at the start of a log names no record, and the end of
+the log before it is the same point in the stream — neither position knows how
+long that log was. A leader whose active log is empty hands out the start of it,
+which is every leader that has just rotated or been snapshotted, and a follower
+holding every record rests at the end of the log before, because that is the
+position that can be checked. So it says `ErrorStale` while holding everything,
+until one more record crosses. It errs towards refusing a current read rather
+than allowing a stale one, and `TestDBReachedAtTheStartOfALog` pins it so that
+nobody "fixes" it by making the comparison generous. The actual fix is a
+per-record sequence number, which would make positions totally ordered and is
+the same format change the batch write below wants — worth doing both at once.
 
 **The server's writer.** Two goroutines writing do not merely fail to go faster,
 they halve throughput: 114 ns a write becomes 228, and more of them change little

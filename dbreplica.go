@@ -138,9 +138,9 @@ func (db *DB) Term() uint64 {
 func (db *DB) Promote() (uint64, error) {
 	// One writer of the state file at a time, and it decides what to write with
 	// the lock already held. Three paths write it — this, noteTerm and
-	// setApplied — each reading its own snapshot of the three numbers, and two
-	// of them interleaving would put one path's stale copy of a field on the
-	// disk under the other path's fresh one.
+	// advance — each reading its own snapshot of the three numbers, and two of
+	// them interleaving would put one path's stale copy of a field on the disk
+	// under the other path's fresh one.
 	db.stateMu.Lock()
 	defer db.stateMu.Unlock()
 
@@ -781,6 +781,130 @@ func (db *DB) Applied() DBPosition {
 	return db.applied
 }
 
+// ErrorSuperseded is returned by Reached for a position cut by a leader this
+// store has since stopped following. Whether the record it names survived the
+// handover cannot be told from here — a failover keeps what the new leader had,
+// which is everything it had received and nothing it had not — and a position
+// in the old leader's logs says nothing about the new one's. Take a fresh
+// position from the leader there is now.
+const ErrorSuperseded = Error("position is from a leader that has been replaced")
+
+// Reached reports whether this store holds every record up to pos: nil if it
+// does, ErrorStale if it is behind, and ErrorSuperseded if pos came from a
+// leader this store has stopped following.
+//
+// It is the single-store Reached one level up, and what a replica behind a load
+// balancer answers a read with. Write to the leader, take its Position, hand it
+// back with the next read, and a replica that has not caught up refuses rather
+// than answering out of an older copy of the store. Await is the same question
+// with waiting, which is usually what a read wants: a client reading its own
+// write is a few milliseconds ahead of the stream, not minutes.
+//
+// What is compared here is two positions in one leader's stream — its log ids,
+// which rise as it rotates, and the offsets within a log. Nothing checks the
+// record: a DB follower holds none of the leader's bytes, its own files having
+// nothing to do with them, so a position is something the leader said rather
+// than something this store can look up. Apply is where a position is checked
+// against the records it names, and a position from somewhere that was never
+// this store's leader is a caller error nothing here can catch.
+//
+// Which position it is compared against is the whole of the term handling. A
+// store that is following judges by how far it has applied; one that follows
+// nobody — because it never has, or because Promote raised it above the term it
+// last applied at — is the leader those positions were cut by, and judges by its
+// own. A term this store has not heard of is a leader it has heard nothing from,
+// so it is behind by definition.
+//
+// One position is answered too cautiously, and it cannot be answered any other
+// way here: the start of a log. It names no record, and the end of the log
+// before it is the same point in the stream — which two positions cannot say,
+// since neither of them knows how long that log was. A leader whose active log
+// is empty hands out the start of it, which is every leader that has just
+// rotated or just been snapshotted, and a follower holding every record it ever
+// wrote rests at the end of the log before. So it reports ErrorStale while
+// holding everything, until one more record crosses and settles it. That is the
+// safe direction — a read refused while current, rather than allowed while
+// stale — and the fix is a sequence number in the record rather than anything
+// this comparison can do.
+//
+// This says nothing about whether the store should be read from at all. A fenced
+// store still holds what it holds, and a replica is behind its leader by
+// definition; being at a position is the only claim made here.
+func (db *DB) Reached(pos DBPosition) error {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	if db.closed {
+		return ErrorClosed
+	}
+	return db.reached(pos)
+}
+
+// reached is Reached with db.mu held.
+func (db *DB) reached(pos DBPosition) error {
+	// The zero position names nothing, and every store holds that much.
+	if pos == (DBPosition{}) {
+		return nil
+	}
+	if pos.Term > db.term {
+		return ErrorStale
+	}
+
+	here := db.applied
+	switch {
+	case here == DBPosition{}, pos.Term > here.Term:
+		// This store follows nobody at that term — it never has, or Promote
+		// raised it past the term it last applied at — so the positions at
+		// that term are the ones it cut itself, and its own log is what they
+		// are offsets into.
+		here = db.position()
+	case pos.Term < here.Term:
+		return ErrorSuperseded
+	}
+
+	// One leader's stream: the log ids rise as it rotates, and the offsets rise
+	// within a log. A position at the start of a log compares as the start of
+	// it, which is the cautious end of the boundary described above.
+	if here.Segment != pos.Segment {
+		if here.Segment > pos.Segment {
+			return nil
+		}
+		return ErrorStale
+	}
+	if here.Log.Offset < pos.Log.Offset {
+		return ErrorStale
+	}
+	return nil
+}
+
+// Await is Reached with waiting: it returns nil once this store holds
+// everything up to pos, ErrorStale if until is closed first, and anything else
+// Reached reports at once, since a position from a leader that has been
+// replaced is not one waiting will bring.
+//
+// A read that waits is a read that costs the client the replication lag rather
+// than the truth. Give it a deadline — a context's Done channel is the usual
+// one — since a follower that has fallen a long way behind, or is following
+// nothing at all, will not arrive on this side of it.
+func (db *DB) Await(pos DBPosition, until <-chan struct{}) error {
+	for {
+		// Taken before the position is asked about and not after, so that a
+		// batch applied in between is a wake-up rather than a wait for the
+		// next one. See Changed.
+		changed := db.Changed()
+
+		if err := db.Reached(pos); !errors.Is(err, ErrorStale) {
+			return err
+		}
+
+		select {
+		case <-changed:
+		case <-until:
+			return ErrorStale
+		}
+	}
+}
+
 // Apply appends one batch of a leader's records to this store and records that
 // it has reached next. from is the position the batch was cut for; Apply
 // reports ErrorPosition if this store has applied something else since.
@@ -839,12 +963,14 @@ func (db *DB) Apply(from, next DBPosition, r io.Reader, opts ReplicaOptions) (DB
 		}
 	}
 
-	if err := db.adoptTerm(next.Term); err != nil {
+	if err := db.advance(next.Term, next); err != nil {
 		return db.Applied(), err
 	}
-	if err := db.setApplied(next); err != nil {
-		return db.Applied(), err
-	}
+
+	// Applying is how a follower's store changes, so it is one of the things
+	// Changed exists to report: anything waiting to read its own write here,
+	// and anything following this store in turn, is waiting on that channel.
+	db.notify()
 
 	// The records are stored; rotating is housekeeping, as it is after a write.
 	db.rotateIfFull(active)
@@ -877,40 +1003,11 @@ func (db *DB) ApplySnapshot(at DBPosition, r io.Reader, opts ReplicaOptions) err
 	if err := db.applyStream(r, opts.batchSize()); err != nil {
 		return err
 	}
-	if err := db.adoptTerm(at.Term); err != nil {
-		return err
-	}
-	return db.setApplied(at)
-}
-
-// adoptTerm takes the term of the leader this store is following, so that a
-// follower of a promoted leader is fenced against the one it replaced. A
-// follower is not a leader, so raising its own term costs it nothing: it is not
-// taking writes either way, and Promote is what makes it one.
-func (db *DB) adoptTerm(term uint64) error {
-	db.stateMu.Lock()
-	defer db.stateMu.Unlock()
-
-	db.mu.Lock()
-	if term <= db.term {
-		db.mu.Unlock()
-		return nil
-	}
-	applied := db.applied
-	db.mu.Unlock()
-
-	if err := writeReplicaState(db.dir, term, term, applied, db.opts.Sync == SyncAlways); err != nil {
+	if err := db.advance(at.Term, at); err != nil {
 		return err
 	}
 
-	db.mu.Lock()
-	if term > db.term {
-		db.term = term
-	}
-	if term > db.seen {
-		db.seen = term
-	}
-	db.mu.Unlock()
+	db.notify()
 	return nil
 }
 
@@ -982,7 +1079,17 @@ func (m *memSegment) take(batch []byte, index map[string]int64, last int64) erro
 	return m.kvs.takeRecords(batch, index, last)
 }
 
-// setApplied writes down how far through the leader this store has got.
+// advance writes down which leader this store is following and how far through
+// it the store has got, in that one write of the file beside the logs.
+//
+// The term goes with the position and not before it. They are one fact from two
+// sides — which leader, and where in it — and anything reading both has to be
+// given them together or be handed one leader's offsets under another leader's
+// term. Reached is that reader: it tells a store that has been promoted from
+// one that is following by whether its term has gone past the term it last
+// applied at, and writing the two separately leaves a window where a follower
+// looks promoted — a window a crash between the writes leaves open until the
+// next batch arrives. One write closes it, and saves the follower a write.
 //
 // It waits for the disk exactly when the records did. The position must never
 // be more durable than the records it claims: under SyncNever the records are
@@ -990,20 +1097,33 @@ func (m *memSegment) take(batch []byte, index map[string]int64, last int64) erro
 // would leave a store that survived losing power claiming records that did not.
 // Losing the position instead costs a batch applied twice, which is the same
 // records in the same order.
-func (db *DB) setApplied(pos DBPosition) error {
+func (db *DB) advance(term uint64, pos DBPosition) error {
+	// One writer of the state file at a time, and it decides what to write
+	// with the lock already held, as Promote and noteTerm do.
 	db.stateMu.Lock()
 	defer db.stateMu.Unlock()
 
 	db.mu.RLock()
-	term, seen := db.term, db.seen
+	mine, seen := db.term, db.seen
 	db.mu.RUnlock()
 
-	if err := writeReplicaState(db.dir, term, seen, pos, db.opts.Sync == SyncAlways); err != nil {
+	// A follower takes the term of the leader it follows, so that a follower of
+	// a promoted leader is fenced against the one it replaced. Raising its own
+	// term costs it nothing: it is not taking writes either way, and Promote is
+	// what makes it a leader. Terms only ever go up.
+	if term > mine {
+		mine = term
+	}
+	if term > seen {
+		seen = term
+	}
+
+	if err := writeReplicaState(db.dir, mine, seen, pos, db.opts.Sync == SyncAlways); err != nil {
 		return err
 	}
 
 	db.mu.Lock()
-	db.applied = pos
+	db.term, db.seen, db.applied = mine, seen, pos
 	db.mu.Unlock()
 	return nil
 }

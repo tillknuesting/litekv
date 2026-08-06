@@ -562,6 +562,54 @@ A follower is a store like any other. Give it a file with `Open` and it survives
 is where its own log ends, which is what it asks with next time. That is the catch-up recovery every
 leader-follower system needs after a follower has been down.
 
+### Reads that are not stale
+
+Replication here is asynchronous, so a replica is behind its leader, and the person who finds out is the
+client that wrote to the leader a millisecond ago and read from a replica. Not seeing your own write is
+the way this arrangement most often surprises people.
+
+The position is already the fix. Take the leader's after a write, give it to the client, and take it
+back with the client's next read:
+
+```go
+at := leader.Position()                     // hand this to the client after its write
+
+if err := replica.Reached(at); err != nil { // and back with its next read
+	// litekv.ErrorStale: this replica has not got there yet
+}
+```
+
+That is read-your-writes. Asking with the position of the last *read* instead gives monotonic reads — a
+client never sees the store go backwards, however it is routed — and both are things a leader with
+replicas otherwise takes away. `Await` is the same question with waiting, which is usually what a read
+wants, since a client is a few milliseconds ahead of the stream rather than minutes:
+
+```go
+err := replica.Await(at, ctx.Done())        // nil, or ErrorStale when the context ends
+```
+
+A single store checks the position rather than merely comparing it: its log is the leader's log byte for
+byte, so the record the position names is there to be looked at, and a store that is merely as long
+answers `ErrorDiverged`. A `DB` cannot — a follower holds none of the leader's bytes — so `Reached`
+compares two positions in one leader's stream and the term decides which position it compares against:
+a store that is following judges by how far it has applied, and one that follows nobody, because it never
+has or because `Promote` raised it above the term it last applied at, is the leader those positions came
+from and judges by its own. A position from a leader that has been replaced gets `ErrorSuperseded`,
+since whether that write survived the failover is not something a follower of the new leader can work
+out.
+
+**One position is answered too cautiously.** A position at the start of a log names no record, and the
+end of the log before it is the same point in the stream — which two positions cannot say, neither of
+them knowing how long that log was. A leader whose active log is empty hands out the start of it, which
+is every leader that has just rotated or been snapshotted, and a follower holding every record it ever
+wrote rests at the end of the log before, because that is the position that can be checked. So it reports
+`ErrorStale` while holding everything, until one more record crosses. It refuses a read that is current
+rather than allowing one that is not, and the real fix is a sequence number in the record rather than
+anything this comparison can do.
+
+None of this says a store is fresh in general. A position is not a clock, and reaching one says only
+that what it names is here.
+
 ### What it costs
 
 | | |
@@ -1002,7 +1050,9 @@ anything either.
   be written with that in it.
 - **Replication is asynchronous, and only that.** A write returns as soon as the leader has it, so a
   leader that dies loses whatever its followers had not received yet. There is no synchronous or
-  semi-synchronous mode, no acknowledgement from a follower, and nothing waits for one.
+  semi-synchronous mode, no acknowledgement from a follower, and nothing waits for one. `Reached` lets a
+  client refuse a replica that has not got to a write it already knows about, which is a different
+  thing: it hides the lag from that client, it does not remove it.
 - **There is no failover.** Which store is the leader is your decision and nobody else's: `Promote`
   writes the decision down, it does not make it. Raising the term in two places at once puts two stores
   on the same term and gives the guarantee away, so whatever decides has to be the only thing deciding.

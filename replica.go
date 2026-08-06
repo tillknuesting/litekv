@@ -74,6 +74,12 @@ const ErrorDiverged = Error("follower's log is not part of this one")
 // reported.
 const ErrorPosition = Error("batch does not continue this log")
 
+// ErrorStale is returned by Reached and Await when this store has not got as
+// far as the position it was given. It is not a fault in the store: it is a
+// replica saying it does not yet hold a write that something else has already
+// acknowledged, which is the honest answer and the only one worth having.
+const ErrorStale = Error("store has not reached that position")
+
 // positionSize is what a Position takes on the wire.
 const positionSize = 20
 
@@ -154,6 +160,73 @@ func (kvs *KeyValueStore) positionAt(last int64) (Position, bool) {
 		return Position{}, false
 	}
 	return Position{Offset: next, Last: last, Crc: record.Crc}, true
+}
+
+// Reached reports whether this store holds every record up to pos: nil if it
+// does, ErrorStale if it is behind, and ErrorDiverged if pos names a record
+// this log does not hold.
+//
+// It is what makes reads from a replica safe to promise anything about. Write
+// to the leader, take its Position, and hand it back with the next read: a
+// replica that has not caught up says so rather than answering out of an older
+// copy of the store. That is read-your-writes, and asking with the position of
+// the last read instead gives monotonic reads — a client that has seen a value
+// never sees the store go backwards, however it is routed. Both are what a
+// leader with asynchronous replicas otherwise takes away, and not seeing your
+// own write a millisecond after making it is the way this design most often
+// surprises people.
+//
+// The position is checked, not merely compared. A single store's log is the
+// leader's log byte for byte, so the record pos names is here to be looked at,
+// and looking at it is what tells a replica of that leader from a store that
+// happens to be as long. What this does not say is anything about how fresh
+// the store is in general: a position is not a clock, and reaching one says
+// only that what it names is here.
+func (kvs *KeyValueStore) Reached(pos Position) error {
+	kvs.RLock()
+	defer kvs.RUnlock()
+
+	// The zero position names nothing, and every store holds that much.
+	if pos == (Position{}) {
+		return nil
+	}
+
+	if here := kvs.position(); pos.Offset > here.Offset {
+		return ErrorStale
+	}
+
+	// Far enough along, but along the same log? This is the check batch makes
+	// before a leader sends anything, made against a position that arrived
+	// from a client rather than from a follower.
+	record, next, err := parseRecordAt(kvs.Data, pos.Last)
+	if err != nil || next != pos.Offset || record.Crc != pos.Crc {
+		return ErrorDiverged
+	}
+	return nil
+}
+
+// Await is Reached with waiting: it returns nil once this store holds
+// everything up to pos, ErrorStale if until is closed first, and anything else
+// Reached reports at once, since a position this log does not hold is not one
+// waiting will bring.
+//
+// The channel is taken before the position is asked about and not after, which
+// is what makes a record that arrives in between a wake-up rather than a wait
+// for the next one. See Changed.
+func (kvs *KeyValueStore) Await(pos Position, until <-chan struct{}) error {
+	for {
+		changed := kvs.Changed()
+
+		if err := kvs.Reached(pos); !errors.Is(err, ErrorStale) {
+			return err
+		}
+
+		select {
+		case <-changed:
+		case <-until:
+			return ErrorStale
+		}
+	}
 }
 
 // defaultBatch is how much of the log crosses at once when nothing says
