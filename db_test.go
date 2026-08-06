@@ -1345,7 +1345,7 @@ func TestScanSegmentMixedLayouts(t *testing.T) {
 	}
 
 	// And a record fetched by offset agrees with the walk.
-	index, good, err := indexSegment(file, int64(len(data)))
+	index, good, _, err := indexSegment(file, int64(len(data)))
 	if err != nil {
 		t.Fatalf("indexSegment: %v", err)
 	}

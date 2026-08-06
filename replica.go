@@ -17,7 +17,7 @@ import (
 // missing, Apply puts it in, and Changed says when there is more.
 //
 // Nothing here opens a socket. What crosses the gap is a Position, which
-// marshals to twenty bytes, and a run of records; carrying those over TCP,
+// marshals to twenty-eight bytes, and a run of records; carrying those over TCP,
 // HTTP, a pipe or a file is the caller's business and no concern of a storage
 // engine. example/ wires one over a connection.
 //
@@ -60,6 +60,17 @@ type Position struct {
 
 	// Crc is that record's checksum.
 	Crc uint32
+
+	// Seq is the number the next record written here will carry, which is one
+	// past the number of the record at Last. It is zero for a store that does
+	// not number its records, which is every KeyValueStore not standing in for
+	// a DB's log.
+	//
+	// It is what makes two positions comparable when their offsets are not.
+	// Offsets are only comparable within one log, and a DB has many: the end of
+	// one log and the start of the next are the same point in the stream and
+	// have nothing in common to say so. Both carry the same number.
+	Seq uint64
 }
 
 // ErrorDiverged is returned by Since when the position it was given is not a
@@ -81,9 +92,9 @@ const ErrorPosition = Error("batch does not continue this log")
 const ErrorStale = Error("store has not reached that position")
 
 // positionSize is what a Position takes on the wire.
-const positionSize = 20
+const positionSize = 28
 
-// MarshalBinary encodes the position in twenty bytes, little-endian, as records
+// MarshalBinary encodes the position in twenty-eight bytes, little-endian, as records
 // are. It is here so that the two ends of a connection do not have to invent an
 // encoding for the one thing they both have to agree on.
 func (p Position) MarshalBinary() ([]byte, error) {
@@ -91,6 +102,7 @@ func (p Position) MarshalBinary() ([]byte, error) {
 	binary.LittleEndian.PutUint64(buf[0:8], uint64(p.Offset))
 	binary.LittleEndian.PutUint64(buf[8:16], uint64(p.Last))
 	binary.LittleEndian.PutUint32(buf[16:20], p.Crc)
+	binary.LittleEndian.PutUint64(buf[20:28], p.Seq)
 	return buf[:], nil
 }
 
@@ -106,6 +118,7 @@ func (p *Position) UnmarshalBinary(data []byte) error {
 		Offset: int64(binary.LittleEndian.Uint64(data[0:8])),
 		Last:   int64(binary.LittleEndian.Uint64(data[8:16])),
 		Crc:    binary.LittleEndian.Uint32(data[16:20]),
+		Seq:    binary.LittleEndian.Uint64(data[20:28]),
 	}
 	if q.Offset < 0 || q.Last < 0 || (q.Offset != 0 && q.Last >= q.Offset) {
 		return fmt.Errorf("litekv: %w: offset %d, last record at %d", ErrorCorruptData, q.Offset, q.Last)
@@ -141,10 +154,29 @@ func (kvs *KeyValueStore) position() Position {
 	// far as it is intact and leaves the torn tail out of it.
 	var found Position
 	kvs.scan(func(pos, next int64, r Record) bool {
-		found = Position{Offset: next, Last: pos, Crc: r.Crc}
+		found = Position{Offset: next, Last: pos, Crc: r.Crc, Seq: after(r.Seq)}
 		return true
 	})
+
+	// An empty log still has a place in the stream, and saying so is the whole
+	// of what the number is for: the log a DB has just rotated into holds no
+	// record to name, and the end of the log it rotated out of holds one. They
+	// are the same point, and only the number says so.
+	if found == (Position{}) && kvs.numbers {
+		found.Seq = kvs.seq
+	}
 	return found
+}
+
+// after is the number the record following one numbered seq would take, and
+// zero for a record that carries no number: a store that does not number them
+// has no next number either, and saying one would put an unnumbered log ahead
+// of the start of a numbered one.
+func after(seq uint64) uint64 {
+	if seq == 0 {
+		return 0
+	}
+	return seq + 1
 }
 
 // positionAt reports the position of a log whose newest record starts at last,
@@ -159,7 +191,7 @@ func (kvs *KeyValueStore) positionAt(last int64) (Position, bool) {
 	if err != nil || next != int64(len(kvs.Data)) {
 		return Position{}, false
 	}
-	return Position{Offset: next, Last: last, Crc: record.Crc}, true
+	return Position{Offset: next, Last: last, Crc: record.Crc, Seq: after(record.Seq)}, true
 }
 
 // Reached reports whether this store holds every record up to pos: nil if it
@@ -186,8 +218,9 @@ func (kvs *KeyValueStore) Reached(pos Position) error {
 	kvs.RLock()
 	defer kvs.RUnlock()
 
-	// The zero position names nothing, and every store holds that much.
-	if pos == (Position{}) {
+	// A position at the start of the log names no record, and every store holds
+	// that much of it.
+	if pos.Offset == 0 {
 		return nil
 	}
 
@@ -361,8 +394,9 @@ func (kvs *KeyValueStore) batch(pos Position, size int64, dst []byte) ([]byte, P
 
 	// Where the follower says it has got to has to be a place this log has
 	// actually been: a record starting there, ending where the follower says its
-	// log ends, with the checksum the follower holds.
-	if pos != (Position{}) {
+	// log ends, with the checksum the follower holds. An offset of zero is the
+	// start of the log and names no record, whatever else the position carries.
+	if pos.Offset != 0 {
 		if pos.Offset > here.Offset {
 			return dst, pos, ErrorDiverged
 		}
@@ -385,7 +419,7 @@ func (kvs *KeyValueStore) batch(pos Position, size int64, dst []byte) ([]byte, P
 		if end-pos.Offset > size && next.Offset > pos.Offset {
 			break
 		}
-		next = Position{Offset: end, Last: next.Offset, Crc: record.Crc}
+		next = Position{Offset: end, Last: next.Offset, Crc: record.Crc, Seq: after(record.Seq)}
 	}
 
 	return append(dst, kvs.Data[pos.Offset:next.Offset]...), next, nil
@@ -591,8 +625,40 @@ func (kvs *KeyValueStore) takeRecords(batch []byte, index map[string]int64, last
 	}
 
 	kvs.lastRecord = pos + last
+
+	// The records came numbered by whoever wrote them, and a follower keeps
+	// those numbers rather than making its own. What it takes from them is
+	// where to carry on from if it is ever promoted, since numbers only go up
+	// and reissuing one would put two records in the same place in the stream.
+	//
+	// The highest of them, not the last of them: a snapshot ships the newest
+	// version of every key by asking the newest log first, so what arrives is
+	// in no particular order and the last record of a batch is routinely not
+	// its highest numbered. See TestFollowerKeepsTheLeadersNumbers.
+	kvs.observe(highestSeqIn(batch))
+
 	kvs.notify()
 	return nil
+}
+
+// highestSeqIn is the largest number carried by the records at the front of
+// buf, and zero if none of them carry one. The records have already been
+// verified by the time this walks them, so a record that will not decode ends
+// it rather than being an error.
+func highestSeqIn(buf []byte) uint64 {
+	var highest uint64
+
+	for at := int64(0); at < int64(len(buf)); {
+		record, next, err := parseRecordAt(buf, at)
+		if err != nil {
+			break
+		}
+		if record.Seq > highest {
+			highest = record.Seq
+		}
+		at = next
+	}
+	return highest
 }
 
 // recordLen reports how many bytes the record at the front of buf takes and
@@ -627,6 +693,11 @@ func (kvs *KeyValueStore) Reset() error {
 	kvs.Data = nil
 	kvs.Index = make(map[string]int64)
 	kvs.lastRecord = 0
+
+	// The numbering is left where it is. Emptying a store does not un-hand-out
+	// the numbers it has already given to records that are now somewhere else,
+	// and a follower about to be sent a snapshot takes its numbering from the
+	// records in it.
 	kvs.notify()
 
 	return kvs.rewrite()

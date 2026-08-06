@@ -19,7 +19,7 @@ func FuzzHint(f *testing.F) {
 
 	dir := f.TempDir()
 	segment := dir + "/0000000001" + segmentSuffix
-	if err := writeHint(segment, 1024, index); err != nil {
+	if err := writeHint(segment, 1024, 7, index); err != nil {
 		f.Fatal(err)
 	}
 	written, err := disk.ReadFile(hintPath(segment))
@@ -34,7 +34,7 @@ func FuzzHint(f *testing.F) {
 	f.Add(make([]byte, hintHeaderSize+4), int64(0))
 
 	f.Fuzz(func(t *testing.T, data []byte, segmentSize int64) {
-		got, ok := parseHint(data, segmentSize)
+		got, _, ok := parseHint(data, segmentSize)
 		if !ok {
 			return
 		}
@@ -70,12 +70,13 @@ func FuzzSegmentBytes(f *testing.F) {
 	f.Add(make([]byte, headerSizeV0))
 	f.Add(make([]byte, headerSizeV1))
 	f.Add(make([]byte, headerSizeV2))
+	f.Add(make([]byte, headerSizeV4))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		reader := bytes.NewReader(data)
 		size := int64(len(data))
 
-		index, good, err := indexSegment(reader, size)
+		index, good, _, err := indexSegment(reader, size)
 		if err != nil {
 			t.Fatalf("indexing bytes should refuse them, not fail: %v", err)
 		}

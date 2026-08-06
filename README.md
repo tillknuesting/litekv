@@ -493,8 +493,8 @@ record. That is all replication is here: shipping the log. It is the WAL-shippin
 in the leader-follower chapter of *Designing Data-Intensive Applications*, and the one PostgreSQL and
 MySQL use — the follower names a position once and the leader streams from there.
 
-Nothing in the library opens a socket. What crosses the gap is a `Position`, which marshals to twenty
-bytes, and a run of records; carrying those over TCP, HTTP, a pipe or a file is yours to do. A record
+Nothing in the library opens a socket. What crosses the gap is a `Position`, which marshals to
+twenty-eight bytes, and a run of records; carrying those over TCP, HTTP, a pipe or a file is yours to do. A record
 carries its own lengths, so a stream of them needs no framing on top.
 
 ```go
@@ -598,17 +598,55 @@ from and judges by its own. A position from a leader that has been replaced gets
 since whether that write survived the failover is not something a follower of the new leader can work
 out.
 
-**One position is answered too cautiously.** A position at the start of a log names no record, and the
-end of the log before it is the same point in the stream — which two positions cannot say, neither of
-them knowing how long that log was. A leader whose active log is empty hands out the start of it, which
-is every leader that has just rotated or been snapshotted, and a follower holding every record it ever
-wrote rests at the end of the log before, because that is the position that can be checked. So it reports
-`ErrorStale` while holding everything, until one more record crosses. It refuses a read that is current
-rather than allowing one that is not, and the real fix is a sequence number in the record rather than
-anything this comparison can do.
-
 None of this says a store is fresh in general. A position is not a clock, and reaching one says only
 that what it names is here.
+
+### The number on every record
+
+What makes two of a `DB`'s positions comparable is a number the leader puts on each record as it writes
+it, counting from one. A position carries the number its next record will take, so comparing two of them
+is comparing two integers — and the awkward case is the one that needs it:
+
+> A position at the start of a log names no record, and the end of the log before it is the same point
+> in the stream. Their offsets have nothing in common and their log ids differ by one. A leader whose
+> active log is empty hands out the first, which is every leader that has just rotated or been
+> snapshotted, and a follower holding every record it ever wrote rests at the second, because that is
+> the position that can be checked.
+
+Both carry the same number, so both compare equal, and a replica holding everything says so instead of
+saying it is behind.
+
+**It is in the record rather than counted, and that is not an implementation detail.** Merging drops
+records — superseded ones always, tombstones when the run reaches the oldest log — so a store counting
+what it holds would count fewer than the leader wrote, and two replicas that merged at different times
+would answer the same question about the same position differently. A number that travels with the
+record is the same number wherever it is read. A follower keeps the numbers on the records it is sent
+rather than making its own, and a follower that is promoted carries on from the highest it holds.
+
+The number is handed out under the write lock, which is what puts it in the order the records are in.
+Taking it from an atomic counter before the lock would let two writers take numbers in one order and
+append in the other, and a position naming the last record would then name a number with a bigger one
+behind it. The checksum has to follow the number, so a numbered store checksums the serialized record
+under that lock instead of folding the fields before it.
+
+**What it costs.** Eight bytes a record, which for a 16-byte key and a 16-byte value is 54 bytes to 62,
+and for a 1 KiB value is under a percent. The write itself is *faster*, because a checksum taken in one
+pass over the record beats one folded field by field:
+
+| in-memory write | plain    | numbered |
+| --------------- | -------- | -------- |
+| 16-byte values  | 231 ns   | 205 ns   |
+| 1 KiB values    | 261 ns   | 219 ns   |
+
+A `DB` writing 128-byte values into rotating 64 KiB logs is about 4% slower, which is the extra bytes
+arriving at the next rotation sooner rather than anything the write does. A `KeyValueStore` is untouched
+in both senses: it does not number, so it holds the bytes it always did and writes them at the speed it
+always did.
+
+A store written before any of this has records with no number on them. They report zero, positions in
+them carry zero, and `Reached` falls back to comparing log ids and offsets — which is exact everywhere
+except at that one boundary, where it says `ErrorStale` while holding everything until one more record
+crosses.
 
 ### What it costs
 
@@ -973,11 +1011,23 @@ to 3:
 | 22     | 4    | Key length                                   |
 | 26     | 4    | Value length                                 |
 
-The two sit in the same log and always have — the version byte is how a reader tells them apart, and it
-is why the wider layout could be added without orphaning anything. It is a version rather than a field
-on every record because most records never expire, and eight bytes on each of them is not free: the
-timestamp alone took an in-memory write from roughly 50 ns to 110. A store that never sets an expiry
-holds exactly the bytes it always did.
+A record carrying a sequence number takes another eight, after the expiry when there is one. Version 4
+is a numbered record with no expiry, at 30 bytes of header, and version 5 is one with both, at 38:
+
+| Offset | Size | Field                                        |
+| ------ | ---- | -------------------------------------------- |
+| 6      | 8    | Timestamp, nanoseconds since the Unix epoch  |
+| 14     | 8    | Expires, when the version says there is one  |
+| 14/22  | 8    | Sequence number, from one                    |
+| 22/30  | 4    | Key length                                   |
+| 26/34  | 4    | Value length                                 |
+
+All of them sit in the same log and always have — the version byte is how a reader tells them apart, and
+it is why each wider layout could be added without orphaning anything. They are versions rather than
+fields on every record because most records need neither, and eight bytes on each is not free: the
+timestamp alone took an in-memory write from roughly 50 ns to 110. A store that sets neither holds
+exactly the bytes it always did, which is every `KeyValueStore` — only a `DB` numbers its records, and
+only records given an expiry carry one.
 
 The checksum covers everything after itself, so it does not depend on the layout of what follows. Keys
 and values are limited to 4 GiB by the uint32 length fields, and `Write` returns `ErrorRecordTooLarge`

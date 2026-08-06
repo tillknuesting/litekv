@@ -2247,15 +2247,22 @@ func TestDBFollowIsNotStrandedByAMerge(t *testing.T) {
 	}
 	defer follower.Close()
 
-	// Something in the store before the snapshot, so the position it comes with
-	// names a record. A snapshot of a store whose active log is empty has
-	// nowhere to point but the start of that log, and that position stops being
-	// checkable the moment the log freezes — which on one core is before this
-	// goroutine is next scheduled.
-	for i := 0; i < 20; i++ {
+	// Something in the log being written before the snapshot, so the position it
+	// comes with names a record. A snapshot of a store whose active log is empty
+	// has nowhere to point but the start of that log, and that position stops
+	// being checkable the moment the log freezes — which on one core is before
+	// this goroutine is next scheduled.
+	//
+	// Written until that is true rather than a fixed number of times: a count
+	// that happens to land on a rotation leaves the active log empty, and how
+	// many records that takes is a fact about the record layout, which changes.
+	for i := 0; i < 200 && leader.Position().Log.Offset == 0; i++ {
 		if err := leader.Write([]byte(fmt.Sprintf("early-%02d", i)), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if leader.Position().Log.Offset == 0 {
+		t.Fatal("the leader's active log is still empty; the snapshot would have nothing to point at")
 	}
 
 	var wire bytes.Buffer

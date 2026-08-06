@@ -1,6 +1,7 @@
 package litekv
 
 import (
+	"encoding/binary"
 	"io"
 	"os"
 	"path/filepath"
@@ -237,17 +238,25 @@ func (kvs *KeyValueStore) Recover() (int64, error) {
 	// fails its checksum ends it by returning false. Either way the log is only
 	// trustworthy up to that point.
 	var good, last int64
+	var highest uint64
 	kvs.scan(func(pos, next int64, r Record) bool {
 		if r.Crc != checksumSerialized(kvs.Data[pos:next]) {
 			return false
 		}
 		index[string(r.Key)] = pos
 		last, good = pos, next
+		if r.Seq > highest {
+			highest = r.Seq
+		}
 		return true
 	})
 
 	kvs.Index = index
 	kvs.lastRecord = last
+
+	// The highest number in the log, not the number of the last record: a
+	// follower's log arrives in whatever order a snapshot shipped it.
+	kvs.observe(highest)
 
 	// Whatever was following this log was following the version of it that was
 	// here before it was loaded or recovered.
@@ -476,13 +485,37 @@ func (kvs *KeyValueStore) appendRecord(record *Record, key []byte) error {
 	}
 
 	pos := int64(len(kvs.Data))
+
+	// The number goes on under the lock, which is the only place it can: it is
+	// what puts this record after the one before it, so handing it out earlier
+	// would let two writers take numbers in one order and append in the other.
+	// The checksum has to follow it, and is taken over the serialized record —
+	// one pass over contiguous bytes rather than a fold of the fields, which is
+	// the cheaper of the two and the reason this is not simply done twice.
+	if kvs.numbers {
+		record.Seq = kvs.seq
+		record.Version = record.version()
+	}
+
 	kvs.Data = record.appendTo(kvs.Data)
+
+	if kvs.numbers {
+		record.Crc = checksumSerialized(kvs.Data[pos:])
+		binary.LittleEndian.PutUint32(kvs.Data[pos:pos+4], record.Crc)
+	}
 
 	if state != nil {
 		if err := kvs.writeToLog(state, kvs.Data[pos:], pos); err != nil {
 			kvs.Data = kvs.Data[:pos]
 			return err
 		}
+	}
+
+	// Only a record that is stored spends a number. A gap would be harmless —
+	// nothing here counts them, it only compares them — but a log whose numbers
+	// match its records is easier to trust than one that skips.
+	if kvs.numbers {
+		kvs.seq++
 	}
 
 	if kvs.Index == nil {

@@ -60,7 +60,7 @@ type DBPosition struct {
 // dbPositionSize is what a DBPosition takes on the wire.
 const dbPositionSize = 8 + 8 + positionSize
 
-// MarshalBinary encodes the position in thirty-six bytes, little-endian.
+// MarshalBinary encodes the position in forty-four bytes, little-endian.
 func (p DBPosition) MarshalBinary() ([]byte, error) {
 	log, err := p.Log.MarshalBinary()
 	if err != nil {
@@ -580,7 +580,7 @@ func (db *DB) batch(pos DBPosition, size int64, dst []byte) ([]byte, DBPosition,
 	// follower takes another snapshot exactly as if the log had been removed.
 	// Every other position names a record, which is what batch goes out of its
 	// way to arrange.
-	if pos.Log == (Position{}) && pos.Segment != db.active.segID {
+	if pos.Log.Offset == 0 && pos.Segment != db.active.segID {
 		if seg := db.frozenSegment(pos.Segment); seg == nil || seg.bytes > 0 {
 			return dst, pos, ErrorDiverged
 		}
@@ -715,8 +715,8 @@ func (d *diskSegment) batch(pos Position, size int64, dst []byte) ([]byte, Posit
 	// Where the follower says it has got to has to be a place this log has
 	// actually been. A merge writes its output over the oldest log it replaces,
 	// so a log keeps its name while becoming something else entirely, and this
-	// is what tells the difference.
-	if pos != (Position{}) {
+	// is what tells the difference. An offset of zero names no record.
+	if pos.Offset != 0 {
 		record, raw, err := readRecordAt(d.file, d.bytes, pos.Last)
 		if err != nil || pos.Last+int64(len(raw)) != pos.Offset || record.Crc != pos.Crc {
 			return dst, pos, ErrorDiverged
@@ -749,7 +749,7 @@ func (d *diskSegment) batch(pos Position, size int64, dst []byte) ([]byte, Posit
 		if err != nil {
 			break // the rest of this record did not fit in the batch
 		}
-		next = Position{Offset: pos.Offset + end, Last: next.Offset, Crc: record.Crc}
+		next = Position{Offset: pos.Offset + end, Last: next.Offset, Crc: record.Crc, Seq: after(record.Seq)}
 	}
 
 	// Not one whole record fitted, which happens when a record is larger than a
@@ -761,7 +761,7 @@ func (d *diskSegment) batch(pos Position, size int64, dst []byte) ([]byte, Posit
 			return dst[:start], pos, err
 		}
 		dst = append(dst[:start], raw...)
-		return dst, Position{Offset: pos.Offset + int64(len(raw)), Last: pos.Offset, Crc: record.Crc}, nil
+		return dst, Position{Offset: pos.Offset + int64(len(raw)), Last: pos.Offset, Crc: record.Crc, Seq: after(record.Seq)}, nil
 	}
 
 	return dst[:start+int(next.Offset-pos.Offset)], next, nil
@@ -815,17 +815,15 @@ const ErrorSuperseded = Error("position is from a leader that has been replaced"
 // own. A term this store has not heard of is a leader it has heard nothing from,
 // so it is behind by definition.
 //
-// One position is answered too cautiously, and it cannot be answered any other
-// way here: the start of a log. It names no record, and the end of the log
-// before it is the same point in the stream — which two positions cannot say,
-// since neither of them knows how long that log was. A leader whose active log
-// is empty hands out the start of it, which is every leader that has just
-// rotated or just been snapshotted, and a follower holding every record it ever
-// wrote rests at the end of the log before. So it reports ErrorStale while
-// holding everything, until one more record crosses and settles it. That is the
-// safe direction — a read refused while current, rather than allowed while
-// stale — and the fix is a sequence number in the record rather than anything
-// this comparison can do.
+// The boundary between two logs is what the numbers are for. A position at the
+// start of a log names no record, and the end of the log before it is the same
+// point in the stream — which offsets and log ids cannot say, since neither
+// position knows how long that log was, and a leader hands out the start of a
+// log every time it rotates or is snapshotted. Both carry the same number, so
+// both compare equal. A store holding records from before there were numbers
+// falls back to comparing log ids and offsets, and is cautious at that one
+// boundary: it reports ErrorStale while holding everything, until one more
+// record crosses.
 //
 // This says nothing about whether the store should be read from at all. A fenced
 // store still holds what it holds, and a replica is behind its leader by
@@ -862,9 +860,22 @@ func (db *DB) reached(pos DBPosition) error {
 		return ErrorSuperseded
 	}
 
-	// One leader's stream: the log ids rise as it rotates, and the offsets rise
-	// within a log. A position at the start of a log compares as the start of
-	// it, which is the cautious end of the boundary described above.
+	// The numbers, when both ends have them. They are the only thing here that
+	// compares across logs: the end of one log and the start of the next are
+	// the same point in the stream and carry the same number, where their
+	// offsets have nothing in common and their log ids differ by one.
+	if here.Log.Seq != 0 && pos.Log.Seq != 0 {
+		if here.Log.Seq < pos.Log.Seq {
+			return ErrorStale
+		}
+		return nil
+	}
+
+	// A store written before records were numbered, or a position cut by one.
+	// The log ids rise as a leader rotates and the offsets rise within a log,
+	// which orders every pair of positions except the one across a boundary —
+	// where this says stale while holding everything, until one more record
+	// crosses. That is the cautious way round, and it is why the numbers exist.
 	if here.Segment != pos.Segment {
 		if here.Segment > pos.Segment {
 			return nil
@@ -1231,7 +1242,7 @@ func readBatch(r io.Reader, limit int64) ([]byte, error) {
 const (
 	appliedFile    = "replica"
 	appliedMagic   = "LKVR"
-	appliedVersion = 3
+	appliedVersion = 4
 
 	// magic, version, the term, the highest term heard of, the position, and a
 	// checksum over all of it.

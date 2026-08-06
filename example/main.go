@@ -266,18 +266,23 @@ func main() {
 
 	// The leader's end: read the position the follower has reached, then send
 	// records from there for as long as it stays connected. A position is
-	// twenty bytes, which is the only thing the two ends have to agree on.
+	// twenty-eight bytes, which is the only thing the two ends have to agree on.
 	go func() {
 		defer streaming.Done()
 		defer server.Close()
 
-		var asked [20]byte
-		if _, err := io.ReadFull(server, asked[:]); err != nil {
+		// However many bytes a position marshals to, which is the one number
+		// the two ends have to agree on. Ask a zero one rather than writing it
+		// down here.
+		size, _ := (litekv.Position{}).MarshalBinary()
+
+		asked := make([]byte, len(size))
+		if _, err := io.ReadFull(server, asked); err != nil {
 			return
 		}
 
 		var from litekv.Position
-		if err := from.UnmarshalBinary(asked[:]); err != nil {
+		if err := from.UnmarshalBinary(asked); err != nil {
 			return
 		}
 

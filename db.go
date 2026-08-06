@@ -332,9 +332,28 @@ func (db *DB) start(id uint64) error {
 		return err
 	}
 
+	// Numbering carries on from the highest number anywhere in this store, not
+	// just from the highest in the log about to be written. A store that was
+	// rotated and then stopped comes back with an empty log, and taking that log
+	// at its word would start again from one and hand out numbers already given
+	// to a client. The frozen logs are opened before this one for that reason.
+	kvs.number(db.highestSeq())
+
 	db.active = &memSegment{segID: id, kvs: kvs}
 	db.nextID = id + 1
 	return nil
+}
+
+// highestSeq is the highest record number this store has handed out, as far as
+// its frozen logs know. Callers must not be racing an open.
+func (db *DB) highestSeq() uint64 {
+	var highest uint64
+	for _, seg := range db.frozen {
+		if seg.maxSeq > highest {
+			highest = seg.maxSeq
+		}
+	}
+	return highest
 }
 
 // segmentIDs returns the ids of the logs in dir, oldest first.
@@ -681,6 +700,11 @@ func (db *DB) rotateLocked() error {
 		return err
 	}
 
+	// The numbering crosses the rotation. It is one stream however many files
+	// it is kept in, and a log that started again from one would put two
+	// records in the same place in it.
+	kvs.number(db.active.kvs.highestSeq())
+
 	frozen, err := freeze(db.active, db.opts.Sync, db.opts.bloomMinKeys())
 	if err != nil {
 		kvs.Close()
@@ -805,7 +829,19 @@ func (db *DB) mergeLocked(victims []*diskSegment, dropTombstones bool) error {
 	//
 	// The merge knows where it put every record, so there is nothing to read
 	// back: the index it built is the index of the new log.
-	merged, err := adoptMerged(oldest.id(), temp, db.path(oldest.id()), index, size, db.opts.bloomMinKeys())
+	// The highest number the merge covers is the highest of its inputs, not the
+	// highest of what it kept. A merge drops records — superseded ones always,
+	// tombstones when the run reaches the oldest log — and the one it drops may
+	// be the newest of the lot, so reading the merged file back would report a
+	// number below one already handed out and let the next write reuse it.
+	var maxSeq uint64
+	for _, seg := range victims {
+		if seg.maxSeq > maxSeq {
+			maxSeq = seg.maxSeq
+		}
+	}
+
+	merged, err := adoptMerged(oldest.id(), temp, db.path(oldest.id()), index, size, maxSeq, db.opts.bloomMinKeys())
 	if err != nil {
 		disk.Remove(temp)
 		return err
@@ -829,7 +865,7 @@ func (db *DB) mergeLocked(victims []*diskSegment, dropTombstones bool) error {
 
 	// Written once the log is where it says it is, so a hint never describes a
 	// file under a name it has not reached yet.
-	writeHint(db.path(oldest.id()), size, index)
+	writeHint(db.path(oldest.id()), size, maxSeq, index)
 
 	db.mu.Lock()
 	replaced := make(map[uint64]bool, len(victims))
@@ -984,13 +1020,13 @@ func mergeInto(path string, victims []*diskSegment, dropTombstones bool) (map[st
 // through a rename, and opening it afterwards would leave a failure with the
 // log swapped and the store still holding the segment it replaced. The hint is
 // written by the caller, once the rename has happened.
-func adoptMerged(id uint64, at, path string, index map[string]int64, size int64, bloomMin int) (*diskSegment, error) {
+func adoptMerged(id uint64, at, path string, index map[string]int64, size int64, maxSeq uint64, bloomMin int) (*diskSegment, error) {
 	file, err := disk.Open(at, os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
 	}
 
-	return &diskSegment{segID: id, path: path, file: file, index: index, bytes: size, filter: maybeBloom(index, bloomMin)}, nil
+	return &diskSegment{segID: id, path: path, file: file, index: index, bytes: size, maxSeq: maxSeq, filter: maybeBloom(index, bloomMin)}, nil
 }
 
 // syncDir makes a rename in dir durable. Not every filesystem supports it, so a

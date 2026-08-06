@@ -84,6 +84,15 @@ type diskSegment struct {
 	index map[string]int64
 	bytes int64
 
+	// maxSeq is the highest number any record in this log carries, or any
+	// record in a log this one was merged from. It is the second of those that
+	// makes it an upper bound rather than a fact about the file: a merge drops
+	// records, and the one it drops may be the highest numbered, so reading the
+	// file back would say a smaller number than was ever handed out. A DB only
+	// asks this to know where to carry on numbering, and carrying on too high
+	// leaves a gap while carrying on too low reuses a number.
+	maxSeq uint64
+
 	// filter answers "not in this log" without consulting index. Nil disables
 	// it, which is how the benchmarks measure what it is worth.
 	filter *bloom
@@ -107,11 +116,11 @@ func openDiskSegment(id uint64, path string, bloomMin int) (*diskSegment, error)
 		return nil, err
 	}
 
-	if index, ok := loadHint(path, info.Size()); ok {
-		return &diskSegment{segID: id, path: path, file: file, index: index, bytes: info.Size(), filter: maybeBloom(index, bloomMin)}, nil
+	if index, maxSeq, ok := loadHint(path, info.Size()); ok {
+		return &diskSegment{segID: id, path: path, file: file, index: index, bytes: info.Size(), maxSeq: maxSeq, filter: maybeBloom(index, bloomMin)}, nil
 	}
 
-	index, good, err := indexSegment(file, info.Size())
+	index, good, maxSeq, err := indexSegment(file, info.Size())
 	if err != nil {
 		file.Close()
 		return nil, err
@@ -130,9 +139,9 @@ func openDiskSegment(id uint64, path string, bloomMin int) (*diskSegment, error)
 
 	// Reading the log the long way is worth writing down, so that opening it
 	// again does not. A hint that cannot be written is not worth failing over.
-	writeHint(path, good, index)
+	writeHint(path, good, maxSeq, index)
 
-	return &diskSegment{segID: id, path: path, file: file, index: index, bytes: good, filter: maybeBloom(index, bloomMin)}, nil
+	return &diskSegment{segID: id, path: path, file: file, index: index, bytes: good, maxSeq: maxSeq, filter: maybeBloom(index, bloomMin)}, nil
 }
 
 // freeze turns the active segment into a frozen one, letting go of the records
@@ -150,6 +159,7 @@ func freeze(m *memSegment, policy SyncPolicy, bloomMin int) (*diskSegment, error
 	m.kvs.RLock()
 	index := m.kvs.Index
 	size := int64(len(m.kvs.Data))
+	maxSeq := m.kvs.highest()
 	path := ""
 	if m.kvs.state != nil {
 		path = m.kvs.state.path
@@ -181,9 +191,9 @@ func freeze(m *memSegment, policy SyncPolicy, bloomMin int) (*diskSegment, error
 
 	// The index is already built, so writing it down here saves opening the
 	// store from ever having to read this log.
-	writeHint(path, size, index)
+	writeHint(path, size, maxSeq, index)
 
-	return &diskSegment{segID: m.segID, path: path, file: file, index: index, bytes: size, filter: maybeBloom(index, bloomMin)}, nil
+	return &diskSegment{segID: m.segID, path: path, file: file, index: index, bytes: size, maxSeq: maxSeq, filter: maybeBloom(index, bloomMin)}, nil
 }
 
 func (d *diskSegment) id() uint64 { return d.segID }
@@ -424,17 +434,22 @@ func endOfLog(err error, pos int64) error {
 }
 
 // indexSegment builds the index of a segment file, checking every record
-// against its checksum, and reports where the good part of it ends.
-func indexSegment(file io.ReaderAt, size int64) (map[string]int64, int64, error) {
+// against its checksum, and reports where the good part of it ends and the
+// highest number any of its records carries.
+func indexSegment(file io.ReaderAt, size int64) (map[string]int64, int64, uint64, error) {
 	index := make(map[string]int64)
 
 	var good int64
+	var maxSeq uint64
 	err := scanSegment(file, size, func(pos int64, raw []byte, r Record) bool {
 		if r.Crc != checksumSerialized(raw) {
 			return false
 		}
 		index[string(r.Key)] = pos
 		good = pos + int64(len(raw))
+		if r.Seq > maxSeq {
+			maxSeq = r.Seq
+		}
 		return true
 	})
 
@@ -446,8 +461,8 @@ func indexSegment(file io.ReaderAt, size int64) (map[string]int64, int64, error)
 	// throwing away what is on it.
 	var corrupt *CorruptAtError
 	if err != nil && !errors.As(err, &corrupt) {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 
-	return index, good, nil
+	return index, good, maxSeq, nil
 }

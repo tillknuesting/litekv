@@ -57,12 +57,31 @@ const (
 	recordV2     = 3
 	headerSizeV2 = 30
 
-	// recordVersion is what a record with nothing to expire is written as.
+	// recordV3 is a record carrying a sequence number, after the timestamp and
+	// where an expiry would be: Crc (4), Version (1), Type (1), Timestamp (8),
+	// Seq (8), KeyLength (4), ValueLength (4).
+	//
+	// recordV4 is one carrying both, the expiry first: Crc (4), Version (1),
+	// Type (1), Timestamp (8), Expires (8), Seq (8), KeyLength (4),
+	// ValueLength (4).
+	//
+	// The same bargain as the expiry, for the same reason. A DB numbers its
+	// records because that is what makes a position in its stream comparable
+	// with another; a KeyValueStore has no need of it, since its log is one
+	// file and an offset in it already says which record comes first. A store
+	// that is not asked to number is byte for byte what it always was.
+	recordV3     = 4
+	headerSizeV3 = 30
+	recordV4     = 5
+	headerSizeV4 = 38
+
+	// recordVersion is what a record with nothing to expire and no number is
+	// written as.
 	recordVersion = recordV1
 
 	// headerSize is the largest header, which is what a reader has to have in
 	// hand before it knows which layout it is looking at.
-	headerSize = headerSizeV2
+	headerSize = headerSizeV4
 )
 
 // headerSizeFor returns the fixed-width size of a record of this version, and
@@ -75,10 +94,20 @@ func headerSizeFor(version uint8) (int64, bool) {
 		return headerSizeV1, true
 	case version == recordV2:
 		return headerSizeV2, true
+	case version == recordV3:
+		return headerSizeV3, true
+	case version == recordV4:
+		return headerSizeV4, true
 	default:
 		return 0, false
 	}
 }
+
+// hasExpiry and hasSequence say which optional fields a layout carries. They
+// are asked rather than the version being compared, so that adding a layout is
+// one line here rather than a search for every comparison.
+func hasExpiry(version uint8) bool   { return version == recordV2 || version == recordV4 }
+func hasSequence(version uint8) bool { return version == recordV3 || version == recordV4 }
 
 // maxFieldLen is the largest key or value that fits in the uint32 length fields.
 const maxFieldLen = math.MaxUint32
@@ -111,6 +140,22 @@ type Record struct {
 	// something different on each machine that read it, and a record that
 	// crosses to a follower has to expire at the same moment on both.
 	Expires int64
+
+	// Seq is where this record comes in the stream of the store that wrote it,
+	// counting from one, or zero for a record from a store that does not number
+	// them. A DB numbers every record it writes; a KeyValueStore numbers none.
+	//
+	// It is in the record rather than being counted because merging drops
+	// records — superseded ones always, tombstones when the run reaches the
+	// oldest log — so two stores holding the same stream would count different
+	// numbers for the same record. A number that travels with the record is the
+	// same number wherever it is read, which is what lets two replicas answer
+	// the same question about a position the same way.
+	//
+	// It is the leader's number. A follower keeps the numbers on the records it
+	// is sent rather than making its own, so the two agree, and a follower that
+	// is promoted carries on from the highest it holds.
+	Seq uint64
 }
 
 // Expired reports whether the record has an expiry that has passed.
@@ -232,6 +277,18 @@ type KeyValueStore struct {
 	// so a path that changes Data and forgets to move it costs a scan and not a
 	// wrong answer. See replica.go.
 	lastRecord int64
+
+	// seq is the number the next record written here would carry, and numbers
+	// is whether one is written at all. A DB numbers its logs; a store on its
+	// own does not, and is byte for byte what it was before numbers existed.
+	//
+	// numbers is settled before the store takes a write and never changes, so
+	// the write path reads it without the lock. seq moves with every record and
+	// is the write lock's, which is also what keeps the numbers in the order the
+	// records are in — an atomic counter taken before the lock would hand out
+	// two numbers and let them be appended the other way round.
+	seq     uint64
+	numbers bool
 
 	// waiters is closed to wake whatever is following this store's log, and
 	// replaced the next time anything asks. Nil when nothing is following.
@@ -387,8 +444,14 @@ func (kvs *KeyValueStore) write(key, value []byte, expires int64) error {
 		KeyLength:   uint32(len(key)),
 		ValueLength: uint32(len(value)),
 	}
-	record.Version = record.version()
-	record.Crc = record.calculateChecksum()
+
+	// A store that numbers its records cannot know the checksum yet: the number
+	// is part of the record and is not handed out until the lock is held.
+	// appendRecord takes it over the serialized bytes instead.
+	if !kvs.numbers {
+		record.Version = record.version()
+		record.Crc = record.calculateChecksum()
+	}
 
 	kvs.Lock()
 	defer kvs.Unlock()
@@ -528,7 +591,9 @@ func (kvs *KeyValueStore) Delete(key []byte) error {
 		Key:       key,
 		KeyLength: uint32(len(key)),
 	}
-	record.Crc = record.calculateChecksum()
+	if !kvs.numbers {
+		record.Crc = record.calculateChecksum()
+	}
 
 	kvs.Lock()
 	defer kvs.Unlock()
@@ -554,6 +619,9 @@ func (r *Record) calculateChecksum() uint32 {
 	if r.Expires != 0 {
 		crc = crcFoldUint64(crc, uint64(r.Expires))
 	}
+	if r.Seq != 0 {
+		crc = crcFoldUint64(crc, r.Seq)
+	}
 	crc = crcFoldUint32(crc, r.KeyLength)
 	crc = crcFoldUint32(crc, r.ValueLength)
 
@@ -561,17 +629,23 @@ func (r *Record) calculateChecksum() uint32 {
 	return crc32.Update(crc, crc32.IEEETable, r.Value)
 }
 
-// version is the layout a record about to be written goes into: the wider one
-// only when there is an expiry to put in it.
+// version is the layout a record about to be written goes into: the widest one
+// the fields it has to carry need, and no wider.
 //
 // This has to agree with appendTo byte for byte, since checksumSerialized reads
 // back what appendTo wrote and calculateChecksum folds what this says it will
 // be. They are next to each other for that reason.
 func (r *Record) version() uint8 {
-	if r.Expires != 0 {
+	switch {
+	case r.Expires != 0 && r.Seq != 0:
+		return recordV4
+	case r.Seq != 0:
+		return recordV3
+	case r.Expires != 0:
 		return recordV2
+	default:
+		return recordVersion
 	}
-	return recordVersion
 }
 
 // crcFoldUint64 folds a little-endian uint64 into a pre-complemented CRC.
@@ -604,11 +678,11 @@ func crcFoldUint32(crc uint32, v uint32) uint32 {
 
 // appendTo serializes the Record and appends it to dst, returning the extended
 // slice. Fields are written in little-endian order: Crc, Version, Type,
-// Timestamp, then Expires when there is one, then KeyLength, ValueLength, Key,
-// Value. A record with nothing to expire goes into the narrower layout, so a
-// store that never sets one is byte for byte what it was.
+// Timestamp, then Expires when there is one, then Seq when there is one, then
+// KeyLength, ValueLength, Key, Value. A record with neither goes into the
+// narrowest layout, so a store that sets neither is byte for byte what it was.
 func (r *Record) appendTo(dst []byte) []byte {
-	var hdr [headerSizeV2]byte
+	var hdr [headerSize]byte
 	binary.LittleEndian.PutUint32(hdr[0:4], r.Crc)
 	hdr[4] = r.version()
 	hdr[5] = byte(r.Type)
@@ -616,8 +690,12 @@ func (r *Record) appendTo(dst []byte) []byte {
 
 	at := 14
 	if r.Expires != 0 {
-		binary.LittleEndian.PutUint64(hdr[14:22], uint64(r.Expires))
-		at = 22
+		binary.LittleEndian.PutUint64(hdr[at:at+8], uint64(r.Expires))
+		at += 8
+	}
+	if r.Seq != 0 {
+		binary.LittleEndian.PutUint64(hdr[at:at+8], r.Seq)
+		at += 8
 	}
 	binary.LittleEndian.PutUint32(hdr[at:at+4], r.KeyLength)
 	binary.LittleEndian.PutUint32(hdr[at+4:at+8], r.ValueLength)
@@ -678,6 +756,7 @@ type recordHeader struct {
 	recordType  RecordType
 	timestamp   int64
 	expires     int64
+	seq         uint64
 	keyLength   uint32
 	valueLength uint32
 	size        int64 // what the header itself takes
@@ -692,6 +771,7 @@ func (h recordHeader) record() Record {
 		Type:        h.recordType,
 		Timestamp:   h.timestamp,
 		Expires:     h.expires,
+		Seq:         h.seq,
 		KeyLength:   h.keyLength,
 		ValueLength: h.valueLength,
 	}
@@ -729,9 +809,13 @@ func decodeHeader(buf []byte) (recordHeader, bool) {
 	h.timestamp = int64(binary.LittleEndian.Uint64(buf[6:14]))
 
 	at := 14
-	if size == headerSizeV2 {
-		h.expires = int64(binary.LittleEndian.Uint64(buf[14:22]))
-		at = 22
+	if hasExpiry(h.version) {
+		h.expires = int64(binary.LittleEndian.Uint64(buf[at : at+8]))
+		at += 8
+	}
+	if hasSequence(h.version) {
+		h.seq = binary.LittleEndian.Uint64(buf[at : at+8])
+		at += 8
 	}
 	h.keyLength = binary.LittleEndian.Uint32(buf[at : at+4])
 	h.valueLength = binary.LittleEndian.Uint32(buf[at+4 : at+8])
@@ -933,6 +1017,11 @@ func (kvs *KeyValueStore) Compact() error {
 
 	// Every record has moved, so no follower's position survives this. Waking
 	// them is how they find that out rather than waiting for the next write.
+	//
+	// The numbering is left where it was, deliberately. Compaction only removes
+	// records, and the newest one it removes may be the highest numbered — a
+	// tombstone it was entitled to drop — so reading the number back off the log
+	// would lower it and let the next write reuse a number already handed out.
 	kvs.lastRecord = last
 	kvs.notify()
 
@@ -957,6 +1046,7 @@ func (kvs *KeyValueStore) RebuildIndex() error {
 
 	// Backwards, so that each key is inserted once: see offsets.
 	index := make(map[string]int64)
+	var highest uint64
 	for i := len(offs) - 1; i >= 0; i-- {
 		record, _, perr := parseRecordAt(kvs.Data, offs[i])
 		if perr != nil {
@@ -965,14 +1055,75 @@ func (kvs *KeyValueStore) RebuildIndex() error {
 		if _, seen := index[string(record.Key)]; !seen {
 			index[string(record.Key)] = offs[i]
 		}
+		if record.Seq > highest {
+			highest = record.Seq
+		}
 	}
 
 	kvs.Index = index
 	if len(offs) > 0 {
 		kvs.lastRecord = offs[len(offs)-1]
 	}
+	kvs.observe(highest)
 	kvs.notify()
 	return err
+}
+
+// number tells the store to give every record it writes its place in the
+// stream, carrying on after the highest number handed out anywhere — which for
+// a DB is not always the highest in this log, since the log may be an empty one
+// left by a rotation.
+//
+// It is called before the store is written to or shared, which is what lets the
+// write path read the flag without the lock.
+func (kvs *KeyValueStore) number(after uint64) {
+	kvs.Lock()
+	defer kvs.Unlock()
+
+	kvs.numbers = true
+	if after >= kvs.seq {
+		kvs.seq = after + 1
+	}
+}
+
+// observe raises the number the next record written here would take to one past
+// highest, and never lowers it. Callers must hold the write lock.
+//
+// Only ever up, for the reason a term is only ever up: a number that was handed
+// out names a place in the stream, and handing it out again puts two records
+// there. Going too high costs a gap, which nothing here counts.
+//
+// The highest number is not the number of the last record. That is true of a log
+// a store wrote itself, since the numbers are handed out under this lock in the
+// order the records are appended, but it is not true of a log a follower filled:
+// a snapshot ships the newest version of every key by asking the newest log
+// first, so it arrives newest first and the log ends on an old number.
+func (kvs *KeyValueStore) observe(highest uint64) {
+	if kvs.seq == 0 {
+		kvs.seq = 1
+	}
+	if highest >= kvs.seq {
+		kvs.seq = highest + 1
+	}
+}
+
+// highestSeq is the highest number a record in this log carries, and zero for a
+// log with none in it.
+func (kvs *KeyValueStore) highestSeq() uint64 {
+	kvs.RLock()
+	defer kvs.RUnlock()
+
+	return kvs.highest()
+}
+
+// highest is highestSeq with at least a read lock held. The counter is one past
+// the highest number in the log, except on a store nothing has ever opened,
+// recovered or numbered, where it is zero and there is no number to be one past.
+func (kvs *KeyValueStore) highest() uint64 {
+	if kvs.seq == 0 {
+		return 0
+	}
+	return kvs.seq - 1
 }
 
 // Verify walks every record in the Data slice and checks it against its stored

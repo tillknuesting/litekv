@@ -216,11 +216,11 @@ func TestDBReachedRefusesAReplicaThatIsBehind(t *testing.T) {
 	}
 }
 
-// TestDBReachedComparesLogsAndOffsets walks a position through the leader's
-// logs. Nothing else in the package compares two positions for order, so the
-// rotation boundary is the part worth holding: an offset means nothing without
-// the log it is an offset into.
-func TestDBReachedComparesLogsAndOffsets(t *testing.T) {
+// TestDBReachedOrdersTheWholeStream walks a position through the leader's logs.
+// Every mark it passed it has reached, in whatever log that mark was in, and
+// anything ahead of it it has not — which is the whole claim, and the one that
+// offsets alone cannot make across a rotation.
+func TestDBReachedOrdersTheWholeStream(t *testing.T) {
 	leader, err := OpenDB(t.TempDir(), smallSegments(200))
 	if err != nil {
 		t.Fatal(err)
@@ -237,13 +237,62 @@ func TestDBReachedComparesLogsAndOffsets(t *testing.T) {
 
 	last := marks[len(marks)-1]
 	if last.Segment == marks[0].Segment {
-		t.Fatalf("the leader never rotated; the test needs more than one log")
+		t.Fatal("the leader never rotated; the test needs more than one log")
 	}
 
-	// Everything it has passed through, in every log it has passed through.
+	// The numbers only ever go up, however many logs they cross.
 	for i, mark := range marks {
+		if mark.Log.Seq == 0 {
+			t.Fatalf("the position after write %d carries no number: %+v", i, mark)
+		}
+		if i > 0 && mark.Log.Seq <= marks[i-1].Log.Seq {
+			t.Fatalf("write %d took the number back from %d to %d", i, marks[i-1].Log.Seq, mark.Log.Seq)
+		}
 		if err := leader.Reached(mark); err != nil {
 			t.Fatalf("the leader has not reached its own position after write %d (%+v): %v", i, mark, err)
+		}
+	}
+
+	// One record further on than it has written is ahead of it, in whichever
+	// log that record would land in.
+	ahead := last
+	ahead.Log.Seq++
+	if err := leader.Reached(ahead); !errors.Is(err, ErrorStale) {
+		t.Errorf("a position one record ahead reported '%v', want %v", err, ErrorStale)
+	}
+}
+
+// TestDBReachedFallsBackToLogsAndOffsets is the same question asked with a
+// position from before records were numbered — a client holding one across the
+// upgrade, or a store whose logs predate it. There is nothing to compare but
+// the log id and the offset, which is what this did before the numbers and is
+// exact everywhere except at a log boundary.
+func TestDBReachedFallsBackToLogsAndOffsets(t *testing.T) {
+	leader, err := OpenDB(t.TempDir(), smallSegments(200))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer leader.Close()
+
+	var marks []DBPosition
+	for i := 0; i < 40; i++ {
+		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+			t.Fatal(err)
+		}
+
+		mark := leader.Position()
+		mark.Log.Seq = 0 // as a position cut before there were numbers
+		marks = append(marks, mark)
+	}
+
+	last := marks[len(marks)-1]
+	if last.Segment == marks[0].Segment {
+		t.Fatal("the leader never rotated; the test needs more than one log")
+	}
+
+	for i, mark := range marks {
+		if err := leader.Reached(mark); err != nil {
+			t.Fatalf("the leader has not reached %+v, its own position after write %d: %v", mark, i, err)
 		}
 	}
 
@@ -381,21 +430,15 @@ func TestDBReachedRefusesAPositionFromAReplacedLeader(t *testing.T) {
 	}
 }
 
-// TestDBReachedAtTheStartOfALog is the one question this comparison answers
-// too cautiously, and it is the same fact the rest of this file is built on: a
+// TestDBReachedAtTheStartOfALog is the question the numbers were added for. A
 // position at the start of a log names no record, and the end of the log before
-// it is the same point in the stream. Neither position knows how long that log
-// was, so neither can say so.
+// it is the same point in the stream: a leader whose active log is empty hands
+// out the first, and a follower holding every record it ever wrote rests at the
+// second, because that is the position that can be checked.
 //
-// A leader whose active log is empty hands out the start of it — every leader
-// that has just rotated, and every one that has just been snapshotted — while a
-// follower holding every record it ever wrote rests at the end of the log
-// before, because that is the position that can be checked. So it says it is
-// behind while holding everything.
-//
-// It is the safe direction, and it settles as soon as one more record crosses.
-// What it is not is something to leave undocumented, since a client waiting on
-// a position of this shape against an idle leader waits out its deadline.
+// Nothing about the offsets or the log ids says those are the same place. The
+// numbers do, and a follower that holds everything says so instead of saying it
+// is behind.
 func TestDBReachedAtTheStartOfALog(t *testing.T) {
 	leader, err := OpenDB(t.TempDir(), smallSegments(4096))
 	if err != nil {
@@ -422,25 +465,38 @@ func TestDBReachedAtTheStartOfALog(t *testing.T) {
 	sameStores(t, leader, follower, nil)
 
 	at := leader.Position()
-	if at.Log != (Position{}) {
+	if at.Log.Offset != 0 {
 		t.Fatalf("the leader's active log is not empty; the test needs the boundary: %+v", at)
 	}
 	if follower.Applied().Segment >= at.Segment {
 		t.Fatalf("the follower stepped into the empty log after all: %+v", follower.Applied())
 	}
-
-	if err := follower.Reached(at); !errors.Is(err, ErrorStale) {
-		t.Errorf("a follower at the boundary reported '%v', want %v", err, ErrorStale)
+	if at.Log.Seq == 0 {
+		t.Fatal("the leader's position carries no number; nothing below is being tested")
 	}
 
-	// One more record, and the batch that carries it crosses into that log.
+	// Different logs, different offsets, same place in the stream.
+	if got := follower.Applied().Log.Seq; got != at.Log.Seq {
+		t.Errorf("the follower is at number %d and the leader at %d, holding the same records", got, at.Log.Seq)
+	}
+	if err := follower.Reached(at); err != nil {
+		t.Errorf("a follower holding every record reported '%v' at the boundary", err)
+	}
+
+	// And it is still an ordering: one more record on the leader, not yet sent,
+	// is ahead of the follower.
 	if err := leader.Write([]byte("one"), []byte("more")); err != nil {
 		t.Fatal(err)
 	}
+	ahead := leader.Position()
+	if err := follower.Reached(ahead); !errors.Is(err, ErrorStale) {
+		t.Errorf("a follower a record behind reported '%v', want %v", err, ErrorStale)
+	}
+
 	followDB(t, leader, follower, ReplicaOptions{})
 
-	if err := follower.Reached(at); err != nil {
-		t.Errorf("the follower has not reached %+v with a record of that log applied: %v", at, err)
+	if err := follower.Reached(ahead); err != nil {
+		t.Errorf("the follower has not reached %+v after catching up: %v", ahead, err)
 	}
 }
 

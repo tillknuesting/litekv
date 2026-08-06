@@ -20,11 +20,11 @@ left to be inferred:
   nothing should; the server owns the protocol. `tcp_test.go` is a working
   sketch of the replication endpoint that server will need, and is the thing to
   promote into a package rather than reinvent.
-- **Format changes are cheapest now.** A batch commit marker, a TTL field, a
-  per-record sequence number: anything touching the record layout costs less
-  before there is data anyone minds losing. The version byte exists for this,
-  and each change still costs compatibility work. Server-layer decisions can
-  wait; on-disk ones cannot.
+- **Format changes are cheapest now.** A batch commit marker: anything touching
+  the record layout costs less before there is data anyone minds losing. The
+  version byte exists for this, and has now carried three changes — the
+  timestamp, the expiry, the sequence number — each costing compatibility work.
+  Server-layer decisions can wait; on-disk ones cannot.
 
 ## Where things are
 
@@ -179,6 +179,49 @@ all write it, each reading its own snapshot of the three numbers in it, so two
 of them interleaving would put one path's stale copy of a field on the disk
 underneath the other path's fresh one. `stateMu` is held across the read and the
 write.
+
+**A record's number is in the record, and only ever goes up.** Merging drops
+records, so a store that counted what it holds would count fewer than the leader
+wrote, and two replicas that merged at different times would give the same
+record different numbers and answer the same question about a position
+differently. So it travels with the record: a follower keeps the numbers on what
+it is sent, a merge copies them through, and a promoted follower carries on from
+the highest it holds. `observe` raises the counter and never lowers it, for the
+reason a term is only ever raised — a number that was handed out names a place
+in the stream, and handing it out again puts two records there. Gaps cost
+nothing; nothing counts the numbers, everything compares them.
+`TestFollowerKeepsTheLeadersNumbers`, `TestMergeKeepsTheHighestNumber`.
+
+**A follower's log is not in number order.** A snapshot ships the newest version
+of every key by asking the newest log first, so it arrives newest first and the
+follower's log ends on a low number. Reading the number off the last record — as
+the first version of this did — leaves a follower about to reuse most of the
+stream, and the store that catches it is one whose snapshot is bigger than the
+4 KiB the apply path reads at a time, since a smaller one arrives in a single
+piece and the highest number is in it. The counter is raised over the highest
+number in whatever arrived, never the last of them, and the same applies to
+`Recover` and `RebuildIndex`.
+
+**The number is handed out under the write lock.** It is what puts a record after
+the one before it, so an atomic counter taken before the lock would let two
+writers take numbers in one order and append in the other, leaving a position
+that names the last record naming a number with a bigger one behind it.
+`TestNumbersFollowTheRecordOrder` writes from eight goroutines and reads the log
+back. The checksum follows the number, so a numbered store checksums the
+serialized record under the lock rather than folding the fields before it — which
+turns out to be *faster* (231 ns to 205 at 16-byte values, 261 to 219 at 1 KiB),
+because one pass over contiguous bytes beats a fold of the header a byte at a
+time. That is the "contiguous CRC" line in the rejected table, measured again and
+much larger than the 9 ns recorded there. It is still not worth doing to the
+unnumbered path on its own — that would move a pass over the value inside the
+lock for nothing in return.
+
+**A merged log records the highest number of its inputs, not of what it kept.**
+A merge drops records, and the one it drops may be the newest of the lot, so
+reading the merged file back reports a number below one already handed out. The
+hint beside a log carries that number (hint version 2), and a hint from before it
+is ignored, which costs the scan a hint exists to save and arrives at the same
+answer. `TestMergeKeepsTheHighestNumber`.
 
 **A follower's term and its applied position are one write.** They are one fact
 from two sides — which leader, and how far through it — and `Reached` reads both
@@ -435,6 +478,25 @@ That last one is the reason `advance` exists, and it is caught by the fault
 sweep rather than by any assertion about a call's result: splitting the write in
 two breaks nothing a test can see until a fault lands between the halves.
 
+And thirteen for the numbering, against `sequence_test.go`: records not numbered
+at all, every record taking the same number, a checksum that does not cover the
+number, a counter allowed to go back down, a batch taken at its last number
+rather than its highest, a new log starting again from one, a reopened store
+forgetting what its frozen logs used, a merge recording the numbers it kept
+rather than the ones it covered, a hint that drops the number, an empty log with
+no place in the stream, a position numbered by its last record instead of by
+what follows it, `Reached` treating equal numbers as behind, and a number that
+does not cross the wire. All thirteen are caught — two of them only after the
+tests were fixed, which is the point of running them:
+
+- the counter going back down survived because the snapshot in the test fitted
+  in the 4 KiB the apply path reads at a time, so it arrived in one piece with
+  its highest number in it. Only a snapshot large enough to arrive in several
+  makes a follower take a number lower than one it already has;
+- the number not crossing the wire survived because `-run TestPositionBinary`
+  does not match `TestDBPositionBinary`, and a `KeyValueStore`'s positions carry
+  no number to lose. That is the filter trap below, for the third time.
+
 Three of those are worth knowing about beyond the list.
 
 **Two checks in `batch` look redundant and are not.** The checksum makes the
@@ -461,6 +523,14 @@ invariant above is phrased as slow-never-wrong rather than as a rule to follow.
 
 ## Traps this codebase has already sprung
 
+- **A field added to a struct that is compared to its zero value.** `Position`
+  gained `Seq`, and five places asking `pos == (Position{})` were really asking
+  "does this name a record", which is `pos.Offset == 0`. Four were in the
+  library and were changed with the field; the fifth was in a test, which then
+  wrote one record instead of ten, took a snapshot of a store whose active log
+  was empty, and failed only under `GOMAXPROCS=1` — where the timing that had
+  been hiding it changed. Grep for the zero value of anything you add a field
+  to, tests included, and ask what each comparison actually means.
 - **Hard-coded header offsets.** Bit three times now. The third was a test doing
   pointer arithmetic with `headerSize` to find where a value sat, which was
   right until a second layout existed and `headerSize` became the largest of
@@ -631,31 +701,25 @@ puts some small things ahead of some interesting ones.
 
 Fencing is done: `Promote`, a term on every `DBPosition`, and `ErrorFenced` from
 a store that has heard of a newer one. Expiry is done. Reads that are not stale
-are done: `Reached` and `Await`, on both halves. What is left below is ordered as
-before.
+are done: `Reached` and `Await`, on both halves. The per-record sequence number
+is done, which made positions totally ordered and settled the log boundary those
+two were cautious about. What is left below is ordered as before.
 
-Two things about that last one are worth knowing before building on it.
+One thing about `Reached` is still worth knowing before building on it: **a `DB`
+cannot check a position, only compare it.** A follower holds none of the leader's
+bytes, so what it compares is two numbers, and the term decides which of the
+store's two positions it compares against — the applied one for a store that is
+following, its own for one that follows nobody. Handing it a position cut by
+something that was never this store's leader is a caller error nothing here can
+catch, which is the difference from the single-store version, where the record
+the position names is in `Data` to be looked at.
 
-**A `DB` cannot check a position, only compare it.** A follower holds none of
-the leader's bytes, so `Reached` compares log ids and offsets and the term
-decides which of the store's two positions it compares against — the applied one
-for a store that is following, its own for one that follows nobody. Handing it a
-position cut by something that was never this store's leader is a caller error
-nothing here can catch, which is the difference from the single-store version,
-where the record the position names is in `Data` to be looked at.
-
-**The boundary between two logs is answered too cautiously, and no comparison
-can do better.** A position at the start of a log names no record, and the end of
-the log before it is the same point in the stream — neither position knows how
-long that log was. A leader whose active log is empty hands out the start of it,
-which is every leader that has just rotated or been snapshotted, and a follower
-holding every record rests at the end of the log before, because that is the
-position that can be checked. So it says `ErrorStale` while holding everything,
-until one more record crosses. It errs towards refusing a current read rather
-than allowing a stale one, and `TestDBReachedAtTheStartOfALog` pins it so that
-nobody "fixes" it by making the comparison generous. The actual fix is a
-per-record sequence number, which would make positions totally ordered and is
-the same format change the batch write below wants — worth doing both at once.
+The number also makes **carrying a stranded position forward** cheaper than it
+was when it was written up below. A merged log keeps its records' numbers, so a
+position naming number 40,000 can be found in the log that replaced the one it
+was cut against, where before there was nothing to look for. It is still not
+free — something has to find it without scanning the log — but the fact the
+scheme needed is now on the disk.
 
 **The server's writer.** Two goroutines writing do not merely fail to go faster,
 they halve throughput: 114 ns a write becomes 228, and more of them change little
@@ -665,7 +729,10 @@ before the API exists than after.
 
 **A batch write** is the largest thing left in the format, and needs a commit
 marker to be atomic across a crash — so it belongs in the window while format
-changes are cheap.
+changes are cheap. The sequence number went in ahead of it and is the shape to
+copy: a version per combination of optional fields, the offsets in `decodeHeader`
+and nowhere else, and the six scanners left alone because they ask for a record
+rather than reaching into one.
 
 The format byte is the cheap part and the semantics are not. "Is this record
 inside a batch that was never committed?" has to be answered by `Recover`,
