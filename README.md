@@ -659,6 +659,33 @@ start of that log. Used before the log fills it is fine, because a log being wri
 the log fills and freezes first, the leader says `ErrorDiverged` rather than guess, and the follower
 takes another snapshot.
 
+### Fencing, and promoting a replica
+
+Two stores taking writes at once cannot be reconciled. The position check refuses to splice one log onto
+another, so nothing is corrupted — but that is integrity, not durability: writes acknowledged by the
+wrong leader are discovered to be worthless and thrown away. A checksum cannot tell you that a leader has
+no business being one. A term can, because it only ever goes up.
+
+```go
+term, err := replica.Promote()   // this store is now the leader, at term+1
+```
+
+Every `DBPosition` carries the term it came from, and it is written down beside the logs, so it survives
+a restart — a term that did not would be no fence at all. From there:
+
+- a leader asked for records by anything carrying a **newer** term learns it has been replaced, writes
+  that term down, and stops taking writes: `ErrorFenced` from `Write`, `Delete` and `Snapshot`;
+- a follower refuses a snapshot or a batch from an **older** term, so a leader that has been replaced
+  cannot spread its records;
+- a follower **adopts** the term of the leader it follows, so promoting one replica fences it against
+  the leader it replaced.
+
+Reads carry on throughout. A fenced store is not broken, it is not in charge. `Promote` raises the term
+above the highest it has heard of, so a store that was fenced becomes a leader again by being promoted.
+
+What this does not do is decide who should be leader. Something outside — a person, a script, a lease
+service — decides, and `Promote` is how the decision is written down.
+
 ### Holding the logs a follower still needs
 
 Without something holding them, a follower is at the mercy of the merging going on underneath it. One
@@ -976,13 +1003,15 @@ anything either.
 - **Replication is asynchronous, and only that.** A write returns as soon as the leader has it, so a
   leader that dies loses whatever its followers had not received yet. There is no synchronous or
   semi-synchronous mode, no acknowledgement from a follower, and nothing waits for one.
-- **There is no failover, and no fencing.** Which store is the leader is your decision and nobody
-  else's. A follower promoted by hand is just a store you start writing to. Two of them written to at
-  once diverge, and the divergence is *reported* rather than resolved — a follower will refuse to splice
-  one log onto another, so nothing is corrupted, but writes acknowledged by the wrong leader are
-  discovered to be worthless and thrown away. Nothing here carries a term, so nothing can tell a leader
-  it has stopped being one. `AGENTS.md` has what fencing would take, and why it comes before consensus
-  rather than after.
+- **There is no failover.** Which store is the leader is your decision and nobody else's: `Promote`
+  writes the decision down, it does not make it. Raising the term in two places at once puts two stores
+  on the same term and gives the guarantee away, so whatever decides has to be the only thing deciding.
+  That is consensus, and it is not here — see `AGENTS.md` for why an external lease is the pragmatic
+  answer and why Raft for the data path would replace this work rather than sit on it.
+- **A fenced leader has to be told, and only replication tells it.** It cannot know it was replaced;
+  the news reaches it when something carrying a newer term asks it for records. Until then it goes on
+  taking writes, and those writes are lost when it finds out. Fencing bounds the damage, it does not
+  prevent it.
 - **A follower is a whole copy.** There is no partial replication, no filtering by key, and no way to
   follow one part of a store. The unit is the log.
 - **A replica costs the leader a copy.** Each batch is copied out of `Data` under the read lock before

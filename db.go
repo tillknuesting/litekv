@@ -53,6 +53,13 @@ type DB struct {
 	// hear; Sync and Close report it instead.
 	rotateErr error
 
+	// term is the leader generation this store is at, and seen is the highest
+	// it has heard of anywhere. A store that has heard of a term above its own
+	// has been replaced and stops taking writes. Both live in the file beside
+	// the logs. See Promote in dbreplica.go.
+	term uint64
+	seen uint64
+
 	// held counts the followers reading each log, by id. Nothing from the oldest
 	// of them onwards is merged, so a follower walking forward through the logs
 	// never has one taken out from under it — see Hold in dbreplica.go.
@@ -269,7 +276,8 @@ func OpenDB(dir string, opts DBOptions) (*DB, error) {
 		return nil, err
 	}
 
-	db := &DB{dir: dir, opts: opts, applied: readApplied(dir)}
+	term, applied := readReplicaState(dir)
+	db := &DB{dir: dir, opts: opts, term: term, seen: term, applied: applied}
 
 	// An interrupted merge leaves its half built file behind. The logs it was
 	// merging are all still there, so it can simply go.
@@ -410,6 +418,10 @@ func (db *DB) write(key, value []byte, at time.Time) error {
 		db.mu.RUnlock()
 		return ErrorClosed
 	}
+	if db.isFenced() {
+		db.mu.RUnlock()
+		return ErrorFenced
+	}
 
 	active := db.active
 	err := active.kvs.WriteExpiring(key, value, at)
@@ -434,6 +446,10 @@ func (db *DB) Delete(key []byte) error {
 	if db.closed {
 		db.mu.RUnlock()
 		return ErrorClosed
+	}
+	if db.isFenced() {
+		db.mu.RUnlock()
+		return ErrorFenced
 	}
 
 	active := db.active

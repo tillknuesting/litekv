@@ -45,6 +45,11 @@ import (
 // merged out from under a follower is caught rather than half read. The zero
 // value is no position at all, which only a snapshot can fill.
 type DBPosition struct {
+	// Term is which leader this position came from. It rises by one every time
+	// a store is promoted, and it is what stops a leader that has been replaced
+	// from being followed or written to. See Promote.
+	Term uint64
+
 	// Segment is which of the leader's logs, by the id in its filename.
 	Segment uint64
 
@@ -53,9 +58,9 @@ type DBPosition struct {
 }
 
 // dbPositionSize is what a DBPosition takes on the wire.
-const dbPositionSize = 8 + positionSize
+const dbPositionSize = 8 + 8 + positionSize
 
-// MarshalBinary encodes the position in twenty-eight bytes, little-endian.
+// MarshalBinary encodes the position in thirty-six bytes, little-endian.
 func (p DBPosition) MarshalBinary() ([]byte, error) {
 	log, err := p.Log.MarshalBinary()
 	if err != nil {
@@ -63,8 +68,9 @@ func (p DBPosition) MarshalBinary() ([]byte, error) {
 	}
 
 	buf := make([]byte, dbPositionSize)
-	binary.LittleEndian.PutUint64(buf[0:8], p.Segment)
-	copy(buf[8:], log)
+	binary.LittleEndian.PutUint64(buf[0:8], p.Term)
+	binary.LittleEndian.PutUint64(buf[8:16], p.Segment)
+	copy(buf[16:], log)
 	return buf, nil
 }
 
@@ -76,10 +82,11 @@ func (p *DBPosition) UnmarshalBinary(data []byte) error {
 	}
 
 	var q DBPosition
-	if err := q.Log.UnmarshalBinary(data[8:]); err != nil {
+	if err := q.Log.UnmarshalBinary(data[16:]); err != nil {
 		return err
 	}
-	q.Segment = binary.LittleEndian.Uint64(data[0:8])
+	q.Term = binary.LittleEndian.Uint64(data[0:8])
+	q.Segment = binary.LittleEndian.Uint64(data[8:16])
 
 	*p = q
 	return nil
@@ -99,7 +106,88 @@ func (db *DB) position() DBPosition {
 	if db.active == nil {
 		return DBPosition{}
 	}
-	return DBPosition{Segment: db.active.segID, Log: db.active.kvs.Position()}
+	return DBPosition{Term: db.term, Segment: db.active.segID, Log: db.active.kvs.Position()}
+}
+
+// Term is the leader generation this store is at. It starts at zero, rises by
+// one on every Promote, and is written down beside the logs.
+func (db *DB) Term() uint64 {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	return db.term
+}
+
+// Promote raises this store's term and returns the new one, which is what makes
+// a replica into a leader.
+//
+// The term is the whole of fencing. Two stores taking writes at once cannot be
+// reconciled — the position check will refuse to splice one log onto another, so
+// nothing is corrupted, but writes acknowledged by the wrong leader are found to
+// be worthless and thrown away. A checksum cannot tell you that a leader has no
+// business being one; a term can, because it only ever goes up.
+//
+// What it does not do is decide who should be leader. That is consensus, and it
+// is not here: something outside — a person, a script, a lease service — decides,
+// and calling this is how the decision is written down. Raising it twice in two
+// places at once puts two stores on the same term and gives the guarantee away,
+// so whatever decides has to be the only thing deciding.
+//
+// A store that had been fenced starts taking writes again, since its term is now
+// the highest it has seen.
+func (db *DB) Promote() (uint64, error) {
+	db.mu.Lock()
+
+	if db.closed {
+		db.mu.Unlock()
+		return 0, ErrorClosed
+	}
+
+	term := db.term + 1
+	if db.seen >= term {
+		term = db.seen + 1
+	}
+	applied := db.applied
+	db.mu.Unlock()
+
+	if err := writeReplicaState(db.dir, term, applied, db.opts.Sync == SyncAlways); err != nil {
+		return 0, err
+	}
+
+	db.mu.Lock()
+	db.term, db.seen = term, term
+	db.mu.Unlock()
+
+	return term, nil
+}
+
+// fenced reports whether this store has heard of a leader newer than itself, in
+// which case it is not one and may not take writes. Callers must hold db.mu.
+func (db *DB) isFenced() bool { return db.seen > db.term }
+
+// noteTerm remembers the highest term this store has heard of. A store that
+// hears of one above its own has been replaced and stops taking writes: it
+// cannot tell that by itself, and the only place the news reaches it is a
+// follower or a leader that has moved on.
+func (db *DB) noteTerm(term uint64) error {
+	db.mu.Lock()
+	if term <= db.seen {
+		db.mu.Unlock()
+		return nil
+	}
+	applied, mine := db.applied, db.term
+	db.mu.Unlock()
+
+	if err := writeReplicaState(db.dir, mine, applied, db.opts.Sync == SyncAlways); err != nil {
+		return err
+	}
+
+	db.mu.Lock()
+	if term > db.seen {
+		db.seen = term
+	}
+	db.mu.Unlock()
+	return nil
 }
 
 // Snapshot writes the store's live records to w and returns the position they
@@ -135,6 +223,9 @@ func (db *DB) Snapshot(w io.Writer, opts ReplicaOptions) (DBPosition, func(), er
 	at, frozen, err := db.freezeForSnapshot()
 	if err != nil {
 		return DBPosition{}, func() {}, err
+	}
+	if db.isFencedLocked() {
+		return DBPosition{}, func() {}, ErrorFenced
 	}
 
 	// Taken here rather than by the caller afterwards, because here there is no
@@ -225,7 +316,7 @@ func (db *DB) freezeForSnapshot() (DBPosition, []*diskSegment, error) {
 	// log's last record, so a follower handed it can be checked. Reporting the
 	// start of the new log instead would name no record at all, and every
 	// follower would be unverifiable from the moment that log filled.
-	at := DBPosition{Segment: db.active.segID, Log: db.active.kvs.Position()}
+	at := DBPosition{Term: db.term, Segment: db.active.segID, Log: db.active.kvs.Position()}
 
 	if err := db.rotateLocked(); err != nil {
 		return DBPosition{}, nil, err
@@ -251,6 +342,14 @@ func (db *DB) Since(pos DBPosition, w io.Writer, opts ReplicaOptions) (DBPositio
 	batch, next, err := db.batch(pos, opts.batchSize(), (*bufp)[:0])
 	*bufp = batch
 
+	if errors.Is(err, ErrorFenced) {
+		// Written down before it is reported, so that a leader which has been
+		// replaced stops taking writes rather than carrying on until somebody
+		// notices the error.
+		if noted := db.noteTerm(pos.Term); noted != nil {
+			return pos, noted
+		}
+	}
 	if err != nil {
 		return pos, err
 	}
@@ -304,6 +403,15 @@ func (db *DB) Hold(pos DBPosition) (release func()) {
 	defer db.mergeMu.Unlock()
 
 	return db.hold(pos)
+}
+
+// isFencedLocked reports whether this store has been replaced, taking the lock
+// itself, for the callers that are not already holding it.
+func (db *DB) isFencedLocked() bool {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	return db.isFenced()
 }
 
 // hold is Hold with db.mergeMu already held, for the callers that are inside
@@ -435,6 +543,19 @@ func (db *DB) batch(pos DBPosition, size int64, dst []byte) ([]byte, DBPosition,
 		return dst, pos, ErrorClosed
 	}
 
+	// A follower that has heard of a newer leader is not this store's to serve.
+	// This is the only way a leader learns it has been replaced — nothing else
+	// tells it — so the term is remembered by the caller and this store stops
+	// taking writes.
+	if pos.Term > db.term {
+		return dst, pos, ErrorFenced
+	}
+
+	// From here the term is this store's. It has been checked, and everything
+	// below compares positions for equality, so a caller a term behind must not
+	// be told it has something to catch up on that it has not.
+	pos.Term = db.term
+
 	// The one position that cannot be checked. A snapshot of a store whose
 	// active log was empty has nowhere to point but the start of that log, and
 	// if it fills and freezes before the follower asks for anything, there is no
@@ -464,7 +585,7 @@ func (db *DB) batch(pos DBPosition, size int64, dst []byte) ([]byte, DBPosition,
 			if err != nil {
 				return dst[:start], pos, err
 			}
-			return taken, DBPosition{Segment: next.Segment, Log: log}, nil
+			return taken, DBPosition{Term: db.term, Segment: next.Segment, Log: log}, nil
 		}
 
 		seg := db.frozenSegment(next.Segment)
@@ -477,7 +598,7 @@ func (db *DB) batch(pos DBPosition, size int64, dst []byte) ([]byte, DBPosition,
 			return dst[:start], pos, err
 		}
 		dst = taken
-		next = DBPosition{Segment: next.Segment, Log: log}
+		next = DBPosition{Term: db.term, Segment: next.Segment, Log: log}
 
 		if log.Offset < seg.bytes {
 			return dst, next, nil
@@ -502,7 +623,7 @@ func (db *DB) batch(pos DBPosition, size int64, dst []byte) ([]byte, DBPosition,
 		if after == db.active.segID && db.active.size() == 0 {
 			return dst, next, nil
 		}
-		next = DBPosition{Segment: after}
+		next = DBPosition{Term: db.term, Segment: after}
 	}
 }
 
@@ -680,6 +801,13 @@ func (db *DB) Apply(from, next DBPosition, r io.Reader, opts ReplicaOptions) (DB
 		db.mu.RUnlock()
 		return db.applied, ErrorClosed
 	}
+	// A leader below the highest term this store has heard of has been
+	// replaced, and its records are not to be taken.
+	if next.Term < db.seen {
+		here := db.applied
+		db.mu.RUnlock()
+		return here, ErrorFenced
+	}
 	if db.applied != from {
 		here := db.applied
 		db.mu.RUnlock()
@@ -694,6 +822,9 @@ func (db *DB) Apply(from, next DBPosition, r io.Reader, opts ReplicaOptions) (DB
 		}
 	}
 
+	if err := db.adoptTerm(next.Term); err != nil {
+		return db.Applied(), err
+	}
 	if err := db.setApplied(next); err != nil {
 		return db.Applied(), err
 	}
@@ -716,13 +847,51 @@ func (db *DB) Apply(from, next DBPosition, r io.Reader, opts ReplicaOptions) (DB
 // to no position at all, which is a follower that needs another one: the same
 // place it started.
 func (db *DB) ApplySnapshot(at DBPosition, r io.Reader, opts ReplicaOptions) error {
+	db.mu.RLock()
+	stale := at.Term < db.seen
+	db.mu.RUnlock()
+
+	if stale {
+		return ErrorFenced
+	}
 	if err := db.Reset(); err != nil {
 		return err
 	}
 	if err := db.applyStream(r, opts.batchSize()); err != nil {
 		return err
 	}
+	if err := db.adoptTerm(at.Term); err != nil {
+		return err
+	}
 	return db.setApplied(at)
+}
+
+// adoptTerm takes the term of the leader this store is following, so that a
+// follower of a promoted leader is fenced against the one it replaced. A
+// follower is not a leader, so raising its own term costs it nothing: it is not
+// taking writes either way, and Promote is what makes it one.
+func (db *DB) adoptTerm(term uint64) error {
+	db.mu.Lock()
+	if term <= db.term {
+		db.mu.Unlock()
+		return nil
+	}
+	applied := db.applied
+	db.mu.Unlock()
+
+	if err := writeReplicaState(db.dir, term, applied, db.opts.Sync == SyncAlways); err != nil {
+		return err
+	}
+
+	db.mu.Lock()
+	if term > db.term {
+		db.term = term
+	}
+	if term > db.seen {
+		db.seen = term
+	}
+	db.mu.Unlock()
+	return nil
 }
 
 // applyStream reads records from r and appends them to the log being written, a
@@ -802,7 +971,11 @@ func (m *memSegment) take(batch []byte, index map[string]int64, last int64) erro
 // Losing the position instead costs a batch applied twice, which is the same
 // records in the same order.
 func (db *DB) setApplied(pos DBPosition) error {
-	if err := writeApplied(db.dir, pos, db.opts.Sync == SyncAlways); err != nil {
+	db.mu.RLock()
+	term := db.term
+	db.mu.RUnlock()
+
+	if err := writeReplicaState(db.dir, term, pos, db.opts.Sync == SyncAlways); err != nil {
 		return err
 	}
 
@@ -902,22 +1075,26 @@ func readBatch(r io.Reader, limit int64) ([]byte, error) {
 	}
 }
 
-// The record of how far through a leader a follower has got, written beside the
-// logs. It is small and rewritten constantly, so it goes to one side and is
-// renamed into place: one that exists is one that was finished.
+// The replication state, written beside the logs: the term this store is at and
+// how far through a leader it has got. It is small and rewritten constantly, so
+// it goes to one side and is renamed into place: one that exists is one that was
+// finished.
 //
-// A damaged or missing one means no position at all, which costs a snapshot and
-// never a wrong answer — the same bargain a hint makes.
+// A damaged or missing one means no position and no term, which costs a snapshot
+// and never a wrong answer — the same bargain a hint makes. Losing a term the
+// safe way round means going back to zero, so a store that was fenced starts
+// taking writes again; a term is a claim about the world, not a fact about the
+// records, and there is nowhere else to recover it from.
 const (
 	appliedFile    = "replica"
 	appliedMagic   = "LKVR"
-	appliedVersion = 1
+	appliedVersion = 2
 
-	// magic, version, the position, and a checksum over all of it.
-	appliedSize = 4 + 1 + dbPositionSize + 4
+	// magic, version, the term, the position, and a checksum over all of it.
+	appliedSize = 4 + 1 + 8 + dbPositionSize + 4
 )
 
-func writeApplied(dir string, pos DBPosition, durable bool) error {
+func writeReplicaState(dir string, term uint64, pos DBPosition, durable bool) error {
 	encoded, err := pos.MarshalBinary()
 	if err != nil {
 		return err
@@ -926,8 +1103,9 @@ func writeApplied(dir string, pos DBPosition, durable bool) error {
 	var buf [appliedSize]byte
 	copy(buf[0:4], appliedMagic)
 	buf[4] = appliedVersion
-	copy(buf[5:5+dbPositionSize], encoded)
-	binary.LittleEndian.PutUint32(buf[5+dbPositionSize:], crc32.ChecksumIEEE(buf[:5+dbPositionSize]))
+	binary.LittleEndian.PutUint64(buf[5:13], term)
+	copy(buf[13:13+dbPositionSize], encoded)
+	binary.LittleEndian.PutUint32(buf[13+dbPositionSize:], crc32.ChecksumIEEE(buf[:13+dbPositionSize]))
 
 	path := filepath.Join(dir, appliedFile)
 	temp := path + mergeSuffix
@@ -966,23 +1144,23 @@ func writeApplied(dir string, pos DBPosition, durable bool) error {
 	return nil
 }
 
-// readApplied reads that record back, and reports the zero position for one
-// that is not there or cannot be trusted.
-func readApplied(dir string) DBPosition {
+// readReplicaState reads that back, and reports nothing for a file that is not
+// there or cannot be trusted.
+func readReplicaState(dir string) (uint64, DBPosition) {
 	raw, err := disk.ReadFile(filepath.Join(dir, appliedFile))
 	if err != nil || len(raw) != appliedSize {
-		return DBPosition{}
+		return 0, DBPosition{}
 	}
 	if string(raw[0:4]) != appliedMagic || raw[4] != appliedVersion {
-		return DBPosition{}
+		return 0, DBPosition{}
 	}
-	if binary.LittleEndian.Uint32(raw[5+dbPositionSize:]) != crc32.ChecksumIEEE(raw[:5+dbPositionSize]) {
-		return DBPosition{}
+	if binary.LittleEndian.Uint32(raw[13+dbPositionSize:]) != crc32.ChecksumIEEE(raw[:13+dbPositionSize]) {
+		return 0, DBPosition{}
 	}
 
 	var pos DBPosition
-	if err := pos.UnmarshalBinary(raw[5 : 5+dbPositionSize]); err != nil {
-		return DBPosition{}
+	if err := pos.UnmarshalBinary(raw[13 : 13+dbPositionSize]); err != nil {
+		return 0, DBPosition{}
 	}
-	return pos
+	return binary.LittleEndian.Uint64(raw[5:13]), pos
 }

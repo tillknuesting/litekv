@@ -178,6 +178,12 @@ const (
 	// uint32 length fields of the binary format.
 	ErrorRecordTooLarge = Error("key or value exceeds 4 GiB")
 
+	// ErrorFenced is returned by a store that has heard of a leader newer than
+	// itself. It has been replaced and may not take writes, and it cannot find
+	// that out on its own — the news reaches it through a follower or a leader
+	// that has moved on. Promote is how it becomes a leader again.
+	ErrorFenced = Error("store has been fenced by a newer term")
+
 	// ErrorKeyExpired is returned for a key whose newest record was written
 	// with an expiry that has passed. Like ErrorKeyDeleted it means there is no
 	// value; the two are told apart because one of them says the key was asked

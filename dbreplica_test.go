@@ -547,10 +547,18 @@ func TestDBPositionBinary(t *testing.T) {
 		}
 	}
 
-	// A log part that does not describe a log is refused whatever the segment.
+	// A log part that does not describe a log is refused whatever the term and
+	// segment in front of it are. Built by marshalling the impossible part
+	// rather than by writing bytes at offsets, which is what broke when the
+	// term was put in front of them.
+	impossible, err := Position{Offset: 40, Last: 40}.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	nonsense := make([]byte, dbPositionSize)
-	nonsense[8] = 40  // an offset of 40
-	nonsense[16] = 40 // with its last record starting at the end of it
+	copy(nonsense[dbPositionSize-positionSize:], impossible)
+
 	var got DBPosition
 	if err := got.UnmarshalBinary(nonsense); err == nil {
 		t.Errorf("a position whose log part is impossible was accepted as %+v", got)

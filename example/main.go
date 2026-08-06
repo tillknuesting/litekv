@@ -501,6 +501,25 @@ func main() {
 		must(err)
 	}
 
+	// Promote makes a replica into a leader by raising its term, which is
+	// written down beside the logs. Every position carries it, and a store that
+	// hears of a newer one stops taking writes: it cannot tell it has been
+	// replaced any other way. Deciding who should be leader is somebody else's
+	// job — this only writes the decision down.
+	term, err := replicaDB.Promote()
+	must(err)
+	fmt.Printf("the follower was promoted to term %d; the old leader is at %d\n", term, db.Term())
+
+	// The old leader is still up and still thinks it is in charge. It finds out
+	// the moment anything carrying the newer term asks it for records.
+	_, err = db.Since(replicaDB.Position(), io.Discard, litekv.ReplicaOptions{})
+	if errors.Is(err, litekv.ErrorFenced) {
+		fmt.Println("and the old leader has been fenced:", err)
+	}
+	if err := db.Write([]byte("late"), []byte("value")); errors.Is(err, litekv.ErrorFenced) {
+		fmt.Println("it takes no more writes, though it still reads")
+	}
+
 	// Reset empties a follower, which is what it does when a leader says there
 	// is no position the two agree on.
 	must(replicaDB.Reset())

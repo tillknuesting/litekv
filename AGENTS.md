@@ -162,6 +162,22 @@ snapshot of a store whose active log is empty, which is refused if that log has
 since frozen. `TestDBSnapshotOfAnEmptyStore` is the exception,
 `TestDBTailCrossesFrozenLogs` is the rule.
 
+**A term only ever goes up, and it is written down before it is believed.**
+`Promote` raises it above the highest this store has heard of and persists it
+before returning; `noteTerm` and `adoptTerm` do the same for a term heard from
+somewhere else. A term that did not survive a restart would be no fence: the
+store would come back believing itself current and take writes again.
+`TestPromoteRaisesTheTerm` reopens to check exactly that.
+
+**Every position carries its term.** It is not enough for `db.position()` to
+set it — `db.batch` builds positions in four places and drops it in all of them
+unless told, which is how the first version of this quietly did nothing.
+`batch` also normalises an incoming position's term to its own once it has
+checked it, because everything below compares positions for equality.
+`TestFollowerAdoptsTheTermFromABatch` is the one that fails without it, and it
+had to be written because a snapshot carries the term too and hides the batch
+path entirely.
+
 **A hold pins from a follower's log onwards, not just that log.** Holding one at
 a time looks like enough and is not: a follower walks forward through the logs,
 and the newest frozen ones are exactly what merging takes first, so it would be
@@ -404,6 +420,15 @@ invariant above is phrased as slow-never-wrong rather than as a rule to follow.
   right until a second layout existed and `headerSize` became the largest of
   them rather than the one a plain `Write` uses. Ask `decodeHeader`, or ask
   `parseRecordAt` for the record and use what it hands back.
+- **A mutation script that does not run the test that would catch it.** Each
+  script has a `-run` filter, and twice a new test was written whose name did
+  not match it, so a mutation was reported as surviving when the test for it was
+  simply never run. If a mutation survives and there is obviously a test for it,
+  check the filter before touching the code.
+- **A mutation whose patterns rot.** They are exact text, so renaming a function
+  or moving a line turns a mutation into a silent SKIP. Read the SKIP lines: a
+  suite reporting twelve caught and five skipped is a suite testing seven
+  things.
 - **A mutation whose pattern matches two files.** The scripts pick a target by
   searching for the text to replace, and once `db.go` and `dbreplica.go` both
   had the same line, two mutations were silently edited into the wrong file and
@@ -551,25 +576,9 @@ Replication is finished in both halves, for a single store and for a `DB`. What
 follows is ordered for the destination above rather than for a library, which
 puts some small things ahead of some interesting ones.
 
-**Fencing, before anything else that touches failover.** This is the one that
-loses data today and the one that is nearly free.
-
-Two nodes both taking writes after a partition cannot be reconciled. The
-position check catches it — a follower will not splice one log onto another —
-but that is integrity, not durability: writes acknowledged by the wrong leader
-are discovered to be worthless and thrown away. The check was deliberately built
-without a term (a checksum handshake needs no persistent identity, which was the
-point), and a checksum cannot tell you that a leader has no business being one.
-
-What it needs is a monotonically increasing term, durable per node: a promoted
-replica raises it, followers refuse a leader below theirs, and writes carry it so
-an old leader that comes back is refused rather than accepted and later
-discarded. It needs no election algorithm — only one place handing out terms,
-which under promotion by hand is whoever is doing the promoting. It is about a
-day, and it removes the outcome that costs data.
-
-Expiry is done: `WriteExpiring` and the `recordV2` layout, version-gated so a
-store that never uses one is byte for byte what it was.
+Fencing is done: `Promote`, a term on every `DBPosition`, and `ErrorFenced` from
+a store that has heard of a newer one. Expiry is done. What is left below is
+ordered as before.
 
 **Reads that are not stale.** `Position` is already the primitive for
 read-your-writes and monotonic reads: take the leader's after a write, hand it
@@ -583,8 +592,9 @@ after that. A handler-per-request calling `Write` walks straight into that. One
 writer goroutine behind a queue is the shape, and it is much easier to decide
 before the API exists than after.
 
-**A batch write**, which needs a commit marker in the format to be atomic across
-a crash — and so belongs in the window while format changes are cheap.
+**A batch write** is the largest thing left in the format, and needs a commit
+marker to be atomic across a crash — so it belongs in the window while format
+changes are cheap.
 
 The format byte is the cheap part and the semantics are not. "Is this record
 inside a batch that was never committed?" has to be answered by `Recover`,
