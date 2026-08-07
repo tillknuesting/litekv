@@ -944,7 +944,20 @@ func (db *DB) mergeLocked(victims []*diskSegment, dropTombstones bool) error {
 
 		removeHint(db.path(victims[i].id()))
 		if err := disk.Remove(db.path(victims[i].id())); err != nil {
-			keep = true
+			// The file will not go, so it is emptied instead. This store has
+			// already forgotten it, and a file the store has forgotten is one
+			// that comes back the next time the directory is read — with an id
+			// above the merged log's, since the merged log takes the oldest id
+			// of the run. It would then be asked first and answer with records
+			// this merge superseded. Everything in it is in the merged log, so
+			// there is nothing in emptying it to regret.
+			//
+			// Only if that fails too is there nothing left to do but stop,
+			// which leaves this log and everything newer than it intact and
+			// answering correctly, as before.
+			if err := emptyLog(db.path(victims[i].id())); err != nil {
+				keep = true
+			}
 		}
 	}
 	syncDir(db.dir)
@@ -1059,6 +1072,29 @@ func adoptMerged(id uint64, at, path string, index map[string]int64, size int64,
 	}
 
 	return &diskSegment{segID: id, path: path, file: file, index: index, bytes: size, maxSeq: maxSeq, filter: maybeBloom(index, bloomMin)}, nil
+}
+
+// emptyLog cuts a log down to nothing, for a file that has to stop being read
+// and will not be removed.
+//
+// It is durable before it returns. A truncation the operating system has not
+// been made to finish would leave the old records there after a crash, which is
+// the situation this exists to get out of.
+func emptyLog(path string) error {
+	file, err := disk.Open(path, os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+
+	if err := file.Truncate(0); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	return file.Close()
 }
 
 // syncDir makes a rename in dir durable. Not every filesystem supports it, so a

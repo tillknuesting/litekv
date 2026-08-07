@@ -92,8 +92,24 @@ Anything older that was left out of the run can still hold the value the
 tombstone hides. Dropping it brings a deleted key back to life.
 `TestDBTieredKeepsTombstones`.
 
+**A log that will not be removed is emptied.** A file the store has forgotten is
+a file the next open reads back, and there is nowhere in the ordering it can
+safely land: a merge names its output after the *oldest* log of the run, so a
+victim whose removal failed keeps a *higher* id and is asked first. That is
+harmless while the leftover is the newest thing the merge covered — and stops
+being harmless at the second merge, when the output takes the oldest id again
+and climbs back over the leftover in age while the leftover's id stays where it
+is. Nothing notices, because the list in memory is right and only a restart reads
+the directory. `TestDBReadsNothingLeftBehindByAMerge` is that in six writes; the
+randomised chaos run found it in four hundred.
+
+So `mergeLocked` and `Reset` empty what they cannot remove, with `emptyLog`,
+which truncates and syncs. Everything a merge would remove is already in the
+merged log, and everything `Reset` would remove is about to be replaced by a
+snapshot, so there is nothing in emptying either to regret.
+
 **A merge renames over the oldest log it replaces, then removes the rest oldest
-first — and stops at the first one that will not go.** At every point in
+first — and stops at the first one it can neither remove nor empty.** At every point in
 between, what is on disk is the merged log plus the newest few of its inputs,
 which are asked first and answer correctly, with anything they do not hold
 falling through to the merged log. `TestDBMergeInterrupted` stops the removals
@@ -104,7 +120,12 @@ carried on, so a log that would not go was skipped and a newer one removed
 instead, leaving an *older* input in front of the merged log — answering with
 records the merge superseded, including a tombstone it dropped, which brings a
 deleted key back on the next open. Nothing says so.
-`TestDBMergeStopsRemovingAtTheFirstRefusal`.
+
+Emptying dissolves that: a log with nothing in it is not in front of anything, so
+the removals carry on past one they could empty. Stopping is what is left for a
+log that can be neither removed nor emptied, which is intact and older than the
+logs after it. `TestDBMergeSurvivesARefusedRemoval` and
+`TestDBMergeStopsWhenItCanNeitherRemoveNorEmpty`.
 
 **A merge opens its output before renaming it into place.** Opening it
 afterwards leaves a failure with the file already swapped over the oldest victim
@@ -754,6 +775,21 @@ a crash survivable and none of them show up in the result of a call.
 
 ## Open
 
+- **The randomised chaos run found a real one, and it took a bisect to believe
+  it.** A follower settled on a value two merges old, once every few dozen runs.
+  The run is seeded — `rand.NewSource(11)` — so the only thing varying is when
+  the background merges land, and the bisect said it appeared with the commit
+  that merged two writes of the state file into one. That commit did not cause
+  it: it changed how many disk operations an apply makes, which moved every
+  fault index in the sweep, and the new indices reached a bug that had been
+  there all along. A bisect over a fault-injection suite tells you when
+  something became *reachable*, not when it was written.
+
+  What made it findable was the record numbers. A check after every step — no
+  log may hold a lower number for a key than an older log does — turned "the
+  follower disagrees, eventually" into "log 24 is on the disk and not in the
+  store, at step 68". That check is worth rebuilding if anything like it comes
+  back.
 - **Two fuzz runs have failed and neither was explained.** Different targets,
   months apart: one of the original targets, and once `FuzzDBSince` reported
   FAIL at the end of a long verification run. Neither wrote anything to

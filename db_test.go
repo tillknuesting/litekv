@@ -2081,7 +2081,17 @@ func TestDBMergeFailureDoesNotStrandAnIndex(t *testing.T) {
 // front of the merged log. It then answers with records the merge superseded,
 // including a tombstone the merge dropped, which brings a deleted key back to
 // life on the next open. Found by chaos, at about one run in eight.
-func TestDBMergeStopsRemovingAtTheFirstRefusal(t *testing.T) {
+// TestDBMergeSurvivesARefusedRemoval covers what a merge does with a victim the
+// disk will not delete. It used to stop there, leaving that log and everything
+// newer intact — which answers correctly, until the next merge folds newer logs
+// into the output and climbs back over the leftover in age while its id stays
+// higher. A restart then reads the leftover first. See
+// TestDBReadsNothingLeftBehindByAMerge.
+//
+// So a victim that will not go is emptied, and the removals carry on. Only a log
+// that can be neither removed nor emptied stops them, which is the old rule kept
+// as a last resort.
+func TestDBMergeSurvivesARefusedRemoval(t *testing.T) {
 	watcher := &watchedDisk{}
 	watcher.install(t)
 
@@ -2129,20 +2139,14 @@ func TestDBMergeStopsRemovingAtTheFirstRefusal(t *testing.T) {
 		t.Fatalf("a merge whose removals were refused reported %v", err)
 	}
 
-	// Every log newer than the one that would not go has to still be there.
-	left, err := segmentIDs(dir)
+	// The log that would not go is still there and holds nothing, which is what
+	// makes it safe to have carried on past it.
+	info, err := os.Stat(filepath.Join(dir, refused))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("the log that refused to be removed is gone: %v", err)
 	}
-
-	kept := map[uint64]bool{}
-	for _, id := range left {
-		kept[id] = true
-	}
-	for _, id := range ids[1:] {
-		if !kept[id] {
-			t.Errorf("log %d was removed after log %d refused to go; what is left is %v", id, ids[1], left)
-		}
+	if info.Size() != 0 {
+		t.Errorf("the log that refused to be removed still holds %d bytes", info.Size())
 	}
 
 	// And the store answers correctly, now and after a restart, which is when
@@ -2171,6 +2175,95 @@ func TestDBMergeStopsRemovingAtTheFirstRefusal(t *testing.T) {
 			continue
 		}
 		if got != value {
+			t.Errorf("%s reads as %q after reopening, want %q", key, got, value)
+		}
+	}
+}
+
+// TestDBMergeStopsWhenItCanNeitherRemoveNorEmpty is the last resort. A log that
+// will not be deleted and will not be truncated is intact and older than the
+// logs after it, so the removals stop there, exactly as they always did.
+func TestDBMergeStopsWhenItCanNeitherRemoveNorEmpty(t *testing.T) {
+	watcher := &watchedDisk{}
+	watcher.install(t)
+
+	dir := t.TempDir()
+
+	db, err := OpenDB(dir, DBOptions{Sync: SyncNever, SegmentSize: 256, MergeTrigger: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := map[string]string{}
+	for round := 0; round < 30; round++ {
+		for _, key := range []string{"alpha", "beta"} {
+			value := fmt.Sprintf("%s-%02d", key, round)
+			if err := db.Write([]byte(key), []byte(value)); err != nil {
+				t.Fatal(err)
+			}
+			want[key] = value
+		}
+		if round == 12 {
+			if err := db.Delete([]byte("alpha")); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	ids, err := segmentIDs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) < 5 {
+		t.Fatalf("%d logs, want several for the removals to walk through", len(ids))
+	}
+
+	// Neither way of getting rid of the second oldest log is allowed: it cannot
+	// be removed, and it cannot even be opened to be emptied.
+	refused := fmt.Sprintf("%010d%s", ids[1], segmentSuffix)
+	watcher.fail["remove:"+refused] = errDiskFailed
+	watcher.fail["open:"+refused] = errDiskFailed
+
+	if err := db.Merge(); err != nil {
+		t.Fatalf("a merge whose removals were refused reported %v", err)
+	}
+
+	left, err := segmentIDs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	kept := map[uint64]bool{}
+	for _, id := range left {
+		kept[id] = true
+	}
+	for _, id := range ids[1:] {
+		if !kept[id] {
+			t.Errorf("log %d was removed after log %d could not be got rid of; what is left is %v", id, ids[1], left)
+		}
+	}
+
+	// Which is safe because those logs are intact and in age order, so they
+	// answer correctly — now and when they are read again.
+	watcher.fail = map[string]error{}
+
+	for key, value := range want {
+		if got, ok := liveValue(t, db, key); !ok || got != value {
+			t.Errorf("%s reads as %q, want %q", key, got, value)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenDB(dir, DBOptions{Sync: SyncNever, SegmentSize: 256, MergeTrigger: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+
+	for key, value := range want {
+		if got, ok := liveValue(t, reopened, key); !ok || got != value {
 			t.Errorf("%s reads as %q after reopening, want %q", key, got, value)
 		}
 	}

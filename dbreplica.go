@@ -1221,7 +1221,21 @@ func (db *DB) Reset() error {
 		if !strings.HasSuffix(name, segmentSuffix) && !strings.HasSuffix(name, hintSuffix) {
 			continue
 		}
-		if rerr := disk.Remove(filepath.Join(db.dir, name)); err == nil {
+
+		path := filepath.Join(db.dir, name)
+		rerr := disk.Remove(path)
+
+		// A log that will not go is emptied, for the reason a merge empties
+		// one: this store has forgotten it, and a forgotten file is read back
+		// the next time the directory is. Here it would answer for keys the
+		// snapshot about to arrive does not hold — which is every key the
+		// leader has deleted since — and bring them back from the dead.
+		if rerr != nil && strings.HasSuffix(name, segmentSuffix) {
+			if eerr := emptyLog(path); eerr == nil {
+				rerr = nil
+			}
+		}
+		if err == nil {
 			err = rerr
 		}
 	}
