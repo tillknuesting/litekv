@@ -96,6 +96,12 @@ type diskSegment struct {
 	// filter answers "not in this log" without consulting index. Nil disables
 	// it, which is how the benchmarks measure what it is worth.
 	filter *bloom
+
+	// keys is index's keys in order, for answering a range, sorted the first
+	// time one is asked for and kept afterwards. A store that never asks for a
+	// range never pays for it. See order.go.
+	ordered sync.Once
+	keys    []string
 }
 
 // openDiskSegment indexes the segment at path without holding its records in

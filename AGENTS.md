@@ -38,6 +38,7 @@ left to be inferred:
 | `writer.go`  | one writer goroutine in front of many callers, and group commit          |
 | `hint.go`    | the index of a frozen log, written beside it                             |
 | `bloom.go`   | the filter in front of that index, once a log is big enough to want one   |
+| `order.go`   | ranges and prefixes, over an index that has no order                     |
 | `replica.go` | `Position`, shipping the log to a follower: `Since`, `Follow`, `Apply`, and `Reached` |
 | `dbreplica.go` | `DBPosition`, shipping a `DB`'s records: `Snapshot`, `Since`, `Follow`, and `Reached` |
 | `fs.go`      | the one seam through which this package touches a disk                    |
@@ -217,6 +218,15 @@ group or none of it. Written as several records instead, a torn write would keep
 the first few while every caller in the group heard an error — records nobody
 was told about, which is the worse half of at-least-once with none of the
 comfort. `TestWriterGroupIsOneBatchInTheLog`.
+
+**A frozen log's sorted keys are the only cache in this package, and only
+because they cannot go stale.** A range needs the keys in order and the index is
+a hash map, so `sortedKeys` sorts them the first time a log is asked and keeps
+them. That is allowed here and nowhere else: a frozen log's index is built once
+and never changes, and a merge does not edit a log — it writes a new one and
+swaps the segment, which brings a new sort with it. The search-order cache in
+the rejected table below was turned down for exactly the property this one has.
+The log being written has no such cache and is filtered per query instead.
 
 **A batch is whole before any of it is handed over.** The marker says how many
 bytes of records follow it, and `scan` and `scanSegment` check all of them —
@@ -552,6 +562,15 @@ That last one is the reason `advance` exists, and it is caught by the fault
 sweep rather than by any assertion about a call's result: splitting the write in
 two breaks nothing a test can see until a fault lands between the halves.
 
+And eleven for ranges, against `order_test.go`: the lower bound not applied, an
+upper bound that includes its own key, a frozen log starting its walk at the
+beginning or walking past the upper bound, a store, a DB and a frozen log each
+handing their keys back unsorted, the oldest log to hold a key answering for it,
+a deleted or expired key yielded anyway, a prefix running to the end of the keys,
+and a prefix of nothing but 0xff overflowing its last byte. All eleven are
+caught, first time — the ordering check inside the `collect` helper is what does
+most of it, since a range that is wrong is usually a range that is out of order.
+
 And seven for the writer, against `writer_test.go`: the writer taking one caller
 at a time, a caller in a group hearing about another write, the group not being
 emptied between writes, a caller's batch flattened to its first record, `Close`
@@ -879,11 +898,18 @@ byte span that follows, so recovery either has all of it or discards from the
 marker on, and records outside a span stay ordinary writes needing no flag.
 Estimate it as its own piece of work, not an afternoon.
 
-**Range and prefix queries** are the awkward one. The index is a hash map, so
-keys have no order, and the radix tree that would give it was measured and
-reverted for costing 3 to 4.5x on point lookups — right for an embedded
-point-lookup store, an open question for something answering `?prefix=`. A
-separate ordered index beside the map is the likelier answer than replacing it.
+**Range and prefix queries** are done, and without an ordered index in the end.
+The keys are asked rather than kept in order: a frozen log sorts its keys the
+first time one is wanted and keeps them, since that index never changes again,
+and the log being written is filtered with only the matches sorted. A prefix
+matching a hundred keys of a hundred thousand is 130 µs against the 45.6 ms of
+walking everything, and the write path pays nothing.
+
+What is left of it, if a range ever becomes a hot path: the answer is gathered
+and then sorted rather than streamed, because every log has to be asked before
+anything can be yielded in order. A k-way merge over the per-log sorted keys
+would stream it and hold nothing, and is worth the code only when somebody is
+ranging over most of a large store.
 
 **Semi-synchronous replication**, which is what stops a failover losing
 acknowledged writes. It needs an acknowledgement from a follower, which needs

@@ -603,8 +603,9 @@ func (db *DB) searchOrder() iter.Seq[readable] {
 
 // ForEach calls fn with every live key and its value, skipping the records that
 // newer logs have superseded, the keys that tombstones have deleted and the
-// records whose expiry has passed. The order is unspecified. The key and value
-// are only valid until fn returns.
+// records whose expiry has passed. The order is unspecified — Range and Prefix
+// are the same walk in key order, over a range of them. The key and value are
+// only valid until fn returns.
 func (db *DB) ForEach(fn func(key, value []byte) bool) error {
 	db.mu.RLock()
 	defer db.mu.RUnlock()

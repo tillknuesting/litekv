@@ -116,6 +116,47 @@ taking a batch bigger than the wire's pieces in one go, exactly as it does a rec
 Merging drops the markers: by then the records are durable and the merged file is renamed into place
 whole, so the atomicity the marker was carrying is being provided by something else.
 
+### Ranges and prefixes
+
+```go
+err := db.Prefix([]byte("user:"), func(key, value []byte) bool {
+    fmt.Printf("%s = %s\n", key, value)
+    return true // false stops early
+})
+
+err = db.Range([]byte("a"), []byte("m"), fn)   // from is included, to is not
+```
+
+Both visit live keys **in order**: the newest version of each, skipping the records newer logs have
+superseded, the keys tombstones have deleted and the records whose expiry has passed. A nil bound runs
+to the end of the keys, and an empty prefix is every key. `Range` and `Prefix` are `ForEach` in key
+order, over a range of them.
+
+The index is a hash map, so the keys have no order to walk — and it stays a hash map, because an ordered
+index instead of it was measured and reverted: a radix tree cost three to four and a half times on point
+lookups, which is the wrong trade for a store whose whole shape is point lookups. So a range asks the
+keys rather than keeping them in order, and the two halves of a `DB` answer differently:
+
+- **A frozen log's index never changes again.** Its keys are sorted the first time anybody asks that log
+  for a range, and kept — a cache that cannot go stale, which is the only reason it is allowed. A range
+  is then a binary search and a walk.
+- **The log being written changes constantly**, so there is nothing worth keeping. Its keys are filtered
+  against the range and only the matches are sorted, which is cheap because the matches are usually few
+  and because the log is bounded — that is what rotation is for.
+
+Nothing is paid on the write path, and nothing is paid in memory by a store that never asks for a range.
+Against a hundred thousand keys, a prefix matching a hundred of them:
+
+| | |
+| ----------------------------------- | -------- |
+| `Prefix`                            | 130 µs   |
+| the same by walking with `ForEach`  | 45.6 ms  |
+
+That is 350 times, and 32 KB of allocation against 17 MB. What it costs is that every log has to be
+asked before anything can be yielded in order, so the answer is gathered and then sorted rather than
+streamed: a range over most of a large store holds most of its keys while it runs, and a range over a
+few of them holds a few.
+
 ## Durability
 
 The `Data` slice is the whole store, and none of this is required: the zero value keeps everything in
@@ -1162,9 +1203,11 @@ anything either.
   large values, and that concurrent readers get most of it back.
 - **A `KeyValueStore` holds every record in memory**, live or superseded, until compaction. A `DB` holds
   only the keys and its active log, which is what to reach for once a store outgrows memory.
-- **No range or prefix queries.** The index is a hash map, so keys have no order. A radix tree that gave
-  ordered traversal was measured and reverted: prefix queries went from a full scan to 214 ns, but point
-  lookups cost 3 to 4.5x more, which was the wrong trade here. It is in the history at `9e3cf2c`.
+- **A range is gathered, not streamed.** `Range` and `Prefix` visit live keys in order, but every log has
+  to be asked before the first key can be yielded, so a range over most of a large store holds most of
+  its keys while it runs. The index is still a hash map: an ordered index instead of it was measured and
+  reverted, since a radix tree took point lookups from a full scan to 214 ns for prefixes but cost 3 to
+  4.5x on the lookups that are the whole point. It is in the history at `9e3cf2c`.
 - **One writer at a time, and a second one costs.** Writes take every shard of the lock, so they
   serialize with each other, and for a single `KeyValueStore` with compaction as well. Two goroutines
   writing do not merely fail to go faster, they halve the store's throughput — 114 ns a write becomes

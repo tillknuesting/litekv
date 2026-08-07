@@ -527,6 +527,22 @@ func main() {
 		streamed <- err
 	}()
 
+	// A range visits live keys in order, which the index cannot do by itself:
+	// it is a hash map. A frozen log sorts its keys the first time one is asked
+	// for and keeps them, since that index never changes again; the log being
+	// written is filtered per query. Nothing is paid for any of it on the way in.
+	must(db.Prefix([]byte("beta"), func(key, value []byte) bool {
+		fmt.Printf("  prefix beta: %s = %s\n", key, value)
+		return true
+	}))
+
+	counted := 0
+	must(db.Range(nil, nil, func(key, value []byte) bool {
+		counted++
+		return true
+	}))
+	fmt.Println("a range over everything visited", counted, "live keys, in order")
+
 	// A Writer is what a server puts in front of the store: one goroutine
 	// writing, everybody else queued behind it, and everything waiting when it
 	// wakes stored as one batch. Two goroutines writing directly do not merely
