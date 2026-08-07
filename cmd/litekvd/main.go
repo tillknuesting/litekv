@@ -47,6 +47,7 @@ func run() error {
 		segmentSize  = flag.Int64("segment-size", 0, "bytes before a log is frozen and a new one started (0 for 4 MiB)")
 		mergeTrigger = flag.Int("merge-trigger", 0, "logs of a size before they are merged (0 for two, below two turns merging off)")
 		maxValue     = flag.Int64("max-value", 0, "largest value a write may carry (0 for 16 MiB)")
+		queue        = flag.Int("queue", 0, "writes that may be waiting to be stored before a handler blocks (0 for 1024)")
 		shutdown     = flag.Duration("shutdown-timeout", 10*time.Second, "how long requests in flight get once the server is asked to stop")
 	)
 	flag.Parse()
@@ -89,9 +90,10 @@ func run() error {
 		return fmt.Errorf("listening on %s: %w", *addr, err)
 	}
 
-	srv := &http.Server{
-		Handler: server.New(db, server.Options{MaxValue: *maxValue, Logger: log}),
-	}
+	api := server.New(db, server.Options{MaxValue: *maxValue, Queue: *queue, Logger: log})
+	defer api.Close()
+
+	srv := &http.Server{Handler: api}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -109,16 +111,20 @@ func run() error {
 	case <-ctx.Done():
 		log.Info("stopping")
 
-		// The requests in flight get their time first, then the store is
-		// closed. The other order answers a request that was already accepted
-		// with a 503 for a store the client had no reason to think was going
-		// away, and under SyncAlways it can drop a write that was about to be
-		// acknowledged.
+		// Three things, in this order, and the order is the whole of it. The
+		// requests in flight get their time; then the writer stores what is
+		// queued and answers the handlers waiting on it; then the store closes.
+		// Any other order answers a request that was already accepted with a
+		// 503 for a store the client had no reason to think was going away, or
+		// drops a write that was a moment from being acknowledged.
 		timeout, cancel := context.WithTimeout(context.Background(), *shutdown)
 		defer cancel()
 
 		if err := srv.Shutdown(timeout); err != nil {
 			log.Error("some requests did not finish", "err", err)
+		}
+		if err := api.Close(); err != nil {
+			log.Error("closing the writer", "err", err)
 		}
 		return db.Close()
 	}

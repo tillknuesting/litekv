@@ -979,6 +979,7 @@ go run ./cmd/litekvd -dir /var/lib/litekv -addr 127.0.0.1:8080
 | `-segment-size`     | bytes before a log is frozen                                     | 4 MiB            |
 | `-merge-trigger`    | logs of a size before they are merged                            | 2                |
 | `-max-value`        | the largest value a write may carry                              | 16 MiB           |
+| `-queue`            | writes that may be waiting before a handler blocks               | 1024             |
 | `-shutdown-timeout` | how long requests in flight get once it is asked to stop         | 10s              |
 
 `-sync` defaults to `always` because the library does: a binary that quietly weakened durability
@@ -1057,6 +1058,36 @@ disk or an offset in a log, and a stranger has no business with either; it goes 
 Fencing refuses writes and not reads. A fenced store's records are still records, and refusing to serve
 them would take a replica out of service for a reason that has nothing to do with reading — what the
 term on the answer is for is telling a client that what it just read may be behind.
+
+### One writer under the handlers
+
+A handler per request is a goroutine per request, and a write takes every shard of the store's lock. An
+HTTP server is therefore the worst caller a store of this shape can have: two goroutines writing do not
+merely fail to go faster, they halve its throughput. So `server.New` puts a `Writer` in front of the
+store and every `PUT` and `DELETE` goes through it. This is the caller "One writer in front of many
+callers" was written for, before there was one.
+
+Ten handler goroutines writing a 128-byte value, driven through the handler with recorders so that the
+socket — real cost, and the same cost either way — does not bury what is being measured:
+
+| `-sync`  | nothing stored | straight to the store | through the queue | the store's share |
+| -------- | -------------- | --------------------- | ----------------- | ----------------- |
+| `never`  | 971 ns         | 3,689 ns              | 1,248 ns          | 2,718 → 277 ns    |
+| `every`  | 996 ns         | 3,776 ns              | 1,276 ns          | 2,780 → 280 ns    |
+| `always` | 1,011 ns       | 3.82 ms               | 779 µs            | 3.82 ms → 778 µs  |
+
+The first column is a request that stores nothing, and it is there so the others can be read: building a
+request and a recorder is about a microsecond of every row, and without it the ratio looks smaller than
+it is. Take it off and the queue is worth **9.8x** with no sync at all — that is pure lock contention
+going away — and **4.9x** under `SyncAlways`, where what is being amortized is one wait for the disk
+shared out among everybody waiting. End to end, request and all, it is 3.0x and 4.9x.
+
+A `Server` therefore has to be closed, even though the store it serves is somebody else's: `New` starts
+the writer's goroutine. Three things go down and the order is the whole of it — stop taking requests,
+close the `Server`, close the store. Any other order answers a request that was already accepted with a
+503, or drops a write that was a moment from being acknowledged. `litekvd` does it in that order and
+`TestClosingTheServerStopsWritesAndNotReads` holds the middle step to it: a closed `Server` refuses
+writes with 503 and goes on answering reads, because the store is still open and still holds everything.
 
 ## Concurrency
 

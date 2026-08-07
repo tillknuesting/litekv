@@ -53,7 +53,7 @@ And outside the engine, in packages of their own:
 
 | file                 | owns                                                              |
 | -------------------- | ----------------------------------------------------------------- |
-| `server/server.go`   | the handler, its options, and the routes                           |
+| `server/server.go`   | the handler, its options, the routes, and the writer in front      |
 | `server/keys.go`     | one key at a time: read, write, delete, and the expiry header      |
 | `server/errors.go`   | which store error is which status, and what a client is not told   |
 | `cmd/litekvd/main.go`| flags, the listener, signals, and the order things shut down in    |
@@ -863,6 +863,36 @@ a crash survivable and none of them show up in the result of a call.
   starts from the seeds in the code every time, so its thirty seconds a target
   is a smoke test. Real coverage comes from running one for minutes locally.
 
+## The server, and what its tests can and cannot say
+
+**Two ways of asking, and the difference matters.** `httptest.NewRecorder`
+drives the handler directly and is enough for anything about statuses, headers
+and bodies. `httptest.NewServer` puts a real client, a real parser and a real
+socket in between, and is the only way to answer a question about whether a
+request can be *built* — which is exactly what `TestKeyOfAnyBytes` asks. A
+recorder is handed a request some other code already made.
+
+**A closed `Server` is not a closed store, and that is what makes the wiring
+testable.** There is no way from outside the package to see that a write went
+through the queue rather than straight to the store: the record lands either
+way. What can be seen is that closing the `Server` stops writes with a 503 while
+reads carry on, which is only true if the queue is in the path.
+`TestClosingTheServerStopsWritesAndNotReads` is doing that job, and three
+mutations depend on it. If it is ever weakened, four things stop being tested.
+
+**One mutation survives on purpose.** Dropping `Options.Queue` on the way to
+`litekv.WriterOptions` changes nothing observable from outside the package: the
+queue's depth decides when a sender blocks and how large a group gets, and
+neither can be asserted without a timing test. It is a pass-through of an engine
+option the engine tests. Do not go looking for the test that catches it.
+
+**The shutdown order is three things and only one of them is obvious.** Stop
+taking requests, close the `Server`, close the store. The middle step exists
+because a handler blocked on the queue is holding a request open: close the
+store first and a write a moment from being acknowledged becomes `ErrorClosed`
+for no reason but the order. `cmd/litekvd` has no test of its own — the
+end-to-end curl run in "Verifying a change" is what covers it.
+
 ## What to build next, and what it needs
 
 Everything on this list that gets cheaper by being done before an API exists is
@@ -871,7 +901,7 @@ now done, so the list has become the server, in six pieces:
 | # | piece                                    | state |
 | - | ---------------------------------------- | ----- |
 | 1 | the package, the binary, and one key     | done  |
-| 2 | group commit under the handlers          |       |
+| 2 | group commit under the handlers          | done  |
 | 3 | several at once, and ranges              |       |
 | 4 | replication over the wire                |       |
 | 5 | two roles, and reads that are not stale  |       |

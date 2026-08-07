@@ -42,7 +42,11 @@ func newServer(t *testing.T, opts Options) (*Server, *litekv.DB) {
 	if opts.Logger == nil {
 		opts.Logger = quiet()
 	}
-	return New(db, opts), db
+
+	s := New(db, opts)
+	t.Cleanup(func() { _ = s.Close() })
+
+	return s, db
 }
 
 // do runs one request against the handler and returns what it answered.

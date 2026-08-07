@@ -82,9 +82,9 @@ func (s *Server) writeKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if expires.IsZero() {
-		err = s.db.Write(key, value)
+		err = s.writes.Write(key, value)
 	} else {
-		err = s.db.WriteExpiring(key, value, expires)
+		err = s.writes.WriteExpiring(key, value, expires)
 	}
 	if err != nil {
 		s.fail(w, r, err)
@@ -101,7 +101,7 @@ func (s *Server) writeKey(w http.ResponseWriter, r *http.Request) {
 // log holds the key without looking, and a delete does not look — so the honest
 // answer is that the deletion is stored, which is what 204 says.
 func (s *Server) deleteKey(w http.ResponseWriter, r *http.Request) {
-	if err := s.db.Delete([]byte(r.PathValue("key"))); err != nil {
+	if err := s.writes.Delete([]byte(r.PathValue("key"))); err != nil {
 		s.fail(w, r, err)
 		return
 	}
