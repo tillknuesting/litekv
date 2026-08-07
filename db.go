@@ -874,7 +874,15 @@ func (db *DB) mergeLocked(victims []*diskSegment, dropTombstones bool) error {
 		}
 	}
 
-	merged, err := adoptMerged(oldest.id(), temp, db.path(oldest.id()), index, size, maxSeq, db.opts.bloomMinKeys())
+	// A merge that dropped tombstones leaves a log a stranded follower cannot be
+	// resumed across, and so does a merge of any log that had already dropped
+	// some: the output covers their number ranges as well as its own.
+	dropped := dropTombstones
+	for _, seg := range victims {
+		dropped = dropped || seg.dropped
+	}
+
+	merged, err := adoptMerged(oldest.id(), temp, db.path(oldest.id()), index, size, maxSeq, dropped, db.opts.bloomMinKeys())
 	if err != nil {
 		disk.Remove(temp)
 		return err
@@ -898,7 +906,7 @@ func (db *DB) mergeLocked(victims []*diskSegment, dropTombstones bool) error {
 
 	// Written once the log is where it says it is, so a hint never describes a
 	// file under a name it has not reached yet.
-	writeHint(db.path(oldest.id()), size, maxSeq, index)
+	writeHint(db.path(oldest.id()), size, maxSeq, dropped, index)
 
 	db.mu.Lock()
 	replaced := make(map[uint64]bool, len(victims))
@@ -1066,13 +1074,13 @@ func mergeInto(path string, victims []*diskSegment, dropTombstones bool) (map[st
 // through a rename, and opening it afterwards would leave a failure with the
 // log swapped and the store still holding the segment it replaced. The hint is
 // written by the caller, once the rename has happened.
-func adoptMerged(id uint64, at, path string, index map[string]int64, size int64, maxSeq uint64, bloomMin int) (*diskSegment, error) {
+func adoptMerged(id uint64, at, path string, index map[string]int64, size int64, maxSeq uint64, dropped bool, bloomMin int) (*diskSegment, error) {
 	file, err := disk.Open(at, os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
 	}
 
-	return &diskSegment{segID: id, path: path, file: file, index: index, bytes: size, maxSeq: maxSeq, filter: maybeBloom(index, bloomMin)}, nil
+	return &diskSegment{segID: id, path: path, file: file, index: index, bytes: size, maxSeq: maxSeq, dropped: dropped, filter: maybeBloom(index, bloomMin)}, nil
 }
 
 // emptyLog cuts a log down to nothing, for a file that has to stop being read

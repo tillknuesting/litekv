@@ -30,16 +30,15 @@ const (
 	hintSuffix = ".hint"
 	hintMagic  = "LKVH"
 
-	// hintVersion is 2 because the header gained the highest record number in
-	// the log. A hint of the version before it is ignored rather than read
-	// without one, which costs the scan a hint exists to save and gets the
-	// number from the records themselves — the same bargain every other way of
-	// refusing a hint makes.
-	hintVersion = 2
+	// hintVersion is 3 because the header gained a byte saying whether the merge
+	// that produced this log dropped anything. A hint of an older version is
+	// ignored rather than read without it, which costs the scan a hint exists to
+	// save — the same bargain every other way of refusing a hint makes.
+	hintVersion = 3
 
-	// magic, version, key count, the size of the log it describes, and the
-	// highest number any record in it carries.
-	hintHeaderSize = 4 + 1 + 8 + 8 + 8
+	// magic, version, key count, the size of the log it describes, the highest
+	// number any record in it carries, and whether records were dropped from it.
+	hintHeaderSize = 4 + 1 + 8 + 8 + 8 + 1
 
 	// offset and key length, per entry.
 	hintEntrySize = 8 + 4
@@ -53,7 +52,7 @@ func hintPath(segmentPath string) string {
 // writeHint records index beside the log at segmentPath, which is segmentSize
 // bytes long. It is written to one side and renamed into place, so a hint that
 // exists is a hint that was finished.
-func writeHint(segmentPath string, segmentSize int64, maxSeq uint64, index map[string]int64) error {
+func writeHint(segmentPath string, segmentSize int64, maxSeq uint64, dropped bool, index map[string]int64) error {
 	path := hintPath(segmentPath)
 	temp := path + mergeSuffix
 
@@ -78,6 +77,9 @@ func writeHint(segmentPath string, segmentSize int64, maxSeq uint64, index map[s
 	binary.LittleEndian.PutUint64(header[5:13], uint64(len(index)))
 	binary.LittleEndian.PutUint64(header[13:21], uint64(segmentSize))
 	binary.LittleEndian.PutUint64(header[21:29], maxSeq)
+	if dropped {
+		header[29] = 1
+	}
 	if _, err := both.Write(header[:]); err != nil {
 		return failed(err)
 	}
@@ -129,10 +131,10 @@ func writeHint(segmentPath string, segmentSize int64, maxSeq uint64, index map[s
 // loadHint reads the index of the log at segmentPath from its hint, and reports
 // whether it could. A false means nothing is wrong beyond having to read the
 // log itself: every reason to refuse a hint is a reason to ignore it.
-func loadHint(segmentPath string, segmentSize int64) (map[string]int64, uint64, bool) {
+func loadHint(segmentPath string, segmentSize int64) (index map[string]int64, maxSeq uint64, dropped, ok bool) {
 	data, err := disk.ReadFile(hintPath(segmentPath))
 	if err != nil {
-		return nil, 0, false
+		return nil, 0, false, false
 	}
 	return parseHint(data, segmentSize)
 }
@@ -140,40 +142,41 @@ func loadHint(segmentPath string, segmentSize int64) (map[string]int64, uint64, 
 // parseHint reads a hint out of the bytes of one, for a log of segmentSize.
 // Every way it can refuse is a way of saying "read the log instead", so it
 // checks everything and explains nothing.
-func parseHint(data []byte, segmentSize int64) (map[string]int64, uint64, bool) {
+func parseHint(data []byte, segmentSize int64) (index map[string]int64, maxSeq uint64, dropped, ok bool) {
 	if len(data) < hintHeaderSize+4 {
-		return nil, 0, false
+		return nil, 0, false, false
 	}
 
 	if string(data[0:4]) != hintMagic || data[4] != hintVersion {
-		return nil, 0, false
+		return nil, 0, false, false
 	}
 
 	body := data[:len(data)-4]
 	if binary.LittleEndian.Uint32(data[len(data)-4:]) != crc32.ChecksumIEEE(body) {
-		return nil, 0, false
+		return nil, 0, false, false
 	}
 
 	// A hint belongs to the log it was written for. A log of another length has
 	// been recovered, replaced, or damaged since, and the offsets in the hint
 	// mean nothing for it.
 	if int64(binary.LittleEndian.Uint64(data[13:21])) != segmentSize {
-		return nil, 0, false
+		return nil, 0, false, false
 	}
 
-	maxSeq := binary.LittleEndian.Uint64(data[21:29])
+	maxSeq = binary.LittleEndian.Uint64(data[21:29])
+	dropped = data[29] == 1
 
 	count := binary.LittleEndian.Uint64(data[5:13])
 	if count > uint64(len(body)/hintEntrySize) {
-		return nil, 0, false
+		return nil, 0, false, false
 	}
 
-	index := make(map[string]int64, count)
+	index = make(map[string]int64, count)
 
 	rest := body[hintHeaderSize:]
 	for i := uint64(0); i < count; i++ {
 		if len(rest) < hintEntrySize {
-			return nil, 0, false
+			return nil, 0, false, false
 		}
 
 		pos := int64(binary.LittleEndian.Uint64(rest[0:8]))
@@ -181,14 +184,14 @@ func parseHint(data []byte, segmentSize int64) (map[string]int64, uint64, bool) 
 		rest = rest[hintEntrySize:]
 
 		if uint64(keyLen) > uint64(len(rest)) {
-			return nil, 0, false
+			return nil, 0, false, false
 		}
 		// An offset that is not in the log would turn a read into an error
 		// rather than a value, so a hint claiming one is not to be trusted.
 		// The bound is the smallest a record can be, which is the older and
 		// shorter of the two layouts.
 		if pos < 0 || pos+headerSizeV0 > segmentSize {
-			return nil, 0, false
+			return nil, 0, false, false
 		}
 
 		index[string(rest[:keyLen])] = pos
@@ -196,10 +199,10 @@ func parseHint(data []byte, segmentSize int64) (map[string]int64, uint64, bool) 
 	}
 
 	if len(rest) != 0 {
-		return nil, 0, false
+		return nil, 0, false, false
 	}
 
-	return index, maxSeq, true
+	return index, maxSeq, dropped, true
 }
 
 // removeHint deletes the hint for a log, which has to happen before the log it

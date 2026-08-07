@@ -562,6 +562,15 @@ That last one is the reason `advance` exists, and it is caught by the fault
 sweep rather than by any assertion about a call's result: splitting the write in
 two breaks nothing a test can see until a fault lands between the halves.
 
+And eight for carrying a stranded position forward, against `stranded_test.go`:
+a log that dropped records crossed anyway, only the resume log asked whether it
+dropped rather than every log after it, a merge that does not record that it
+dropped, a merge that forgets what its inputs had dropped, a log read without a
+hint trusted rather than assumed to have dropped, the checksum of a surviving
+record not checked, a position with no number resumed, and records the follower
+already holds sent again — which is the one that would put an old record in a
+newer log on the follower and shadow a newer one. All eight are caught.
+
 And eleven for ranges, against `order_test.go`: the lower bound not applied, an
 upper bound that includes its own key, a frozen log starting its walk at the
 beginning or walking past the upper bound, a store, a DB and a frozen log each
@@ -916,23 +925,33 @@ acknowledged writes. It needs an acknowledgement from a follower, which needs
 the leader to know its followers, which is the first state the leader does not
 currently keep.
 
-**Carrying a stranded position forward** is what is left of the retention
-problem. `Hold` covers a follower that is connected — `Snapshot` takes one and
-`Follow` adopts it and moves it forward — but a follower that was away while the
-merging happened still has to take a whole new snapshot.
+**Carrying a stranded position forward** is done, and the mappings the earlier
+note here proposed turned out not to be needed. The records carry numbers, so a
+position that no longer names a log can be found by reading: `resumeAt` picks
+the oldest log whose numbers reach the follower's, and `resumeIn` walks it to the
+place just before the first record the follower has not got. That is a scan of
+one log, paid once by a follower that has been away, against the whole store it
+would otherwise be sent.
 
-The cheaper half of a fix is already sitting there: a merge writes its victims
-out oldest-first and in order, so it knows the offset in its output where each
-input log's records end. Recording that would let a position in a merged log be
-mapped forward instead of refused. What makes it more than an afternoon is that
-the mappings have to survive a restart and to chain, since a merged log is
-merged again later, and something has to eventually forget them.
+Two things about it are worth knowing before touching it.
 
-The same missing fact is what keeps `db.batch` refusing a position at the start
-of a frozen log. That refusal is only needed because a frozen log may have been
-merged and be a different file behind the same name — a segment that was never a
-merge output has the contents it has always had, and the position would be safe.
-Knowing which is which across a restart needs the same durable note.
+**What is checked is weaker than what it replaces, on purpose.** If the record
+the position names is still there, its checksum has to match. In a busy store it
+usually is not there — something newer superseded it, and the merge dropped it —
+and then the number is taken at its word. The term has already scoped the
+position to one leader by then, which is what makes that defensible. The
+alternative was refusing every resume in exactly the stores where snapshots hurt
+most.
+
+**A log that dropped records cannot be crossed.** A merge that reaches the
+oldest log drops tombstones and expired records, and a follower carried across
+one would never hear that a key was deleted: it holds an older value and nothing
+in what follows would replace it. So the hint records whether a log dropped
+anything — sticky, since a merge of a log that dropped covers its range too — and
+a resume refuses when any log at or after the resume point has it. A log opened
+without a hint is assumed to have dropped something, since the records cannot
+say. `TestStrandedFollowerAcrossADroppedTombstone` is the case that must not be
+resumed, and it is the one that makes this safe rather than clever.
 
 ### Consensus, and why it is not on that list
 

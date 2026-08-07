@@ -20,7 +20,7 @@ func FuzzHint(f *testing.F) {
 
 	dir := f.TempDir()
 	segment := dir + "/0000000001" + segmentSuffix
-	if err := writeHint(segment, 1024, 7, index); err != nil {
+	if err := writeHint(segment, 1024, 7, false, index); err != nil {
 		f.Fatal(err)
 	}
 	written, err := disk.ReadFile(hintPath(segment))
@@ -35,7 +35,7 @@ func FuzzHint(f *testing.F) {
 	f.Add(make([]byte, hintHeaderSize+4), int64(0))
 
 	f.Fuzz(func(t *testing.T, data []byte, segmentSize int64) {
-		got, _, ok := parseHint(data, segmentSize)
+		got, _, _, ok := parseHint(data, segmentSize)
 		if !ok {
 			return
 		}

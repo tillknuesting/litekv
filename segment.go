@@ -84,6 +84,15 @@ type diskSegment struct {
 	index map[string]int64
 	bytes int64
 
+	// dropped says whether anything was left out of this log when it was
+	// written: a merge that reached the oldest log drops tombstones and expired
+	// records, and a follower resuming by number across such a log would never
+	// hear about a deletion. It is what makes a stranded position refusable
+	// rather than quietly wrong — see resumeAt in dbreplica.go. A log whose
+	// hint is missing is assumed to have dropped something, since there is
+	// nothing left to say otherwise.
+	dropped bool
+
 	// maxSeq is the highest number any record in this log carries, or any
 	// record in a log this one was merged from. It is the second of those that
 	// makes it an upper bound rather than a fact about the file: a merge drops
@@ -122,8 +131,8 @@ func openDiskSegment(id uint64, path string, bloomMin int) (*diskSegment, error)
 		return nil, err
 	}
 
-	if index, maxSeq, ok := loadHint(path, info.Size()); ok {
-		return &diskSegment{segID: id, path: path, file: file, index: index, bytes: info.Size(), maxSeq: maxSeq, filter: maybeBloom(index, bloomMin)}, nil
+	if index, maxSeq, dropped, ok := loadHint(path, info.Size()); ok {
+		return &diskSegment{segID: id, path: path, file: file, index: index, bytes: info.Size(), maxSeq: maxSeq, dropped: dropped, filter: maybeBloom(index, bloomMin)}, nil
 	}
 
 	index, good, maxSeq, err := indexSegment(file, info.Size())
@@ -145,9 +154,14 @@ func openDiskSegment(id uint64, path string, bloomMin int) (*diskSegment, error)
 
 	// Reading the log the long way is worth writing down, so that opening it
 	// again does not. A hint that cannot be written is not worth failing over.
-	writeHint(path, good, maxSeq, index)
+	//
+	// The records cannot say whether anything was left out of this log when it
+	// was written, so a log read the long way is taken to have dropped
+	// something, which only costs a follower a snapshot it would have needed
+	// before any of this existed.
+	writeHint(path, good, maxSeq, true, index)
 
-	return &diskSegment{segID: id, path: path, file: file, index: index, bytes: good, maxSeq: maxSeq, filter: maybeBloom(index, bloomMin)}, nil
+	return &diskSegment{segID: id, path: path, file: file, index: index, bytes: good, maxSeq: maxSeq, dropped: true, filter: maybeBloom(index, bloomMin)}, nil
 }
 
 // freeze turns the active segment into a frozen one, letting go of the records
@@ -197,7 +211,9 @@ func freeze(m *memSegment, policy SyncPolicy, bloomMin int) (*diskSegment, error
 
 	// The index is already built, so writing it down here saves opening the
 	// store from ever having to read this log.
-	writeHint(path, size, maxSeq, index)
+	// Nothing is left out of a log that is simply frozen: it holds every record
+	// that was written to it, superseded ones and tombstones included.
+	writeHint(path, size, maxSeq, false, index)
 
 	return &diskSegment{segID: m.segID, path: path, file: file, index: index, bytes: size, maxSeq: maxSeq, filter: maybeBloom(index, bloomMin)}, nil
 }

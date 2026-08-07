@@ -882,9 +882,17 @@ list of followers the leader keeps: nothing here pins a disk for a follower that
 ignores holds — it is an explicit request to compact the whole store, and a follower reading one of
 those logs will have to take a new snapshot.
 
-**A follower must still always be able to take another snapshot.** A hold covers a follower that is
-connected. One that was away while the merging happened, or whose hold was released, is stranded exactly
-as before, and the loop that follows a `DB` has to be written with that in it. The one in `example/` is.
+**A follower that was away is usually carried forward rather than stranded.** A hold covers a follower
+that is connected; one that was away while the merging happened comes back with a position into a log
+that has been folded into another. The records carry numbers and a merge keeps them, so the leader reads
+the log that now holds those numbers and carries on from the right place — no snapshot, no whole store
+over the wire.
+
+It refuses, and answers `ErrorDiverged` as before, when the position carries no number, when the number
+is one no log reaches, or when any log it would stream across has dropped records. That last is the one
+that matters: a merge which reaches the oldest log drops tombstones, and a follower carried across one
+would never hear that a key was deleted. So **a follower must still always be able to take another
+snapshot**, and the loop that follows a `DB` has to be written with that in it. The one in `example/` is.
 
 ### What replicating a DB costs
 

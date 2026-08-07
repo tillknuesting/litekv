@@ -588,6 +588,24 @@ func (db *DB) batch(pos DBPosition, size int64, dst []byte) ([]byte, DBPosition,
 
 	start := len(dst)
 	next := pos
+	resumed := false
+
+	// stranded is what to do when the log a position names is gone, or has been
+	// written over by a merge. The number the position carries may still find
+	// the record it named, wherever that record lives now, which saves the
+	// follower a whole snapshot. It is tried once, and only for the position
+	// the follower actually asked with.
+	stranded := func() bool {
+		if resumed || next != pos {
+			return false
+		}
+		repaired, ok := db.resumeAt(pos)
+		if !ok {
+			return false
+		}
+		resumed, next = true, repaired
+		return true
+	}
 
 	for {
 		// However full the batch already is, a log that has just been entered
@@ -600,6 +618,10 @@ func (db *DB) batch(pos DBPosition, size int64, dst []byte) ([]byte, DBPosition,
 			// The log being written is the end of the line.
 			taken, log, err := db.active.kvs.batch(next.Log, room, dst)
 			if err != nil {
+				if errors.Is(err, ErrorDiverged) && stranded() {
+					dst = dst[:start]
+					continue
+				}
 				return dst[:start], pos, err
 			}
 			return taken, DBPosition{Term: db.term, Segment: next.Segment, Log: log}, nil
@@ -607,11 +629,18 @@ func (db *DB) batch(pos DBPosition, size int64, dst []byte) ([]byte, DBPosition,
 
 		seg := db.frozenSegment(next.Segment)
 		if seg == nil {
+			if stranded() {
+				continue
+			}
 			return dst[:start], pos, ErrorDiverged
 		}
 
 		taken, log, err := seg.batch(next.Log, room, dst)
 		if err != nil {
+			if errors.Is(err, ErrorDiverged) && stranded() {
+				dst = dst[:start]
+				continue
+			}
 			return dst[:start], pos, err
 		}
 		dst = taken
@@ -642,6 +671,165 @@ func (db *DB) batch(pos DBPosition, size int64, dst []byte) ([]byte, DBPosition,
 		}
 		next = DBPosition{Term: db.term, Segment: after}
 	}
+}
+
+// resumeAt finds where a position carries on when the log it named is gone.
+//
+// A follower that was away while merging happened is holding a position into a
+// log that has been folded into another one, and until the records were numbered
+// there was nothing to look for: an offset into a log that no longer exists says
+// nothing about the log that replaced it. The number says plenty. What the
+// follower needs is the records numbered from its position onwards, and a merge
+// keeps the numbers on everything it carries across, so the place to carry on
+// from can be found by reading.
+//
+// What comes back is a position naming a real record in a log this store still
+// has, so everything downstream carries on as if the follower had never been
+// away — and nothing numbered below the follower's position is ever sent, which
+// matters more than it looks: an old record applied after a newer one would land
+// in a newer log on the follower and shadow it.
+//
+// What is checked, and what is not. If the record the position names is still
+// there, its checksum has to be the one the position carries, and a mismatch is
+// a different history and is refused. If a merge dropped that record — because
+// something newer superseded it, which is the ordinary fate of a record in a
+// busy store — there is nothing left to check it against, and the number is
+// taken at its word. The term has already scoped it to one leader by then, which
+// is what makes a number worth taking at its word at all.
+//
+// It refuses in these cases, each costing the follower the snapshot it would
+// have needed before any of this existed:
+//
+//   - A position with no number, from a store written before there were any.
+//   - A number no log reaches, which is a follower ahead of this store.
+//   - A log at or after the resume point that dropped records. A merge that
+//     reaches the oldest log drops tombstones and expired records, and a
+//     follower carried across one would never hear that a key was deleted — it
+//     holds an older value for that key and nothing in what follows would
+//     replace it. That is the one way this could go quietly wrong, so it is
+//     checked before anything is sent.
+//   - A resume point at the very start of a log, which names no record for the
+//     position to be checked against later.
+//
+// Callers must hold db.mu.
+func (db *DB) resumeAt(pos DBPosition) (DBPosition, bool) {
+	// A position at the start of a log names no record, and one with no number
+	// gives nothing to look for.
+	if pos.Log.Seq == 0 || pos.Log.Offset == 0 {
+		return DBPosition{}, false
+	}
+
+	// Oldest first: the first log whose numbers reach the follower's is the one
+	// to carry on in, since a log's records are older than the logs after it.
+	for i := len(db.frozen) - 1; i >= 0; i-- {
+		seg := db.frozen[i]
+		if seg.maxSeq < pos.Log.Seq {
+			continue
+		}
+
+		// This log and every log after it, since the stream runs through all
+		// of them.
+		for _, later := range db.frozen[:i+1] {
+			if later.dropped {
+				return DBPosition{}, false
+			}
+		}
+
+		log, ok, older := seg.resumeIn(pos.Log.Seq, pos.Log.Crc)
+		if older {
+			continue // this log ends before the follower does: try the next
+		}
+		if !ok {
+			return DBPosition{}, false
+		}
+		return DBPosition{Term: db.term, Segment: seg.segID, Log: log}, true
+	}
+
+	// Or the log being written, which nothing has merged and which drops
+	// nothing.
+	if db.active != nil {
+		if log, ok, _ := db.active.kvs.resumeIn(pos.Log.Seq, pos.Log.Crc); ok {
+			return DBPosition{Term: db.term, Segment: db.active.segID, Log: log}, true
+		}
+	}
+
+	return DBPosition{}, false
+}
+
+// resumeIn finds the place in this log just before the first record numbered
+// want, and reports it as a position. See resumeAt for what that means and what
+// is checked.
+//
+// It reads the log to find it. That is a scan of one log, paid once by a
+// follower that has been away, against the whole store it would otherwise be
+// sent — which is why there is no index from numbers to offsets. Build one in
+// the hint if a store ever spends its time resuming.
+func (d *diskSegment) resumeIn(want uint64, crc uint32) (found Position, ok, older bool) {
+	var before Record
+	var at, end int64
+	var any bool
+
+	older = true // until a record the follower has not got turns up
+
+	d.scan(func(pos int64, raw []byte, r Record) bool {
+		if r.Seq < want {
+			before, at, end, any = r, pos, pos+int64(len(raw)), true
+			return true
+		}
+		older = false
+
+		// The first record the follower has not got. The one before it is what
+		// the position names, and if that is the record the follower last took
+		// then its checksum has to agree.
+		if !any {
+			// Everything this log holds is newer than the follower, so the
+			// place to carry on is the start of it. That names no record and
+			// could not be checked if it had come off a wire — but this was
+			// worked out here, from a log this store is holding open, and what
+			// came before it has been merged away rather than skipped.
+			found, ok = Position{Seq: want}, true
+			return false
+		}
+		if before.Seq == want-1 && before.Crc != crc {
+			return false
+		}
+		found, ok = Position{Offset: end, Last: at, Crc: before.Crc, Seq: want}, true
+		return false
+	})
+
+	return found, ok, older
+}
+
+// resumeIn is the same over the log being written, which is in memory.
+func (kvs *KeyValueStore) resumeIn(want uint64, crc uint32) (found Position, ok, older bool) {
+	kvs.RLock()
+	defer kvs.RUnlock()
+
+	var before Record
+	var at, end int64
+	var any bool
+
+	older = true
+
+	kvs.scan(func(pos, next int64, r Record) bool {
+		if r.Seq < want {
+			before, at, end, any = r, pos, next, true
+			return true
+		}
+		older = false
+
+		if !any {
+			found, ok = Position{Seq: want}, true
+			return false
+		}
+		if before.Seq == want-1 && before.Crc != crc {
+			return false
+		}
+		found, ok = Position{Offset: end, Last: at, Crc: before.Crc, Seq: want}, true
+		return false
+	})
+
+	return found, ok, older
 }
 
 // frozenSegment returns the frozen log with this id, or nil. Callers must hold
