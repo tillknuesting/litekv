@@ -1,0 +1,99 @@
+package server
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strconv"
+
+	"github.com/tillknuesting/litekv"
+)
+
+// The store's errors are a small closed set and every one of them means
+// something a status code already means. Mapping them in one place rather than
+// in each handler is not tidiness: it is the only way the mapping stays the
+// same across routes, and a client that learns what a 404 means from one route
+// is right about the others.
+
+// headerTerm carries the store's term on a refusal that turns on it, so a
+// client that was talking to a leader can tell "it has been replaced" from
+// "something went wrong".
+const headerTerm = "Litekv-Term"
+
+// errorBody is what a failed request answers with. One field, because a client
+// that wants to branch on the failure branches on the status; the string is for
+// whoever is reading the terminal.
+type errorBody struct {
+	Error string `json:"error"`
+}
+
+// fail answers a request that could not be served.
+func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
+	status, message := statusOf(err)
+
+	if errors.Is(err, litekv.ErrorFenced) {
+		w.Header().Set(headerTerm, strconv.FormatUint(s.db.Term(), 10))
+	}
+
+	if status == http.StatusInternalServerError {
+		// The client is told the status and nothing else. An error from the
+		// store can name a path on the server's disk or an offset in a log, and
+		// a stranger has no business with either; it goes to the log, which is
+		// where somebody who may see it will look.
+		s.log.Error("request failed",
+			"method", r.Method, "path", r.URL.Path, "err", err)
+		message = "internal error"
+	}
+
+	writeError(w, status, message)
+}
+
+// statusOf maps a store error onto a status and the sentence a client is told.
+// An error it does not know is a 500 with no message, and fail fills that in.
+func statusOf(err error) (int, string) {
+	switch {
+	// All three mean the same thing to a client: there is no value under that
+	// key. The store tells them apart because it knows whether the key was
+	// asked to go, told to go by itself, or was never there, and none of those
+	// change what a caller does next.
+	case errors.Is(err, litekv.ErrorKeyNotFound),
+		errors.Is(err, litekv.ErrorKeyDeleted),
+		errors.Is(err, litekv.ErrorKeyExpired):
+		return http.StatusNotFound, err.Error()
+
+	// Not 403: the request was allowed, the store is no longer the one to send
+	// it to. A conflict is what that is.
+	case errors.Is(err, litekv.ErrorFenced):
+		return http.StatusConflict, err.Error()
+
+	case errors.Is(err, litekv.ErrorRecordTooLarge):
+		return http.StatusRequestEntityTooLarge, err.Error()
+
+	// A closed store is not a broken one. It is a server on its way down, and
+	// 503 is the status that tells a client to try the next one.
+	case errors.Is(err, litekv.ErrorClosed):
+		return http.StatusServiceUnavailable, err.Error()
+	}
+
+	var tooBig *http.MaxBytesError
+	if errors.As(err, &tooBig) {
+		return http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("value exceeds the %d byte limit", tooBig.Limit)
+	}
+
+	return http.StatusInternalServerError, ""
+}
+
+// writeError sends a JSON body under status. It is also the only way a handler
+// answers a request the store never saw — a malformed header, a body that is
+// too long — since those have no store error to map.
+func writeError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(status)
+
+	// Nothing to do about a failed write here: the status is already on its way
+	// and the connection is the client's problem.
+	_ = json.NewEncoder(w).Encode(errorBody{Error: message})
+}

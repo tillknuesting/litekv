@@ -8,18 +8,24 @@ to save you a day, not to introduce the code.
 
 This is not meant to stay a library. The intent is a standalone database with a
 real API over HTTP, and what is here is the storage engine it will sit on. That
-changes which of the missing things matter, so it is written down rather than
-left to be inferred:
+has now started — `server/` and `cmd/litekvd` exist and serve one key at a time
+— but the engine is still where nearly all of the code and all of the risk is,
+so this section stays as written. It changes which of the missing things matter:
 
 - **Read scaling and failover stop being theoretical.** For an embedded store
   the readers are in the same process and a replica buys little. For a server
   the readers are clients, and a replica behind a load balancer is the ordinary
   way to serve more of them — and a database that cannot survive losing a node
   is a hard sell.
-- **Keep the engine free of a wire.** Nothing in this package opens a socket and
-  nothing should; the server owns the protocol. `tcp_test.go` is a working
-  sketch of the replication endpoint that server will need, and is the thing to
-  promote into a package rather than reinvent.
+- **Keep the engine free of a wire.** Nothing in package `litekv` opens a socket
+  and nothing should; `server/` owns the protocol. This is not a style rule. It
+  is what keeps the store embeddable, and it is also the thing that makes the
+  server's tests worth anything — they exercise the exported API and nothing
+  else, so a change that breaks a caller breaks them. If the server turns out to
+  need something the engine does not export, that is a separate, deliberate
+  commit to the engine, not a quiet widening while building something else.
+  `tcp_test.go` is still a sketch of the replication endpoint and is the thing
+  to promote rather than reinvent.
 - **Format changes are cheapest now.** A batch commit marker: anything touching
   the record layout costs less before there is data anyone minds losing. The
   version byte exists for this, and has now carried three changes — the
@@ -42,6 +48,15 @@ left to be inferred:
 | `replica.go` | `Position`, shipping the log to a follower: `Since`, `Follow`, `Apply`, and `Reached` |
 | `dbreplica.go` | `DBPosition`, shipping a `DB`'s records: `Snapshot`, `Since`, `Follow`, and `Reached` |
 | `fs.go`      | the one seam through which this package touches a disk                    |
+
+And outside the engine, in packages of their own:
+
+| file                 | owns                                                              |
+| -------------------- | ----------------------------------------------------------------- |
+| `server/server.go`   | the handler, its options, and the routes                           |
+| `server/keys.go`     | one key at a time: read, write, delete, and the expiry header      |
+| `server/errors.go`   | which store error is which status, and what a client is not told   |
+| `cmd/litekvd/main.go`| flags, the listener, signals, and the order things shut down in    |
 
 `KeyValueStore` and `DB` are deliberately separate. The first is one log with
 everything in memory and `Data` as a public byte slice people are expected to
@@ -68,6 +83,15 @@ go test -run xxx -fuzz '^FuzzDBApply$' -fuzztime 30s .   # and into a DB
 
 The `^...$` matters: `-fuzz FuzzApply` now matches `FuzzApplySnapshot` too, and
 the go tool refuses to run rather than choosing.
+
+Anything touching `server/` also gets driven end to end, because a handler test
+builds its own request and the interesting question is often whether a request
+can be built at all:
+
+```bash
+go build -o /tmp/litekvd ./cmd/litekvd && /tmp/litekvd -dir "$(mktemp -d)" -addr 127.0.0.1:18080 &
+curl -X PUT --data-binary 'v' http://127.0.0.1:18080/v1/keys/a%2Fb && curl http://127.0.0.1:18080/v1/keys/a%2Fb
+```
 
 `GOMAXPROCS=1` is not paranoia. The lock shards on `GOMAXPROCS`, so a one-core
 machine takes a different path through it, and background merging stops being in
@@ -840,6 +864,25 @@ a crash survivable and none of them show up in the result of a call.
   is a smoke test. Real coverage comes from running one for minutes locally.
 
 ## What to build next, and what it needs
+
+Everything on this list that gets cheaper by being done before an API exists is
+now done, so the list has become the server, in six pieces:
+
+| # | piece                                    | state |
+| - | ---------------------------------------- | ----- |
+| 1 | the package, the binary, and one key     | done  |
+| 2 | group commit under the handlers          |       |
+| 3 | several at once, and ranges              |       |
+| 4 | replication over the wire                |       |
+| 5 | two roles, and reads that are not stale  |       |
+| 6 | operations, and writing it down          |       |
+
+Piece 4 is the one the rest of the engine is waiting on: semi-synchronous
+replication needs the leader to know its followers, and a leader knows nothing
+about a follower until something holds the connection.
+
+Below is what was on the list before that, kept because the reasoning is still
+the reasoning.
 
 Replication is finished in both halves, for a single store and for a `DB`. What
 follows is ordered for the destination above rather than for a library, which

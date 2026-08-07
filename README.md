@@ -12,6 +12,10 @@ idea, and shipped as the storage engine behind Riak. An append-only log holds th
 in-memory index holds an offset per key, so a write never seeks, a read is one lookup and one read, a
 crash costs at most the record being written, and every key has to fit in memory.
 
+It is also a server. `cmd/litekvd` puts an HTTP API in front of a `DB` and `server/` is the package
+behind it — see "Serving it over HTTP". Nothing in the library itself opens a socket, and that is the
+arrangement rather than an omission.
+
 ## Which of the two
 
 `KeyValueStore` is one log. Every record is in memory and so is the index, reads are a map lookup and a
@@ -953,6 +957,107 @@ the same call and not a different one.
 arriving afterwards reports `ErrorClosed`. It does not close the store, which is yours to close after
 it.
 
+## Serving it over HTTP
+
+Nothing in the library opens a socket and nothing in it should: the store has no idea what a request is,
+and keeping it that way is what lets the same code be embedded in a program and served to a network.
+`server/` is the other half of that bargain — a package that imports `litekv`, owns the protocol, and
+reaches the store through the same exported API any other caller would. It is an `http.Handler` and
+nothing else: it does not listen, it does not open the store, and it does not close it.
+`cmd/litekvd` does all three.
+
+```bash
+go run ./cmd/litekvd -dir /var/lib/litekv -addr 127.0.0.1:8080
+```
+
+| flag                | what it is                                                       | default          |
+| ------------------- | ---------------------------------------------------------------- | ---------------- |
+| `-dir`              | the directory holding the store                                  | required         |
+| `-addr`             | the address to listen on                                         | `127.0.0.1:8080` |
+| `-sync`             | `always`, `every` or `never`                                     | `always`         |
+| `-sync-interval`    | how often to sync under `-sync every`                            | 1s               |
+| `-segment-size`     | bytes before a log is frozen                                     | 4 MiB            |
+| `-merge-trigger`    | logs of a size before they are merged                            | 2                |
+| `-max-value`        | the largest value a write may carry                              | 16 MiB           |
+| `-shutdown-timeout` | how long requests in flight get once it is asked to stop         | 10s              |
+
+`-sync` defaults to `always` because the library does: a binary that quietly weakened durability
+relative to the code it wraps would be the wrong kind of convenient. `-sync every` is the usual trade
+and the one to reach for.
+
+It listens on loopback unless told otherwise. There is no authentication and no TLS here yet, so put it
+behind a proxy or on a private network before giving it an address a stranger can reach. One `litekvd`
+owns a directory: the store is not multi-process safe and nothing checks, so a second one on the same
+`-dir` writes over the first one's log.
+
+### The routes
+
+| method      | route            | what it does                          | answers          |
+| ----------- | ---------------- | ------------------------------------- | ---------------- |
+| `GET`       | `/v1/keys/{key}` | the value, as the body                | 200, 404         |
+| `HEAD`      | `/v1/keys/{key}` | the value's length and nothing else   | 200, 404         |
+| `PUT`       | `/v1/keys/{key}` | stores the body under the key         | 204              |
+| `DELETE`    | `/v1/keys/{key}` | writes a tombstone                    | 204              |
+
+A value is the body, raw. There is no JSON envelope around a caller's bytes and nothing is base64 on the
+way through, because a key-value store's whole job is to hand back what it was given; the type is
+`application/octet-stream` and the server has no opinion about what is in it. An empty value is a value,
+and the `Content-Length` of `0` is what tells it apart from a missing key.
+
+`PUT` takes a `Litekv-Expires` header holding an RFC 3339 time, and writes a record that stops answering
+once that instant has passed. It is an instant and not a duration for the same reason the store's expiry
+is one: a duration has to be resolved against somebody's clock, and the only clock a client and a server
+agree on is the one they both write down. A client thinking in TTLs subtracts.
+
+`DELETE` of a key that was never there answers 204, not 404. The store cannot answer that question
+anyway — a delete appends a tombstone without looking for what it hides — so a 404 would be a lie
+dressed as a check.
+
+### Spelling a key in a URL
+
+A key is arbitrary bytes and a URL is not. Percent-encoding a path segment carries all of them: Go's
+`ServeMux` unescapes segment by segment and a `%2F` is deliberately *not* a separator, so a key holding
+slashes, spaces, control bytes, or sequences that are not UTF-8 at all survives the trip unchanged.
+
+```bash
+curl -X PUT --data-binary 'nested' http://127.0.0.1:8080/v1/keys/a%2Fb%2Fc
+curl http://127.0.0.1:8080/v1/keys/a%2Fb%2Fc      # nested
+```
+
+`TestKeyOfAnyBytes` puts thirteen awkward keys through a real socket and a real client rather than
+trusting the documentation for any of that, and checks the store holds the bytes the caller meant rather
+than the ones the URL was spelled with — reading it back through the same encoding would agree with
+itself however wrong both ends were.
+
+The one key with no spelling is the empty one, which the store holds happily. A path wildcard does not
+match an empty segment, so `/v1/keys/` is not a route.
+
+### What a failure says
+
+A failure is a status and a JSON body of one field: `{"error":"key not found"}`. A client that wants to
+branch on what went wrong branches on the status, and the sentence is for whoever is reading a terminal.
+
+| status | when                                                                              |
+| ------ | --------------------------------------------------------------------------------- |
+| 400    | a header the server could not read, such as an expiry that is not a time            |
+| 404    | no value under that key — never written, deleted, or expired                        |
+| 405    | a method that route does not have, with an `Allow` header saying which it does      |
+| 409    | the store has been fenced, with `Litekv-Term` carrying the term it is on            |
+| 413    | a value over `-max-value`                                                           |
+| 503    | the store is closed, which is what a server on its way down looks like              |
+| 500    | anything else                                                                       |
+
+The three ways there can be no value under a key are one status on purpose. The store tells them apart
+because it knows whether the key was asked to go, told to go by itself, or was never there, and none of
+those change what a caller does next.
+
+A 500 says "internal error" and nothing more. An error from the store can name a path on the server's
+disk or an offset in a log, and a stranger has no business with either; it goes to the log instead.
+
+Fencing refuses writes and not reads. A fenced store's records are still records, and refusing to serve
+them would take a replica out of service for a reason that has nothing to do with reading — what the
+term on the answer is for is telling a client that what it just read may be behind.
+
 ## Concurrency
 
 `KeyValueStore` embeds a reader-writer lock and every method takes it, so the methods are safe to call
@@ -1258,6 +1363,14 @@ anything either.
 - **A replica costs the leader a copy.** Each batch is copied out of `Data` under the read lock before
   it is written to the connection, which is what keeps a slow follower from blocking writes. Ten
   followers catching up at once is ten copies.
+- **One process owns a directory, and nothing enforces it.** There is no lock file. Two programs with
+  the same store open — two `litekvd`s on the same `-dir`, or a binary and a shell script — will write
+  over each other's log, and the first either of them hears of it is a checksum that does not match.
+- **The HTTP API has no authentication and no TLS.** `litekvd` listens on loopback for that reason. Put
+  it behind a proxy or on a private network before it has an address a stranger can reach, and note that
+  this applies to every route: there is nothing to stop a client writing as well as reading.
+- **The empty key cannot be reached over HTTP.** The store holds it happily and a path wildcard will not
+  match an empty segment, so there is no way to spell `/v1/keys/` and nowhere else to put it.
 
 ## Working on it
 
