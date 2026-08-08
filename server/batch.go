@@ -53,6 +53,10 @@ const defaultMaxBatch = 32 << 20
 // whether or not any key in it was already there, and a number that is always
 // the number of lines sent is a number nobody can learn anything from.
 func (s *Server) writeBatch(w http.ResponseWriter, r *http.Request) {
+	if !s.mayWrite(w, r) {
+		return
+	}
+
 	// Refused on the declared length before anything is read, exactly as a PUT
 	// is: a client announcing a gigabyte should be turned away at the header
 	// rather than after the server has taken MaxBatch of it and parsed it. The
@@ -77,6 +81,7 @@ func (s *Server) writeBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.wrote(w)
 	w.WriteHeader(http.StatusNoContent)
 }
 

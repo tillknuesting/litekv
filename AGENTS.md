@@ -60,6 +60,7 @@ And outside the engine, in packages of their own:
 | `server/batch.go`    | `POST /v1/batch`: a body of operations parsed whole, then stored   |
 | `server/scan.go`     | `GET /v1/keys`: ranges and prefixes, the query, and the limits     |
 | `server/errors.go`   | which store error is which status, and what a client is not told   |
+| `server/role.go`     | leader or replica, promotion, status, and reads that are not stale |
 | `server/replica.go`  | the frames, the position on the wire, and the leader's stream       |
 | `server/follower.go` | the other end of it: dial, apply, reconnect                         |
 | `cmd/litekvd/main.go`| flags, the listener, signals, and the order things shut down in    |
@@ -945,7 +946,7 @@ reads carry on, which is only true if the queue is in the path.
 `TestClosingTheServerStopsWritesAndNotReads` is doing that job, and three
 mutations depend on it. If it is ever weakened, four things stop being tested.
 
-**Three mutations survive on purpose, and no others.** Written down so that
+**Four mutations survive on purpose, and no others.** Written down so that
 nobody goes hunting for a test that was never written, and so that a fourth
 survivor is read as news rather than as normal:
 
@@ -960,6 +961,14 @@ survivor is read as news rather than as normal:
   does is tested next door by `TestDBHoldKeepsALogFromMerging` and
   `TestDBFollowIsNotStrandedByAMerge`. A test here would be a race with a
   deadline, which is the kind this repo does not write.
+- **Promote raising the term before it stops following, rather than after.**
+  Both orders reach the same end state, and nothing observable from outside the
+  package tells them apart — which is exactly why the code says why the order
+  matters and this says no test enforces it. What the wrong order opens is a
+  window in which the store's term is above its leader's and the follower is
+  still running, so a batch that arrives in it is applied by a node that has
+  just fenced the sender. Reproducing that needs the window held open, and
+  there is no seam for it.
 - **The backoff not resetting after a long-lived connection.** With it gone,
   reconnects still happen and still converge; what is lost is that a leader
   restarting once a day is reconnected to at 5s instead of 100ms. That the
@@ -976,6 +985,18 @@ about how much they happened to write. `TestOneSmallRecordArrivesAtOnce` writes
 one nine-byte record to an idle, caught-up follower — nothing can fill a buffer
 and nothing else is coming — and fails in 15 seconds flat without the flush. If
 a mutation's verdict changes between runs, the test is measuring the wrong thing.
+
+**A role is not a term, and the engine cannot tell you which of the two a node
+is.** Fencing is about two leaders: a store that has heard of a newer term stops
+taking writes. A node that is *following* has heard of no such thing — it holds
+its leader's term, so `ErrorFenced` never fires — and it will take a write, put
+it in its own log, and go on applying the leader's records around it. Nothing
+errors, no checksum is wrong, and the two stores disagree for ever. `role.go`
+exists for that one failure. The check has to be in the server because the thing
+that makes this node a replica is a goroutine in the server, and it has to be on
+every route that stores something: `TestAReplicaRefusesEveryWrite` runs all
+three, because a batch aimed at a replica is the same mistake as a `PUT` and a
+longer one.
 
 **The shutdown order is four things now and only one of them is obvious.** Stop
 taking requests, stop the follower, close the `Server`, close the store. The
@@ -1088,7 +1109,7 @@ now done, so the list has become the server, in six pieces:
 | 2 | group commit under the handlers          | done  |
 | 3 | several at once, and ranges              | done  |
 | 4 | replication over the wire                | done  |
-| 5 | two roles, and reads that are not stale  |       |
+| 5 | two roles, and reads that are not stale  | done  |
 | 6 | operations, and writing it down          |       |
 
 Piece 4 was the one the rest of the engine was waiting on, and it is done: there

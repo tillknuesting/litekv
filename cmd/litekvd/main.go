@@ -12,9 +12,12 @@
 //
 //	litekvd -dir /var/lib/replica -addr 127.0.0.1:8081 -leader http://127.0.0.1:8080
 //
-// Nothing yet stops a node started that way from also taking writes of its own,
-// and one that does will diverge from its leader. Roles are the next piece of
-// work; until then, do not write to a node with -leader on it.
+// A node started that way is a replica: it refuses writes with 409 and a
+// Litekv-Leader header saying where they should go, and reports itself as one
+// at /v1/status. POST /v1/promote stops it following and raises its term, which
+// is how it becomes a leader — and which is a decision something outside this
+// process has to make, since raising the term in two places at once puts two
+// stores on the same term and gives the guarantee away.
 //
 // It listens on loopback unless told otherwise, because there is no
 // authentication and no TLS in front of it yet. Put it behind a proxy or on a
@@ -116,20 +119,15 @@ func run() error {
 	})
 	defer api.Close()
 
-	// Started after the handler and stopped before it, which the deferred
-	// closes get right by running in the opposite order to the calls. It writes
-	// to the store without going through the handlers or the queue, so the only
-	// thing it has to be ordered against is the store's own close.
-	var follower *server.Follower
+	// Through the Server rather than beside it, so that the two agree about
+	// what this node is: a Follower started behind the Server's back leaves it
+	// answering writes it should be refusing, and a store that takes a write
+	// while it is following diverges from its leader for good. api.Close stops
+	// it, in the right order, which is why there is no second defer here.
 	if *leader != "" {
-		follower, err = server.Follow(db, *leader, server.FollowerOptions{Logger: log})
-		if err != nil {
+		if err := api.Follow(*leader, server.FollowerOptions{Logger: log}); err != nil {
 			return err
 		}
-		defer follower.Close()
-
-		log.Warn("following a leader and still taking writes; anything written here will "+
-			"diverge this store from its leader", "leader", *leader)
 	}
 
 	srv := &http.Server{Handler: api}
@@ -157,15 +155,15 @@ func run() error {
 	case <-ctx.Done():
 		log.Info("stopping")
 
-		// Four things now, in this order, and the order is the whole of it. The
-		// requests in flight get their time — the streams among them are ended
-		// at once by the hook above, since they would otherwise take all of it;
-		// then the follower stops, which is the other thing writing to the
-		// store; then the writer stores what is queued and answers the handlers
-		// waiting on it; then the store closes. Any other order answers a
-		// request that was already accepted with a 503 for a store the client
-		// had no reason to think was going away, drops a write that was a
-		// moment from being acknowledged, or closes the store under a batch the
+		// Three steps here and four things, in this order, and the order is the
+		// whole of it. The requests in flight get their time — the streams among
+		// them are ended at once by the hook above, since they would otherwise
+		// take all of it; then api.Close stops the follower, which is the other
+		// thing writing to the store, and then the writer, which answers the
+		// handlers waiting on it; then the store closes. Any other order answers
+		// a request that was already accepted with a 503 for a store the client
+		// had no reason to think was going away, drops a write that was a moment
+		// from being acknowledged, or closes the store under a batch the
 		// follower was in the middle of applying.
 		timeout, cancel := context.WithTimeout(context.Background(), *shutdown)
 		defer cancel()
@@ -173,13 +171,8 @@ func run() error {
 		if err := srv.Shutdown(timeout); err != nil {
 			log.Error("some requests did not finish", "err", err)
 		}
-		if follower != nil {
-			if err := follower.Close(); err != nil {
-				log.Error("stopping the follower", "err", err)
-			}
-		}
 		if err := api.Close(); err != nil {
-			log.Error("closing the writer", "err", err)
+			log.Error("closing the server", "err", err)
 		}
 		return db.Close()
 	}

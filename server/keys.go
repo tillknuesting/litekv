@@ -24,6 +24,12 @@ const (
 func (s *Server) readKey(w http.ResponseWriter, r *http.Request) {
 	key := []byte(r.PathValue("key"))
 
+	// Before the read and not after: a client that said "not from a store older
+	// than this" is asking to be refused rather than answered with what is here.
+	if !s.notStale(w, r) {
+		return
+	}
+
 	// Read and not View. View hands out the stored bytes without copying them
 	// and holds the store's read lock until the callback returns — and the
 	// callback here writes to a socket, so a client that stops reading would
@@ -56,6 +62,10 @@ func (s *Server) readKey(w http.ResponseWriter, r *http.Request) {
 
 // writeKey stores the body under one key.
 func (s *Server) writeKey(w http.ResponseWriter, r *http.Request) {
+	if !s.mayWrite(w, r) {
+		return
+	}
+
 	key := []byte(r.PathValue("key"))
 
 	expires, err := expiryOf(r)
@@ -89,6 +99,7 @@ func (s *Server) writeKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.wrote(w)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -99,11 +110,16 @@ func (s *Server) writeKey(w http.ResponseWriter, r *http.Request) {
 // log holds the key without looking, and a delete does not look — so the honest
 // answer is that the deletion is stored, which is what 204 says.
 func (s *Server) deleteKey(w http.ResponseWriter, r *http.Request) {
+	if !s.mayWrite(w, r) {
+		return
+	}
+
 	if err := s.writes.Delete([]byte(r.PathValue("key"))); err != nil {
 		s.fail(w, r, err)
 		return
 	}
 
+	s.wrote(w)
 	w.WriteHeader(http.StatusNoContent)
 }
 

@@ -111,6 +111,11 @@ type Server struct {
 	// See CloseStreams, which is the only thing that closes it.
 	streams    chan struct{}
 	endStreams sync.Once
+
+	// role is whether this node is following somebody, and the follower doing
+	// it. See role.go: the store cannot answer that question, because the thing
+	// pulling the records is up here.
+	role role
 }
 
 // writes is the calls a handler makes to store something. A *litekv.DB
@@ -190,6 +195,10 @@ func New(db *litekv.DB, opts Options) *Server {
 	// every one of those again.
 	s.mux.HandleFunc("GET "+replicaPath, s.streamReplica)
 
+	// Which of the two this node is, and the one call that changes it.
+	s.mux.HandleFunc("GET /v1/status", s.status)
+	s.mux.HandleFunc("POST /v1/promote", s.promote)
+
 	return s
 }
 
@@ -234,5 +243,12 @@ func (s *Server) CloseStreams() {
 // It does not close the store. That is the caller's, and it goes last.
 func (s *Server) Close() error {
 	s.CloseStreams()
+
+	// Before the writer, and for the same reason the writer goes before the
+	// store: the follower writes to the store too, and it is the one thing here
+	// that does so without going through the queue.
+	if err := s.stopFollowing(); err != nil {
+		s.log.Error("stopping the follower", "err", err)
+	}
 	return s.writer.Close()
 }

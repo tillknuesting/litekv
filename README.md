@@ -1007,6 +1007,8 @@ owns a directory: the store is not multi-process safe and nothing checks, so a s
 | `GET`       | `/v1/keys`       | a range or a prefix, as NDJSON pairs  | 200, 400         |
 | `POST`      | `/v1/batch`      | several records, all of them or none  | 204, 400, 413    |
 | `GET`       | `/v1/replica/stream?from=` | the records after a position, streamed | 200, 400, 409 |
+| `GET`       | `/v1/status`     | which of the two this node is         | 200              |
+| `POST`      | `/v1/promote`    | stop following and raise the term     | 200              |
 
 A value is the body, raw. There is no JSON envelope around a caller's bytes and nothing is base64 on the
 way through, because a key-value store's whole job is to hand back what it was given; the type is
@@ -1054,6 +1056,9 @@ branch on what went wrong branches on the status, and the sentence is for whoeve
 | 404    | no value under that key — never written, deleted, or expired                        |
 | 405    | a method that route does not have, with an `Allow` header saying which it does      |
 | 409    | the store has been fenced, with `Litekv-Term` carrying the term it is on            |
+| 409    | a write aimed at a replica, with `Litekv-Leader` saying where it should go          |
+| 412    | a read carrying `Litekv-After` from a store that has not got there                  |
+| 504    | the same, after `Litekv-Wait` ran out                                               |
 | 413    | a value over `-max-value`, or a batch over `-max-batch`                             |
 | 503    | the store is closed, which is what a server on its way down looks like              |
 | 500    | anything else                                                                       |
@@ -1242,6 +1247,49 @@ What is **not** here yet is roles. Nothing marks a node as a follower, so one st
 takes writes of its own, and a write to it will diverge it from its leader — its own records go into its
 own log while the leader's position marches on. `litekvd` says so at startup and that is all it does
 about it. Do not write to a node with `-leader` on it.
+
+### Which of the two, and reads that are not stale
+
+A node started with `-leader` is a **replica**. It refuses every write with 409 and a `Litekv-Leader`
+header saying where to send it — `PUT`, `DELETE` and `POST /v1/batch` alike — and it goes on answering
+reads, which is what it is for.
+
+That refusal is not fencing and could not be. A store that is following holds its leader's term, so
+`ErrorFenced` never fires, and it will take a write perfectly happily: the record goes into its own log,
+the leader's records keep arriving around it, and the two histories never reconcile. No checksum is
+wrong and nothing errors. It is the quietest way to lose data this design has, and the only thing that
+prevents it is this server knowing which of the two it is — the engine cannot know, because the thing
+pulling the records is up here.
+
+```bash
+curl -X POST http://127.0.0.1:8081/v1/promote      # {"term":1}
+curl http://127.0.0.1:8081/v1/status
+# {"role":"leader","term":1,"position":"...","segments":3,"keys":812}
+```
+
+`POST /v1/promote` stops the following first and raises the term second, and the order is the point: a
+term raised while records are still arriving is a store that has fenced its own leader and then applies
+another of its batches. What promotion does not do is decide that this node should be the leader — that
+is consensus, and it is not here; see `AGENTS.md` for why an external lease is the pragmatic answer at
+this size.
+
+**Reads that are not stale** are the other half, and the reason `Reached` and `Await` were built. Every
+write answers with `Litekv-Position`, an opaque cookie for where the store had got to. Send it back as
+`Litekv-After` on a later read and a node that has not got there refuses rather than answering with what
+it has:
+
+```bash
+POS=$(curl -si -X PUT --data-binary 'ada' http://127.0.0.1:8080/v1/keys/user:1 \
+      | grep -i '^litekv-position:' | cut -d' ' -f2 | tr -d '\r')
+
+curl -H "Litekv-After: $POS" -H "Litekv-Wait: 2s" http://127.0.0.1:8081/v1/keys/user:1
+```
+
+Without `Litekv-Wait` a replica that is behind answers 412 at once, with its own position in
+`Litekv-Position` so a client can decide whether to wait here or go elsewhere. With it, the read waits
+on `Await` and answers 504 if the time runs out — which says the wait was too short, not that the
+records are never coming. This is read-your-writes across a load balancer, and it hides the replication
+lag from the client that just wrote; it does not remove it.
 
 ## Concurrency
 

@@ -71,6 +71,10 @@ const contentTypeScan = "application/x-ndjson"
 // answer without the answer. It is not the saving it is on one key: the range
 // still runs and the body is still built, since measuring it is building it.
 func (s *Server) scanKeys(w http.ResponseWriter, r *http.Request) {
+	if !s.notStale(w, r) {
+		return
+	}
+
 	want, err := scanned(r, s.opts.MaxScan)
 	if err != nil {
 		s.fail(w, r, err)

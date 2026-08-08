@@ -111,6 +111,26 @@ func statusOf(err error) (int, string) {
 	case errors.Is(err, litekv.ErrorClosed):
 		return http.StatusServiceUnavailable, err.Error()
 
+	// A write aimed at a node that is following somebody. Not 403: the request
+	// was allowed, this is not the node for it, and which node is can change.
+	case errors.Is(err, errFollowing):
+		return http.StatusConflict, err.Error()
+
+	// A read the client asked not to be answered from a store this far behind.
+	// A precondition it set and did not get, which is what 412 is.
+	case errors.Is(err, errNotReached):
+		return http.StatusPreconditionFailed, err.Error()
+
+	// The same, after waiting for it. The wait ran out; nothing here says it
+	// never would have.
+	case errors.Is(err, errWaited):
+		return http.StatusGatewayTimeout, err.Error()
+
+	// A position from a leader that has been replaced. The client is holding a
+	// cookie from a history this store is not on.
+	case errors.Is(err, litekv.ErrorSuperseded):
+		return http.StatusConflict, err.Error()
+
 	// A follower asked to carry on from something this server could not read.
 	// Nothing was wrong on this side, and repeating the request will go the
 	// same way, so it is the client's 400 and not a 500.
