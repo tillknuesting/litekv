@@ -21,6 +21,13 @@ import (
 // "something went wrong".
 const headerTerm = "Litekv-Term"
 
+// errBadPosition is a from parameter that is not a position at all: not
+// base64url, or the wrong number of bytes, or bytes the store refuses to
+// decode. The store never saw it, so it is not a store error, but it goes
+// through the same mapping so that every route answers a request it could not
+// read in the same way.
+var errBadPosition = errors.New("from is not a position")
+
 // errorBody is what a failed request answers with. One field, because a client
 // that wants to branch on the failure branches on the status; the string is for
 // whoever is reading the terminal.
@@ -103,6 +110,12 @@ func statusOf(err error) (int, string) {
 	// 503 is the status that tells a client to try the next one.
 	case errors.Is(err, litekv.ErrorClosed):
 		return http.StatusServiceUnavailable, err.Error()
+
+	// A follower asked to carry on from something this server could not read.
+	// Nothing was wrong on this side, and repeating the request will go the
+	// same way, so it is the client's 400 and not a 500.
+	case errors.Is(err, errBadPosition):
+		return http.StatusBadRequest, err.Error()
 	}
 
 	var tooBig *http.MaxBytesError

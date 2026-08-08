@@ -33,6 +33,7 @@ package server
 import (
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/tillknuesting/litekv"
@@ -105,6 +106,11 @@ type Server struct {
 	// the two fields exist because the benchmark next door swaps the interface
 	// for the store to measure what the queue is worth.
 	writer *litekv.Writer
+
+	// streams is closed when this server stops serving replication streams.
+	// See CloseStreams, which is the only thing that closes it.
+	streams    chan struct{}
+	endStreams sync.Once
 }
 
 // writes is the calls a handler makes to store something. A *litekv.DB
@@ -153,12 +159,13 @@ func New(db *litekv.DB, opts Options) *Server {
 	writer := db.Writer(litekv.WriterOptions{Queue: opts.Queue})
 
 	s := &Server{
-		db:     db,
-		opts:   opts,
-		log:    opts.Logger,
-		mux:    http.NewServeMux(),
-		writes: writer,
-		writer: writer,
+		db:      db,
+		opts:    opts,
+		log:     opts.Logger,
+		mux:     http.NewServeMux(),
+		writes:  writer,
+		writer:  writer,
+		streams: make(chan struct{}),
 	}
 
 	// GET also matches HEAD, which is what makes asking for a value's size
@@ -176,6 +183,13 @@ func New(db *litekv.DB, opts Options) *Server {
 	s.mux.HandleFunc("POST /v1/batch", s.writeBatch)
 	s.mux.HandleFunc("GET /v1/keys", s.scanKeys)
 
+	// Replication rides this listener rather than one of its own. One port to
+	// open, one thing to shut down, one place for authentication to go when
+	// there is any, and it goes through whatever proxy or load balancer a read
+	// replica is already behind — a second raw TCP listener would have needed
+	// every one of those again.
+	s.mux.HandleFunc("GET "+replicaPath, s.streamReplica)
+
 	return s
 }
 
@@ -183,8 +197,29 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
 }
 
-// Close stops the writer once everything queued has been stored, and answers
-// the handlers waiting on it. Closing twice is harmless.
+// CloseStreams ends every replication stream this server is serving, and
+// answers a request for a new one with 503. It touches neither the writer nor
+// the store, so reads and writes carry on. Calling it twice is harmless, and
+// Close calls it.
+//
+// It exists because a stream is a request that never finishes on its own, and
+// http.Server.Shutdown waits for one. Shutdown closes the listeners and then
+// waits for every connection to go idle; it does not cancel a request's
+// context, so a leader with one follower attached would spend its whole
+// shutdown timeout waiting for a handler that was never going to return. Hand
+// this to (*http.Server).RegisterOnShutdown and it goes down in the time the
+// ordinary requests take.
+//
+// Ending a stream abruptly costs the follower nothing: it reconnects, which is
+// what it does about any connection ending, and it comes back at the position
+// it had reached.
+func (s *Server) CloseStreams() {
+	s.endStreams.Do(func() { close(s.streams) })
+}
+
+// Close ends the replication streams, then stops the writer once everything
+// queued has been stored and answers the handlers waiting on it. Closing twice
+// is harmless.
 //
 // The order matters on the way down and there are three things in it. Stop
 // taking requests first, so nothing new arrives; then close this, which lets
@@ -192,7 +227,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // store first turns writes that were a moment from being acknowledged into
 // ErrorClosed, for no reason other than the order they were shut down in.
 //
+// A closed Server still answers reads, because the store is still open and
+// still holds everything. A stream is the one thing it stops answering, for the
+// reason CloseStreams gives: it is a connection meant to stay open, not a read.
+//
 // It does not close the store. That is the caller's, and it goes last.
 func (s *Server) Close() error {
+	s.CloseStreams()
 	return s.writer.Close()
 }

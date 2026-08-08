@@ -599,9 +599,11 @@ next, err := leader.Since(pos, w, litekv.ReplicaOptions{})   // one batch
 ```
 
 `example/` wires a leader and a follower over a connection, end to end, in about fifty lines, and shows
-a `DB` followed by another further down. `tcp_test.go` is the same thing over a real loopback socket,
-with framing, a connection broken part way through and a reconnect — the only place that says any of
-this survives a wire rather than a pipe.
+a `DB` followed by another further down. For the same thing over a real socket, with framing, a
+connection broken part way through and a reconnect, see [Replication over the
+wire](#replication-over-the-wire) below: `server/` has the endpoint and `server/replica_test.go` puts a
+leader and a follower through a real listener, which is the only place that says any of this survives a
+wire rather than a pipe.
 
 ### A position is not an offset
 
@@ -982,6 +984,7 @@ go run ./cmd/litekvd -dir /var/lib/litekv -addr 127.0.0.1:8080
 | `-max-batch`        | the largest body `POST /v1/batch` will take                      | 32 MiB           |
 | `-max-scan`         | the most pairs a range answers with, and the most `?limit=` may ask for | 1000      |
 | `-queue`            | writes that may be waiting before a handler blocks               | 1024             |
+| `-leader`           | base URL of a leader to follow                                   | follow nobody    |
 | `-shutdown-timeout` | how long requests in flight get once it is asked to stop         | 10s              |
 
 `-sync` defaults to `always` because the library does: a binary that quietly weakened durability
@@ -1003,6 +1006,7 @@ owns a directory: the store is not multi-process safe and nothing checks, so a s
 | `DELETE`    | `/v1/keys/{key}` | writes a tombstone                    | 204              |
 | `GET`       | `/v1/keys`       | a range or a prefix, as NDJSON pairs  | 200, 400         |
 | `POST`      | `/v1/batch`      | several records, all of them or none  | 204, 400, 413    |
+| `GET`       | `/v1/replica/stream?from=` | the records after a position, streamed | 200, 400, 409 |
 
 A value is the body, raw. There is no JSON envelope around a caller's bytes and nothing is base64 on the
 way through, because a key-value store's whole job is to hand back what it was given; the type is
@@ -1046,7 +1050,7 @@ branch on what went wrong branches on the status, and the sentence is for whoeve
 
 | status | when                                                                              |
 | ------ | --------------------------------------------------------------------------------- |
-| 400    | an expiry, a batch line, or a range query the server could not read                 |
+| 400    | an expiry, a batch line, a range query, or a `from` the server could not read       |
 | 404    | no value under that key — never written, deleted, or expired                        |
 | 405    | a method that route does not have, with an `Allow` header saying which it does      |
 | 409    | the store has been fenced, with `Litekv-Term` carrying the term it is on            |
@@ -1181,6 +1185,63 @@ the range. The callback runs under the store's read lock, and a client that stop
 under it would be deciding when the store is allowed to rotate — the same trade `GET /v1/keys/{key}`
 makes by using `Read` instead of `View`. The framing is still NDJSON and a client can still consume it a
 line at a time; what it does not get is a lock held open while it does.
+### Replication over the wire
+
+Everything the [Replication](#replication) chapter describes now has a route. The leader streams from a
+position on the same listener it serves keys on, and a follower is a second `litekvd` pointed at it:
+
+```bash
+litekvd -dir /var/lib/litekv   -addr 127.0.0.1:8080
+litekvd -dir /var/lib/replica  -addr 127.0.0.1:8081 -leader http://127.0.0.1:8080
+```
+
+**One listener and not two.** One port to open, one thing to shut down, one place for authentication to
+go when there is any, and it goes through whatever proxy or load balancer a read replica is already
+behind — a second raw TCP listener would have needed every one of those again. What it costs is a few
+bytes of chunked framing per batch, which against the megabyte a batch defaults to is not a number worth
+writing down.
+
+The body is the framing `tcp_test.go` arrived at over a bare socket, carried across unchanged: a kind
+byte, the position those records leave a follower at, a length, and the payload, flushed per frame. A
+record stream is self-framing, but a reader still has to know where one batch stops and the next
+begins, and a snapshot has to be told from a batch because different calls apply them.
+
+**A position on the wire is opaque.** It is base64url of `MarshalBinary`, unpadded, and a follower hands
+back the bytes it was given without taking them apart. That is what lets a `DBPosition` gain a field — as
+it has twice, for the term and for the sequence number — with nothing on the client side knowing. It is
+a cookie, not a structure, and one that is not a position at all is a 400.
+
+**A leader answers divergence with a snapshot, not by hanging up.** Nothing holds a log open for a
+follower that is not connected, so a follower that was away long enough always comes back to a position
+that is gone — that is the ordinary fate of one that missed a merge, not an unusual path. A leader that
+treated it as a failed connection would leave that follower asking for the same dead position forever,
+and reconnecting would never help.
+
+**A connection ending is normal.** The follower reconnects with a backoff that doubles from 100 ms to
+5 s, half of each wait jittered so that several followers that lost the same leader do not all come
+back at the same instant. A connection that stayed up longer than the longest wait was a working one,
+so the next attempt starts from the shortest wait again. A leader that refuses — 409 because it has been
+replaced, 400 because it could not read the position — is retried at the longest interval rather than
+climbing to it: asking again straight away cannot change the answer, and somebody promoting something
+can.
+
+Stopping a follower does not cost it its place. The position is written down beside the follower's own
+logs by `Apply`, so a follower that comes back reads it out of the store and resumes; nothing in the
+process keeps a copy that could go stale. `Close` waits for the goroutine, so a batch being applied when
+the stop arrives is finished and written down before the store may be closed.
+
+**Shutting a leader down with a follower attached** needs one thing that is easy to leave out. A stream
+is a request that never finishes on its own, and `http.Server.Shutdown` waits for every request rather
+than cancelling any of them, so a leader would spend the whole of `-shutdown-timeout` waiting for a
+handler that had no intention of returning: **10.05 s against 0.03 s**, measured with two binaries on
+loopback. `Server.CloseStreams` ends the streams and refuses new ones, and `litekvd` hands it to
+`(*http.Server).RegisterOnShutdown`. A follower whose stream ends that way reconnects, which is what it
+does about any connection ending.
+
+What is **not** here yet is roles. Nothing marks a node as a follower, so one started with `-leader` also
+takes writes of its own, and a write to it will diverge it from its leader — its own records go into its
+own log while the leader's position marches on. `litekvd` says so at startup and that is all it does
+about it. Do not write to a node with `-leader` on it.
 
 ## Concurrency
 

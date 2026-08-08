@@ -24,8 +24,9 @@ so this section stays as written. It changes which of the missing things matter:
   else, so a change that breaks a caller breaks them. If the server turns out to
   need something the engine does not export, that is a separate, deliberate
   commit to the engine, not a quiet widening while building something else.
-  `tcp_test.go` is still a sketch of the replication endpoint and is the thing
-  to promote rather than reinvent.
+  `tcp_test.go` was a sketch of the replication endpoint and has been promoted
+  into `server/replica.go` and `server/replica_test.go` rather than reinvented;
+  the engine gave up nothing to make that possible.
 - **Format changes are cheapest now.** A batch commit marker: anything touching
   the record layout costs less before there is data anyone minds losing. The
   version byte exists for this, and has now carried three changes — the
@@ -59,6 +60,8 @@ And outside the engine, in packages of their own:
 | `server/batch.go`    | `POST /v1/batch`: a body of operations parsed whole, then stored   |
 | `server/scan.go`     | `GET /v1/keys`: ranges and prefixes, the query, and the limits     |
 | `server/errors.go`   | which store error is which status, and what a client is not told   |
+| `server/replica.go`  | the frames, the position on the wire, and the leader's stream       |
+| `server/follower.go` | the other end of it: dial, apply, reconnect                         |
 | `cmd/litekvd/main.go`| flags, the listener, signals, and the order things shut down in    |
 
 `KeyValueStore` and `DB` are deliberately separate. The first is one log with
@@ -82,6 +85,7 @@ go run ./example      # it exercises every exported call
 go test -run xxx -fuzz FuzzSegmentBytes -fuzztime 30s .
 go test -run xxx -fuzz '^FuzzApply$' -fuzztime 30s .     # what arrives over a wire
 go test -run xxx -fuzz '^FuzzDBApply$' -fuzztime 30s .   # and into a DB
+go test -run xxx -fuzz '^FuzzReadFrame$' -fuzztime 30s ./server/   # and off a socket
 ```
 
 The `^...$` matters: `-fuzz FuzzApply` now matches `FuzzApplySnapshot` too, and
@@ -95,6 +99,13 @@ can be built at all:
 go build -o /tmp/litekvd ./cmd/litekvd && /tmp/litekvd -dir "$(mktemp -d)" -addr 127.0.0.1:18080 &
 curl -X PUT --data-binary 'v' http://127.0.0.1:18080/v1/keys/a%2Fb && curl http://127.0.0.1:18080/v1/keys/a%2Fb
 ```
+
+Anything touching replication gets two of them, one following the other, with
+the follower killed and restarted while the leader is being written to. Count
+what `ForEach` yields when comparing them afterwards and not `Len`, for the
+reason "Replication over a real socket" gives; and stop both with a signal
+rather than a kill, because how long the leader takes to go down with a follower
+attached is itself a thing that has been broken.
 
 `GOMAXPROCS=1` is not paranoia. The lock shards on `GOMAXPROCS`, so a one-core
 machine takes a different path through it, and background merging stops being in
@@ -454,13 +465,20 @@ is remembered in `db.rotateErr` and reported by `Sync` and `Close`.
 
 ## Replication over a real socket
 
-`tcp_test.go` is the only place the library is put on a wire. Everything else
-moves records through a `bytes.Buffer` or an `io.Pipe`, which says what the
-records are but not that the arrangement works: a pipe never returns a short
-read, never splits a write across two calls, and never goes away in the middle
-of one.
+It lives in `server/replica_test.go` now. It was `tcp_test.go` in this package,
+where it was the only place the library was put on a wire and where the framing
+beside it was a sketch; the sketch is `server/replica.go` and the test moved
+with it. This package has no over-a-socket coverage any more and that is the
+right way round — the server's version exercises the engine through its exported
+API and nothing else, so a change that breaks a caller breaks it, which a test
+living next to the unexported names could not say.
 
-It runs a leader and a follower over loopback TCP with a length in front of
+Why either version exists: everything else here moves records through a
+`bytes.Buffer` or an `io.Pipe`, which says what the records are but not that the
+arrangement works, since a pipe never returns a short read, never splits a write
+across two calls, and never goes away in the middle of one.
+
+It runs a leader and a follower over a real listener with a length in front of
 every frame, a connection broken on purpose part way through, and a reconnect.
 The framing is not part of the library and deliberately so — it is what the
 package says is the caller's job — but writing it found three things no
@@ -479,6 +497,26 @@ in-process test had:
   a follower that came back by way of a snapshot has none, since a snapshot
   carries only live records. Both stores are right and the counts differ. Count
   what `ForEach` yields.
+
+Two more came out of promoting it, and both are about counting snapshots, which
+is the only way from outside to tell a follower that resumed from one that was
+sent the whole store again — the records end up the same either way.
+
+- **A snapshot count is not a constant when anything else is going on.** With
+  merging on, a follower away for a moment can legitimately be sent the store
+  again; and a snapshot of a store whose active log is empty at that instant
+  points at the start of that log, which names no record, so writes that fill
+  and freeze it before the stream reads anything make the leader refuse its own
+  position and snapshot a second time. `TestReplicationOverHTTP` therefore has
+  merging off and counts deltas around the reconnects rather than a total.
+- **A follower's `Close` does not end the handler on the other side.** It ends
+  a moment later, when the closed socket reaches it, and in that moment it is
+  the most likely handler in the process to take a snapshot: `Follow` was
+  blocked, the store moved on, and it comes back diverged. A test that counts
+  what a leader did has to wait for the leader to be serving nobody first, which
+  is what the `alone` helper is. The handler also checks whether the stream is
+  still wanted before snapshotting, which narrows the window but cannot close
+  it.
 
 ## Chaos: faults in the way of every operation
 
@@ -529,6 +567,14 @@ for minutes rather than the seconds CI gives them:
 | `FuzzDBApplySnapshot`  | arbitrary bytes as a snapshot                         |
 | `FuzzDBSince`          | arbitrary positions to a leader                       |
 | `FuzzDBPosition`       | arbitrary bytes to the position parser                |
+| `FuzzReadFrame`        | arbitrary bytes to the frame reader, in `server/`     |
+
+`FuzzReadFrame` is the one outside this package, and what it is really asserting
+is about memory rather than about frames: a header claiming a gigabyte with
+nothing behind it must cost what a header claiming nothing costs. The reader
+grows into the bytes that arrive instead of allocating the length it was told
+about, and a version that did the obvious thing would show up here as a fuzzer
+taking the machine down rather than as a failure.
 
 `FuzzDBApply` and `FuzzDBApplySnapshot` reuse one store rather than opening one
 per execution, and install `unsyncedDisk` from `fs_test.go`, which is the real
@@ -702,7 +748,23 @@ invariant above is phrased as slow-never-wrong rather than as a rule to follow.
 - **A mutation whose patterns rot.** They are exact text, so renaming a function
   or moving a line turns a mutation into a silent SKIP. Read the SKIP lines: a
   suite reporting twelve caught and five skipped is a suite testing seven
-  things.
+  things. Merging two branches is the worst case for this — adding a field to a
+  struct literal realigns every line in it, so `writes: writer,` became
+  `writes:  writer,` and a mutation aimed at the write path stopped being aimed
+  at anything.
+- **A mutation that does not compile is a mutation that did not run.** Four in
+  one sweep: replacing a channel with an undeclared name, and three that left a
+  variable unused because the only line that read it was the line replaced. Each
+  reported `SKIPPED (does not build)`, which is honest and easy to skim past.
+  Mutate to something that still typechecks — `case started.IsZero():` instead
+  of `case false:` — or add the `_ =` that keeps the variable read.
+- **A mutation script that dies on a test's output.** One sweep stopped at
+  mutation 30 of 46 with a `UnicodeDecodeError`: a failing fuzz test printed a
+  corpus entry, the corpus entry was arbitrary bytes, and `subprocess.run(...,
+  text=True)` raised rather than returning. Seventeen mutations were never tried
+  and nothing said so — the tally line was the thing that failed to print. Pass
+  `errors="replace"`, and count the result lines against the number of mutations
+  defined rather than trusting that the run finished.
 - **A mutation whose pattern matches two files.** The scripts pick a target by
   searching for the text to replace, and once `db.go` and `dbreplica.go` both
   had the same line, two mutations were silently edited into the wrong file and
@@ -883,18 +945,82 @@ reads carry on, which is only true if the queue is in the path.
 `TestClosingTheServerStopsWritesAndNotReads` is doing that job, and three
 mutations depend on it. If it is ever weakened, four things stop being tested.
 
-**One mutation survives on purpose.** Dropping `Options.Queue` on the way to
-`litekv.WriterOptions` changes nothing observable from outside the package: the
-queue's depth decides when a sender blocks and how large a group gets, and
-neither can be asserted without a timing test. It is a pass-through of an engine
-option the engine tests. Do not go looking for the test that catches it.
+**Three mutations survive on purpose, and no others.** Written down so that
+nobody goes hunting for a test that was never written, and so that a fourth
+survivor is read as news rather than as normal:
 
-**The shutdown order is three things and only one of them is obvious.** Stop
-taking requests, close the `Server`, close the store. The middle step exists
-because a handler blocked on the queue is holding a request open: close the
-store first and a write a moment from being acknowledged becomes `ErrorClosed`
-for no reason but the order. `cmd/litekvd` has no test of its own — the
-end-to-end curl run in "Verifying a change" is what covers it.
+- **`Options.Queue` dropped on the way to `litekv.WriterOptions`.** The depth
+  decides when a sender blocks and how large a group gets, and neither can be
+  asserted without a timing test. A pass-through of an engine option the engine
+  tests.
+- **The snapshot's hold released before `Follow` takes its own.** `Follow` calls
+  `db.Hold` first and only then releases the caller's, so the mutation opens a
+  window between the two rather than removing a hold — a scheduling race, and
+  the engine's `Follow` has the reason in its own comment. What the mechanism
+  does is tested next door by `TestDBHoldKeepsALogFromMerging` and
+  `TestDBFollowIsNotStrandedByAMerge`. A test here would be a race with a
+  deadline, which is the kind this repo does not write.
+- **The backoff not resetting after a long-lived connection.** With it gone,
+  reconnects still happen and still converge; what is lost is that a leader
+  restarting once a day is reconnected to at 5s instead of 100ms. That the
+  backoff *grows* is tested — `TestTheBackoffGrows`, by counting attempts in a
+  window rather than asserting a latency — and that it comes back down is
+  tuning, not correctness.
+
+**A catch that is not reproducible is not a catch.** The mutation removing the
+`Flush` after each frame was reported as caught by the two big replication tests
+in one sweep and as surviving the next. Both reports were true: those tests
+write hundreds of four-kilobyte values, which fill net/http's buffer and push
+the frames out whether the code flushes or not, so whether they notice is a fact
+about how much they happened to write. `TestOneSmallRecordArrivesAtOnce` writes
+one nine-byte record to an idle, caught-up follower — nothing can fill a buffer
+and nothing else is coming — and fails in 15 seconds flat without the flush. If
+a mutation's verdict changes between runs, the test is measuring the wrong thing.
+
+**The shutdown order is four things now and only one of them is obvious.** Stop
+taking requests, stop the follower, close the `Server`, close the store. The
+`Server` step exists because a handler blocked on the queue is holding a request
+open: close the store first and a write a moment from being acknowledged becomes
+`ErrorClosed` for no reason but the order. The follower step exists because it
+writes to the store without going through the handlers or the queue, so nothing
+else orders it against the close, and its `Close` waits for the goroutine rather
+than merely asking — a batch being applied when the stop arrives is a write, and
+returning before it finished would leave the caller free to close the store
+underneath it. `cmd/litekvd` has no test of its own — the end-to-end curl run in
+"Verifying a change" is what covers it.
+
+**`Shutdown` waits for a stream forever, and the number is 10.05 seconds against
+0.03.** `http.Server.Shutdown` closes the listeners and then waits for every
+connection to go idle; it does not cancel a request's context. A replication
+stream is a request that never finishes on its own, so a leader with one
+follower attached spends the whole of `-shutdown-timeout` and then reports
+`context deadline exceeded`. That is the measurement, taken with two binaries on
+loopback and the hook removed. `Server.CloseStreams` ends the streams and
+refuses new ones, and `litekvd` hands it to `RegisterOnShutdown`. Anything else
+long-lived that gets added to this package needs the same treatment; the
+default is to hang.
+
+**A stream answers everything it can before the first byte of the body.** After
+a 200 there is no status left, so a failure can only end the stream and the
+follower is left guessing. That is why the first snapshot is taken before
+`WriteHeader` — a fenced leader is a 409 with the term on it, a closed store a
+503 — and why the term check happens before that. Everything after the header
+goes to the log at Debug and nowhere else.
+
+**A leader learns it has been replaced from `Since` and not from `Follow`.**
+`db.Since` writes the newer term down before reporting `ErrorFenced`; `db.Follow`
+returns the same error and writes nothing. The endpoint stands in for that by
+asking `Since` with the same position — which costs nothing, because a store
+that refuses on the term refuses before it reads a record — and
+`TestAFollowerWithANewerTermFencesTheLeader` holds it to it by writing to the
+leader afterwards and expecting `ErrorFenced`. The real fix is one line in
+`Follow`, in the engine, and belongs to whoever next has a reason to touch it.
+
+**What a leader is fenced by is asked of it, never volunteered.** `Snapshot`
+refuses when the store is fenced and `batch` does not, so a leader that has
+heard of a newer term goes on streaming to a follower that has not. Nothing in
+this piece can tell — there is no exported way to ask a store whether it is
+fenced, only to try a write. Piece 5 needs one for `/v1/status` anyway.
 
 **`utf8.Valid` is the encoding rule and nothing else may be.** `ndjson.go`
 decides between a plain string field and a `_b64` one by asking whether the
@@ -961,13 +1087,54 @@ now done, so the list has become the server, in six pieces:
 | 1 | the package, the binary, and one key     | done  |
 | 2 | group commit under the handlers          | done  |
 | 3 | several at once, and ranges              | done  |
-| 4 | replication over the wire                |       |
+| 4 | replication over the wire                | done  |
 | 5 | two roles, and reads that are not stale  |       |
 | 6 | operations, and writing it down          |       |
 
-Piece 4 is the one the rest of the engine is waiting on: semi-synchronous
-replication needs the leader to know its followers, and a leader knows nothing
-about a follower until something holds the connection.
+Piece 4 was the one the rest of the engine was waiting on, and it is done: there
+is now a connection for a leader to hang something off, which is what
+semi-synchronous replication needs and what nothing here had before. What it
+does not yet have is anything hanging off it — the handler keeps no list of
+followers and no record of how far each has got, and adding one is the first
+state a leader would have to keep. See "What piece 4 left for the pieces after
+it" below.
+
+### What piece 4 left for the pieces after it
+
+**Roles are the missing half and the endpoint is written as if they existed.** A
+node started with `-leader` still serves `PUT` and `DELETE`, and a write to it
+goes into its own active log while `applied` stays where the leader put it. The
+next batch is accepted — `Apply` compares `from` against `applied`, and
+`applied` did not move — so the leader's records land on top of the local ones
+and the two stores disagree with nothing reporting it. `litekvd` warns at
+startup and that is all it does. Piece 5 refusing writes on a node that is
+following is what closes this, and it is not a small hole.
+
+**A leader keeps no list of followers, on purpose and only for now.** The
+handler holds one connection and knows nothing about any other. Semi-synchronous
+replication needs the opposite: the leader has to know who is connected and how
+far each has got, and a write has to wait for some of them. The place for that
+is the `send` closure in `streamReplica`, which already sees every position that
+goes out and is the only code that knows a follower took it. What it does not
+see is acknowledgement — nothing comes back up this stream, and there is no
+frame kind for it. That is the first protocol change semi-sync needs, and it is
+also what a heartbeat would need, which is the other thing missing: a stream
+over a blackholed TCP connection is noticed by the OS keepalive in about fifteen
+minutes and by nothing else.
+
+**Two engine gaps this piece worked around rather than fixed**, both written up
+under "The server, and what its tests can and cannot say": `Follow` does not
+write down a newer term where `Since` does, and there is no exported way to ask
+a store whether it is fenced.
+
+**The leader holds a whole snapshot in memory.** A snapshot frame carries a
+length in front of it, so the handler buffers the store's live records before it
+can write the header. That is fine for the stores this serves today and it is
+the wrong shape for the one the `DB` was built for — only the keys have to fit
+in memory, and this asks for all of it. Changing it means changing the framing:
+a length of nothing meaning "until the frame after this one", or a trailer, or
+chunking a snapshot across several frames with the reset only on the first.
+`FollowerOptions.MaxFrame` is the bound today, at a gigabyte.
 
 Below is what was on the list before that, kept because the reasoning is still
 the reasoning.
