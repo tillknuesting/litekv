@@ -28,6 +28,35 @@ type errorBody struct {
 	Error string `json:"error"`
 }
 
+// clientError is a request this package refused before the store ever saw it: a
+// line of a batch that is not JSON, a field spelled two ways at once, a limit
+// over the one this server will answer with.
+//
+// It exists so that a route finding out twelve lines into a body can hand the
+// reason back up and let statusOf decide the status, rather than answering 400
+// in its own words from wherever it happened to be. Every 400 this package
+// answers is one of these, including the expiry header, which could have
+// answered on the spot and does not — one way of saying it is easier to keep
+// right than two.
+//
+// The message reaches the client verbatim. That is the point of it, and it is
+// why nothing from the store is ever wrapped in one: a store error can name a
+// path on the server's disk, and those go through the other branch.
+type clientError struct{ error }
+
+// badRequest is a mistake the client made, phrased for the client.
+func badRequest(format string, args ...any) error {
+	return clientError{fmt.Errorf(format, args...)}
+}
+
+// tooLargeFor is what a body over a limit is told, in one place because it is
+// said from three: a declared length on a PUT, a declared length on a batch, and
+// a MaxBytesReader that found out while reading. Which limit was hit is the
+// number, since the routes have one each.
+func tooLargeFor(limit int64) string {
+	return fmt.Sprintf("the body exceeds the %d byte limit", limit)
+}
+
 // fail answers a request that could not be served.
 func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 	status, message := statusOf(err)
@@ -78,8 +107,14 @@ func statusOf(err error) (int, string) {
 
 	var tooBig *http.MaxBytesError
 	if errors.As(err, &tooBig) {
-		return http.StatusRequestEntityTooLarge,
-			fmt.Sprintf("value exceeds the %d byte limit", tooBig.Limit)
+		return http.StatusRequestEntityTooLarge, tooLargeFor(tooBig.Limit)
+	}
+
+	// Last, so that a store error wrapped on its way out of a parse is still
+	// the store error it was rather than a 400. Nothing here wraps one.
+	var bad clientError
+	if errors.As(err, &bad) {
+		return http.StatusBadRequest, bad.Error()
 	}
 
 	return http.StatusInternalServerError, ""

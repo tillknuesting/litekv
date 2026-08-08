@@ -1,7 +1,6 @@
 package server
 
 import (
-	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -61,7 +60,7 @@ func (s *Server) writeKey(w http.ResponseWriter, r *http.Request) {
 
 	expires, err := expiryOf(r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		s.fail(w, r, err)
 		return
 	}
 
@@ -70,8 +69,7 @@ func (s *Server) writeKey(w http.ResponseWriter, r *http.Request) {
 	// server has taken MaxValue of it. The reader below is still needed: a
 	// chunked body declares nothing.
 	if r.ContentLength > s.opts.MaxValue {
-		writeError(w, http.StatusRequestEntityTooLarge,
-			fmt.Sprintf("value exceeds the %d byte limit", s.opts.MaxValue))
+		writeError(w, http.StatusRequestEntityTooLarge, tooLargeFor(s.opts.MaxValue))
 		return
 	}
 
@@ -111,6 +109,10 @@ func (s *Server) deleteKey(w http.ResponseWriter, r *http.Request) {
 
 // expiryOf reads headerExpires. A request without one gets the zero time, which
 // is a record that never expires.
+//
+// The failure is a clientError so that it goes through statusOf with every
+// other 400 this package answers. What it says is the client's mistake and
+// nothing about the server, which is what makes it safe to hand back verbatim.
 func expiryOf(r *http.Request) (time.Time, error) {
 	raw := r.Header.Get(headerExpires)
 	if raw == "" {
@@ -119,7 +121,7 @@ func expiryOf(r *http.Request) (time.Time, error) {
 
 	at, err := time.Parse(time.RFC3339Nano, raw)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("%s must be an RFC 3339 time", headerExpires)
+		return time.Time{}, badRequest("%s must be an RFC 3339 time", headerExpires)
 	}
 	return at, nil
 }

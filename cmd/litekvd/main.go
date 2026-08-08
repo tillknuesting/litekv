@@ -47,8 +47,13 @@ func run() error {
 		segmentSize  = flag.Int64("segment-size", 0, "bytes before a log is frozen and a new one started (0 for 4 MiB)")
 		mergeTrigger = flag.Int("merge-trigger", 0, "logs of a size before they are merged (0 for two, below two turns merging off)")
 		maxValue     = flag.Int64("max-value", 0, "largest value a write may carry (0 for 16 MiB)")
-		queue        = flag.Int("queue", 0, "writes that may be waiting to be stored before a handler blocks (0 for 1024)")
-		shutdown     = flag.Duration("shutdown-timeout", 10*time.Second, "how long requests in flight get once the server is asked to stop")
+		maxBatch     = flag.Int64("max-batch", 0, "largest body POST /v1/batch will take (0 for 32 MiB)")
+		maxScan      = flag.Int("max-scan", 0,
+			"most pairs a range will answer with, and the most a client's own ?limit= may ask for (0 for 1000).\n"+
+				"A range holds the store's read lock while it gathers, so this is what stops one client\n"+
+				"parking a walk of the whole store in front of the writes")
+		queue    = flag.Int("queue", 0, "writes that may be waiting to be stored before a handler blocks (0 for 1024)")
+		shutdown = flag.Duration("shutdown-timeout", 10*time.Second, "how long requests in flight get once the server is asked to stop")
 	)
 	flag.Parse()
 
@@ -90,7 +95,13 @@ func run() error {
 		return fmt.Errorf("listening on %s: %w", *addr, err)
 	}
 
-	api := server.New(db, server.Options{MaxValue: *maxValue, Queue: *queue, Logger: log})
+	api := server.New(db, server.Options{
+		MaxValue: *maxValue,
+		MaxBatch: *maxBatch,
+		MaxScan:  *maxScan,
+		Queue:    *queue,
+		Logger:   log,
+	})
 	defer api.Close()
 
 	srv := &http.Server{Handler: api}

@@ -979,6 +979,8 @@ go run ./cmd/litekvd -dir /var/lib/litekv -addr 127.0.0.1:8080
 | `-segment-size`     | bytes before a log is frozen                                     | 4 MiB            |
 | `-merge-trigger`    | logs of a size before they are merged                            | 2                |
 | `-max-value`        | the largest value a write may carry                              | 16 MiB           |
+| `-max-batch`        | the largest body `POST /v1/batch` will take                      | 32 MiB           |
+| `-max-scan`         | the most pairs a range answers with, and the most `?limit=` may ask for | 1000      |
 | `-queue`            | writes that may be waiting before a handler blocks               | 1024             |
 | `-shutdown-timeout` | how long requests in flight get once it is asked to stop         | 10s              |
 
@@ -999,6 +1001,8 @@ owns a directory: the store is not multi-process safe and nothing checks, so a s
 | `HEAD`      | `/v1/keys/{key}` | the value's length and nothing else   | 200, 404         |
 | `PUT`       | `/v1/keys/{key}` | stores the body under the key         | 204              |
 | `DELETE`    | `/v1/keys/{key}` | writes a tombstone                    | 204              |
+| `GET`       | `/v1/keys`       | a range or a prefix, as NDJSON pairs  | 200, 400         |
+| `POST`      | `/v1/batch`      | several records, all of them or none  | 204, 400, 413    |
 
 A value is the body, raw. There is no JSON envelope around a caller's bytes and nothing is base64 on the
 way through, because a key-value store's whole job is to hand back what it was given; the type is
@@ -1030,8 +1034,10 @@ trusting the documentation for any of that, and checks the store holds the bytes
 than the ones the URL was spelled with — reading it back through the same encoding would agree with
 itself however wrong both ends were.
 
-The one key with no spelling is the empty one, which the store holds happily. A path wildcard does not
-match an empty segment, so `/v1/keys/` is not a route.
+The one key with no spelling *here* is the empty one, which the store holds happily. A path wildcard
+does not match an empty segment, so `/v1/keys/` is not a route. It is reachable through the routes that
+do not spell a key in a path — a batch line writes it and a range hands it back — but not through this
+one.
 
 ### What a failure says
 
@@ -1040,11 +1046,11 @@ branch on what went wrong branches on the status, and the sentence is for whoeve
 
 | status | when                                                                              |
 | ------ | --------------------------------------------------------------------------------- |
-| 400    | a header the server could not read, such as an expiry that is not a time            |
+| 400    | an expiry, a batch line, or a range query the server could not read                 |
 | 404    | no value under that key — never written, deleted, or expired                        |
 | 405    | a method that route does not have, with an `Allow` header saying which it does      |
 | 409    | the store has been fenced, with `Litekv-Term` carrying the term it is on            |
-| 413    | a value over `-max-value`                                                           |
+| 413    | a value over `-max-value`, or a batch over `-max-batch`                             |
 | 503    | the store is closed, which is what a server on its way down looks like              |
 | 500    | anything else                                                                       |
 
@@ -1088,6 +1094,93 @@ close the `Server`, close the store. Any other order answers a request that was 
 503, or drops a write that was a moment from being acknowledged. `litekvd` does it in that order and
 `TestClosingTheServerStopsWritesAndNotReads` holds the middle step to it: a closed `Server` refuses
 writes with 503 and goes on answering reads, because the store is still open and still holds everything.
+
+### Several at once, and ranges
+
+Two routes carry more than one record, and both of them carry it as **newline-delimited JSON**: one
+object to a line, no array around them, so a body can be produced and consumed a line at a time and
+neither end has to hold a large answer as a single JSON value before it can look at any of it.
+
+```bash
+curl -X POST --data-binary @- http://127.0.0.1:8080/v1/batch <<'EOF'
+{"op":"write","key":"user:1","value":"ada"}
+{"op":"write","key":"user:2","value":"grace","expires":"2030-01-01T00:00:00Z"}
+{"op":"delete","key":"user:0"}
+EOF
+
+curl 'http://127.0.0.1:8080/v1/keys?prefix=user:'
+# {"key":"user:1","value":"ada"}
+# {"key":"user:2","value":"grace"}
+```
+
+`POST /v1/batch` stores every operation or none of them, and answers 204. `"op"` is `"write"` or
+`"delete"`, `"expires"` is an RFC 3339 time meaning exactly what the `Litekv-Expires` header means on a
+`PUT`, and a delete carrying a value or an expiry is refused rather than having them quietly dropped.
+An absent key or value is the empty one, a blank line is skipped, and an empty body stores nothing and
+answers 204 — an empty batch is what the engine calls an empty batch.
+
+All or nothing means two things and the route provides both. The engine provides the second:
+`WriteBatch` puts the records down behind a marker and recovery discards from that marker on unless
+every one of them is there. The route provides the first: the **whole body is parsed** into a
+`litekv.Batch` before any of it is handed to the store, so one line the server cannot read refuses the
+whole request with a 400 naming that line. A parser that stored as it went would make the marker
+pointless — atomic on the disk and torn on the wire.
+
+### A key is bytes and a JSON string is not
+
+Both routes use one encoding rule, in both directions:
+
+- A key or a value is a plain string field — `"key"`, `"value"` — when it is **valid UTF-8**.
+- It is a separate base64url field — `"key_b64"`, `"value_b64"` — when it is not. That is
+  `base64.RawURLEncoding`: the alphabet of RFC 4648 §5 and **no padding**, since padding carries
+  nothing and one spelling of a field is easier to be right about than two.
+- Which one is decided by `utf8.Valid` and by nothing else. `encoding/json` replaces a byte that is not
+  UTF-8 with U+FFFD rather than refusing it, in both directions, and a store that hands back a
+  replacement character where its caller wrote `0xff` has lost that caller's data while answering 200.
+- Sending both forms of one field is an error rather than something to resolve, and so is a raw byte
+  that is not UTF-8 anywhere in a line — that is what the `_b64` fields are for.
+
+The plain form is the ordinary one and is meant to be: keys people actually have are text, and a body
+of them should be readable in a terminal without anything being decoded first.
+
+This is also the only place the **empty key** can be reached. It has no spelling in a path, but a batch
+line with no `key` field — or with `"key":""` — writes it, and a range hands it back.
+
+### Reading a range over HTTP
+
+`GET /v1/keys` takes `?prefix=` or `?from=`&`?to=`, with `from` included and `to` excluded, and answers
+the matching pairs in key order. Both bounds and the prefix are percent-decoded exactly as a key in a
+path is, so they carry any byte a key can hold; `TestBoundOfAnyBytes` puts eleven awkward prefixes
+through a real socket the way `TestKeyOfAnyBytes` does for paths.
+
+| the request                     | what it means                                                  |
+| ------------------------------- | -------------------------------------------------------------- |
+| no parameters at all            | every key, capped by the maximum below                          |
+| `?prefix=` with nothing after it| the same thing: an empty prefix is every key, as it is in the engine |
+| `?from=` or `?to=` empty        | no bound on that side                                           |
+| `prefix` with `from` or `to`    | 400. They are two ways of naming one range, not two to intersect |
+| a `from` after its `to`         | an empty range, which is 200 and no lines                       |
+| nothing matched                 | 200 and no lines. There is no key here to be missing, so no 404  |
+| `?limit=` empty, zero, negative | 400. A client that built the query wrongly should hear about it  |
+| `?limit=` over `-max-scan`      | 400, naming the maximum                                         |
+
+The limit is refused rather than quietly lowered because counting the lines against the limit it asked
+for is the only way a client can tell that an answer was cut short. Paging is that plus one byte: `from`
+is inclusive, so the next page starts at the last key with a `%00` after it.
+
+**What the limit does not buy is a cheap range.** A range is gathered and not streamed — every log has
+to be asked before the first key can be yielded in order, and the store's read lock is held for all of
+it — so stopping at the limit does not stop the walk that found the keys. What it stops is reading the
+records: the value copies, and for a frozen log the system calls that fetch them, which is most of the
+cost of a large answer but not the search. A range that has to be cheap has to be narrow. `-max-scan` is
+there because rotation and merging want the write lock and would otherwise queue behind whoever is
+scanning; it is the cap a client cannot raise.
+
+For the same reason the answer is built in memory and sent afterwards rather than written from inside
+the range. The callback runs under the store's read lock, and a client that stopped reading a socket
+under it would be deciding when the store is allowed to rotate — the same trade `GET /v1/keys/{key}`
+makes by using `Read` instead of `View`. The framing is still NDJSON and a client can still consume it a
+line at a time; what it does not get is a lock held open while it does.
 
 ## Concurrency
 
@@ -1400,8 +1493,13 @@ anything either.
 - **The HTTP API has no authentication and no TLS.** `litekvd` listens on loopback for that reason. Put
   it behind a proxy or on a private network before it has an address a stranger can reach, and note that
   this applies to every route: there is nothing to stop a client writing as well as reading.
-- **The empty key cannot be reached over HTTP.** The store holds it happily and a path wildcard will not
-  match an empty segment, so there is no way to spell `/v1/keys/` and nowhere else to put it.
+- **The empty key has no spelling in a path.** The store holds it happily and a path wildcard will not
+  match an empty segment, so `/v1/keys/` is not a route and the single-key routes cannot reach it. A
+  batch line writes it and a range hands it back, which is where it went rather than a way around this.
+- **A range over HTTP is capped and cannot be paged through cheaply.** `-max-scan` bounds what one
+  request answers with, and a client walks a large store by asking again from the last key it saw —
+  which starts the gather over, since the engine has nowhere to resume from. The cap is a count and not
+  a number of bytes, so a store of large values wants a smaller one than a store of small ones.
 
 ## Working on it
 

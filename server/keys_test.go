@@ -383,6 +383,8 @@ func TestStatusOfEveryError(t *testing.T) {
 		{litekv.ErrorRecordTooLarge, http.StatusRequestEntityTooLarge},
 		{litekv.ErrorClosed, http.StatusServiceUnavailable},
 		{&http.MaxBytesError{Limit: 16}, http.StatusRequestEntityTooLarge},
+		{badRequest("line 3: not a JSON object"), http.StatusBadRequest},
+		{fmt.Errorf("wrapped: %w", badRequest("a limit over the maximum")), http.StatusBadRequest},
 		{litekv.ErrorChecksumMismatch, http.StatusInternalServerError},
 		{litekv.ErrorCorruptData, http.StatusInternalServerError},
 		{fmt.Errorf("wrapped: %w", litekv.ErrorKeyNotFound), http.StatusNotFound},

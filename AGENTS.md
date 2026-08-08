@@ -55,6 +55,9 @@ And outside the engine, in packages of their own:
 | -------------------- | ----------------------------------------------------------------- |
 | `server/server.go`   | the handler, its options, the routes, and the writer in front      |
 | `server/keys.go`     | one key at a time: read, write, delete, and the expiry header      |
+| `server/ndjson.go`   | how a key or a value goes in a JSON object, in both directions     |
+| `server/batch.go`    | `POST /v1/batch`: a body of operations parsed whole, then stored   |
+| `server/scan.go`     | `GET /v1/keys`: ranges and prefixes, the query, and the limits     |
 | `server/errors.go`   | which store error is which status, and what a client is not told   |
 | `cmd/litekvd/main.go`| flags, the listener, signals, and the order things shut down in    |
 
@@ -893,6 +896,61 @@ store first and a write a moment from being acknowledged becomes `ErrorClosed`
 for no reason but the order. `cmd/litekvd` has no test of its own — the
 end-to-end curl run in "Verifying a change" is what covers it.
 
+**`utf8.Valid` is the encoding rule and nothing else may be.** `ndjson.go`
+decides between a plain string field and a `_b64` one by asking whether the
+bytes are valid UTF-8, because `encoding/json` does not refuse bytes that are
+not — it substitutes U+FFFD, in both directions, and says nothing. A route that
+let that happen would answer 200 having lost the caller's bytes, which is the
+worst shape this kind of bug has. `TestTheReplacementCharacterIsNotAnEncoding`
+demonstrates the loss with `encoding/json` first and then shows this rule not
+making it, and skips itself if the standard library ever stops doing it. The
+same check runs on the way in over the whole line, since a raw `0xff` inside a
+JSON string is not JSON and the decoder would quietly repair it.
+
+**A `bufio.Scanner` checks its maximum only when it grows.** `parseBatch` starts
+its buffer at `min(64 KiB, max)` for that reason: a Scanner given a starting
+buffer larger than its maximum token size never reaches the check and never
+reports `ErrTooLong`, so the limit is not a limit. This was caught by a test that
+asked for a 500-byte line under a 128-byte limit and got the line.
+
+**A body cut short reads as a line that is not JSON.** `http.MaxBytesReader`
+stops mid-line, the Scanner hands back the partial token, and blaming that line
+is blaming the wrong thing — the answer a client can act on is 413 and not "line
+12 is not JSON". `parseBatch` asks `lines.Err()` before reporting a parse
+failure, which works because a Scanner sets its error on the same call that
+returns the last partial token.
+
+**The batch route's queue test is the same one-trick job as the PUT's.** There is
+still no way from outside the package to see that a batch went through the
+writer rather than straight to the store, so `TestBatchGoesThroughTheQueue`
+closes the `Server` and asks for a 503 while the store is still open, exactly as
+`TestClosingTheServerStopsWritesAndNotReads` does. Weakening either weakens the
+only evidence that `writes` is in the path.
+
+**`litekv.Batch` does not copy, and the parser is what has to know.** Every key
+and value in a parsed batch is its own allocation — a string conversion or a
+base64 decode — because the batch reads them when it is written rather than when
+they are added. A decode buffer reused across the lines would store the last
+line's bytes under every key in the batch and report nothing.
+`TestEveryLineKeepsItsOwnBytes` writes two hundred lines whose values get shorter
+as it goes, which is the shape that catches a shared buffer that is not cleared;
+values of one length would not.
+
+**A range holds the store's read lock for the whole gather, so nothing writes to
+a socket inside the callback.** `scan.go` builds the whole answer in memory and
+sends it afterwards. It is the same trade `keys.go` makes with `Read` instead of
+`View` and for the same reason: a client that stopped reading would otherwise be
+deciding when the store is allowed to rotate. It also means a failure part way
+through is still a clean 503 or 500, since nothing has gone out —
+`TestScanOfAClosedStore` checks the answer holds no part of a range.
+
+**What `?limit=` bounds is smaller than it looks.** The engine gathers and sorts
+every matching key before it yields the first one, so returning false from the
+callback stops the record reads and not the walk. The limit bounds the memory
+this package holds and the values it copies; it does not bound the scan. Anybody
+adding a cheaper range should read the k-way-merge note above rather than
+tightening this.
+
 ## What to build next, and what it needs
 
 Everything on this list that gets cheaper by being done before an API exists is
@@ -902,7 +960,7 @@ now done, so the list has become the server, in six pieces:
 | - | ---------------------------------------- | ----- |
 | 1 | the package, the binary, and one key     | done  |
 | 2 | group commit under the handlers          | done  |
-| 3 | several at once, and ranges              |       |
+| 3 | several at once, and ranges              | done  |
 | 4 | replication over the wire                |       |
 | 5 | two roles, and reads that are not stale  |       |
 | 6 | operations, and writing it down          |       |

@@ -139,6 +139,7 @@ type nothing struct{}
 func (nothing) Write(key, value []byte) error                       { return nil }
 func (nothing) WriteExpiring(key, value []byte, at time.Time) error { return nil }
 func (nothing) Delete(key []byte) error                             { return nil }
+func (nothing) WriteBatch(b *litekv.Batch) error                    { return nil }
 
 // BenchmarkWriteThroughTheHandler is the number this piece exists for: the same
 // handler, the same store, several requests at once, with the queue in the way

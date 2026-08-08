@@ -47,6 +47,31 @@ type Options struct {
 	// not spent anything yet.
 	MaxValue int64
 
+	// MaxBatch is the largest body POST /v1/batch will take, in bytes. Zero
+	// means 32 MiB.
+	//
+	// Separate from MaxValue because a batch is many values and because it is
+	// JSON: base64 costs a third on any key or value that is not text. It is
+	// not derived from MaxValue for the same reason — what MaxValue bounds is
+	// one record and what this bounds is one request, and it is the request
+	// that decides how much a client can make the server hold at once.
+	//
+	// MaxValue is not applied to the records inside a batch. This is the limit
+	// on that route, and two limits on one request would mean two numbers to
+	// keep in step and a batch that refused what a PUT accepts. The engine's
+	// own bound on a key or a value still applies, and reports
+	// ErrorRecordTooLarge, which is the same 413.
+	MaxBatch int64
+
+	// MaxScan is the most pairs GET /v1/keys will answer with, and the most a
+	// client's own ?limit= may ask for. Zero means 1000.
+	//
+	// A range holds the store's read lock while it gathers, so an unbounded one
+	// is a way for a client to stand in front of the writes; this is the cap
+	// that client cannot raise. It counts pairs and not bytes, so a store of
+	// large values wants a smaller number here than a store of small ones.
+	MaxScan int
+
 	// Queue is how many writes may be waiting to be stored before another
 	// handler blocks on the way in. Zero means the Writer's own default.
 	//
@@ -80,14 +105,20 @@ type Server struct {
 	writer *litekv.Writer
 }
 
-// writes is the three calls a handler makes to store something. A *litekv.DB
+// writes is the calls a handler makes to store something. A *litekv.DB
 // satisfies it and so does a *litekv.Writer in front of one, which is the whole
 // reason it is an interface: BenchmarkWriteThroughTheHandler measures the same
 // handler both ways.
+//
+// WriteBatch is in it so that POST /v1/batch goes through the queue like
+// everything else. A batch arriving straight at the store would take every
+// shard of its lock, which is exactly what the queue is here to stop, and it
+// would do it for longer than a single write does.
 type writes interface {
 	Write(key, value []byte) error
 	WriteExpiring(key, value []byte, at time.Time) error
 	Delete(key []byte) error
+	WriteBatch(b *litekv.Batch) error
 }
 
 // New returns a Server handing requests to db.
@@ -101,6 +132,12 @@ type writes interface {
 func New(db *litekv.DB, opts Options) *Server {
 	if opts.MaxValue <= 0 {
 		opts.MaxValue = defaultMaxValue
+	}
+	if opts.MaxBatch <= 0 {
+		opts.MaxBatch = defaultMaxBatch
+	}
+	if opts.MaxScan <= 0 {
+		opts.MaxScan = defaultMaxScan
 	}
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
@@ -128,6 +165,14 @@ func New(db *litekv.DB, opts Options) *Server {
 	s.mux.HandleFunc("GET /v1/keys/{key}", s.readKey)
 	s.mux.HandleFunc("PUT /v1/keys/{key}", s.writeKey)
 	s.mux.HandleFunc("DELETE /v1/keys/{key}", s.deleteKey)
+
+	// Several at once, and ranges. /v1/keys is the exact path and does not
+	// collide with /v1/keys/{key} above it: a pattern without a trailing slash
+	// matches that path and nothing under it, and a wildcard will not match an
+	// empty segment, so /v1/keys/ is still nothing at all.
+	// TestScanDoesNotCollideWithOneKey holds all three of those.
+	s.mux.HandleFunc("POST /v1/batch", s.writeBatch)
+	s.mux.HandleFunc("GET /v1/keys", s.scanKeys)
 
 	return s
 }
