@@ -103,16 +103,19 @@ func TestKeyOfAnyBytes(t *testing.T) {
 	}
 }
 
-// TestTheEmptyKeyCannotBeSpelled pins the one key the store takes and this API
-// does not. A path wildcard will not match an empty segment, so /v1/keys/ is
-// not a route and there is nowhere else to put it. The store is happy to hold
-// it — this asserts that too, so that the day it stops being true, the reason
-// for the limitation goes with it.
-func TestTheEmptyKeyCannotBeSpelled(t *testing.T) {
+// TestTheEmptyKeyHasNoPathSpelling pins the one key the single-key routes
+// cannot reach: a path wildcard will not match an empty segment, so /v1/keys/
+// is not a route. The store is happy to hold it — this asserts that too, so
+// that the day it stops being true, the reason for the gap goes with it.
+//
+// It is not unreachable over HTTP. A batch line writes it and a range hands it
+// back; TestBatchOfTheEmptyKey is that. This is about the path and only the
+// path.
+func TestTheEmptyKeyHasNoPathSpelling(t *testing.T) {
 	s, db := newServer(t, Options{})
 
 	if err := db.Write(nil, []byte("stored under nothing")); err != nil {
-		t.Fatalf("the store refused an empty key, so this limitation is not the API's: %v", err)
+		t.Fatalf("the store refused an empty key, so this gap is not the path's: %v", err)
 	}
 	if _, err := db.Read(nil); err != nil {
 		t.Fatalf("the store did not keep an empty key: %v", err)

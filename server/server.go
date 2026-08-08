@@ -23,9 +23,11 @@
 // not UTF-8 at all. TestKeyOfAnyBytes pins that rather than trusting the
 // documentation for it.
 //
-// With one exception: the empty key, which the store holds happily and which
-// has no spelling here. A path wildcard does not match an empty segment, so
-// /v1/keys/ is not a route.
+// With one exception: the empty key, which the store holds happily and which no
+// path can name, since a path wildcard does not match an empty segment and
+// /v1/keys/ is therefore not a route. It is not out of reach — a batch line
+// writes it and a range hands it back — but the single-key routes cannot get
+// at it.
 package server
 
 import (
