@@ -92,9 +92,23 @@ go test -run xxx -fuzz '^FuzzReadFrame$' -fuzztime 30s ./server/   # and off a s
 The `^...$` matters: `-fuzz FuzzApply` now matches `FuzzApplySnapshot` too, and
 the go tool refuses to run rather than choosing.
 
-Anything touching `server/` also gets driven end to end, because a handler test
-builds its own request and the interesting question is often whether a request
-can be built at all:
+Anything touching `server/` also gets mutation tested and driven end to end.
+`tools/mutate.py` is the sweep — sixty-six mutations, eight workers, about ten
+minutes, and it prints each verdict as it lands rather than at the end:
+
+```bash
+python3 tools/mutate.py                 # all of them
+python3 tools/mutate.py replica batch   # only those whose name matches
+```
+
+It used to be an ad-hoc script in a scratch directory, rewritten from memory
+each time, which is how two of the traps below were discovered twice. The
+mutations themselves are in `tools/mutations.py`; adding one is four lines and
+is part of writing the code, not a thing to come back to.
+
+The end-to-end run matters separately, because a handler test builds its own
+request and the interesting question is often whether a request can be built at
+all:
 
 ```bash
 go build -o /tmp/litekvd ./cmd/litekvd && /tmp/litekvd -dir "$(mktemp -d)" -addr 127.0.0.1:18080 &
