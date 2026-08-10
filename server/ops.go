@@ -251,6 +251,13 @@ func (s *Server) exposition(w http.ResponseWriter, r *http.Request) {
 		// here that a request in flight contributes to.
 		{"litekv_replication_streams", "Replication streams open right now.",
 			int(s.streaming.Load())},
+		// What WaitFor is counted against. The same number as the streams above
+		// in the ordinary case, and not the same one: a stream that has opened
+		// without an id is a follower this leader cannot wait for, and telling
+		// those apart is the difference between a semi-synchronous leader that
+		// is working and one that is answering 202 to everything.
+		{"litekv_replication_followers", "Followers this leader can wait for.",
+			s.attached()},
 		{"litekv_term", "The term this store is on.", int(s.db.Term())},
 		{"litekv_store_keys", "Keys the store holds, tombstones included.", s.db.Len()},
 		{"litekv_store_segments", "Logs the store is spread across.", s.db.Segments()},

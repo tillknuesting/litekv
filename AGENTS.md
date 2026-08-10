@@ -62,6 +62,7 @@ And outside the engine, in packages of their own:
 | `server/errors.go`   | which store error is which status, and what a client is not told   |
 | `server/role.go`     | leader or replica, promotion, status, and reads that are not stale |
 | `server/ops.go`      | health, metrics, request logging, and the bearer token             |
+| `server/acks.go`     | who is following, how far each has got, and what a write waits for |
 | `tools/mutate.py`    | the mutation sweep, and `tools/mutations.py` is what it breaks      |
 | `server/replica.go`  | the frames, the position on the wire, and the leader's stream       |
 | `server/follower.go` | the other end of it: dial, apply, reconnect                         |
@@ -1014,6 +1015,20 @@ every route that stores something: `TestAReplicaRefusesEveryWrite` runs all
 three, because a batch aimed at a replica is the same mistake as a `PUT` and a
 longer one.
 
+**A measurement whose two arms agree is measuring the harness.** Semi-synchronous
+replication was first timed with a curl loop: 1507ms waiting for a follower
+against 1513ms not waiting, which reads as "it is free" and is really "a curl
+process costs seven milliseconds and that is all this measured". The benchmark
+says 8.3 µs against 215 µs. If two arms of a comparison land within half a
+percent of each other, suspect the harness before believing the result.
+
+**A wait that is never woken still returns the right answer.** The mutation that
+stops anything waking a blocked write survived, because `await` times out and
+counts again — so it answered correctly, five seconds late. Correctness and
+promptness are two claims and a test that only makes the first one lets the
+whole waking mechanism rot. `TestAWriteWaitsForAFollower` bounds how long it
+took.
+
 **A goroutine that outlives its handler is a race the tests cannot see.** The
 heartbeat is a second goroutine holding the stream's `http.ResponseWriter`, and
 a ResponseWriter may not be touched once its handler has returned. Left to stop
@@ -1298,10 +1313,36 @@ anything can be yielded in order. A k-way merge over the per-log sorted keys
 would stream it and hold nothing, and is worth the code only when somebody is
 ranging over most of a large store.
 
-**Semi-synchronous replication**, which is what stops a failover losing
-acknowledged writes. It needs an acknowledgement from a follower, which needs
-the leader to know its followers, which is the first state the leader does not
-currently keep.
+**Semi-synchronous replication** is done, and it needed all three of the things
+that note said it did: a leader that knows its followers, a follower that says
+how far it has got, and a write that waits. `acks.go` is the registry and the
+wait; the follower's half is in `follower.go`.
+
+The acknowledgement is `POST /v1/replica/ack` and not something coming back up
+the stream, because a response body only goes one way and the alternative is
+full-duplex HTTP/1.1 — which is the thing proxies break, and riding one listener
+through whatever proxy a replica sits behind was the reason for choosing HTTP at
+all.
+
+**What it cannot do is take a write back**, and that is not a shortcut. The
+record is in the log before anything waits — there is nothing to replicate until
+it is written — so a wait that runs out is reported and never undone: 202 rather
+than 204, with `Litekv-Replicated` saying how many followers had it. A client
+that retries on 202 writes the record twice. Say so to anyone who asks for
+"synchronous replication" here; what is on offer is a 204 that means a failover
+will not lose the write, and nothing stronger.
+
+**An ack only counts from a follower this leader is streaming to.** An ack is a
+claim, and what makes it worth anything is that this leader is the one sending
+that follower records. Taking one from anybody would let whatever can reach the
+route satisfy a semi-synchronous write by asserting it had the data — the
+guarantee, given away to a caller that guessed a URL.
+
+It costs 8.3 µs against 215 µs for a 128-byte write on loopback, and all of the
+difference is the network. See `BenchmarkSemiSynchronousWrite`, and read its
+comment before writing another benchmark here: the first measurement of this was
+a curl loop that reported 1507ms waiting against 1513ms not, because a curl
+process costs about seven milliseconds to start and that was the entire number.
 
 **Carrying a stranded position forward** is done, and the mappings the earlier
 note here proposed turned out not to be needed. The records carry numbers, so a

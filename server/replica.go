@@ -332,6 +332,15 @@ func (s *Server) streamReplica(w http.ResponseWriter, r *http.Request) {
 	s.streaming.Add(1)
 	defer s.streaming.Add(-1)
 
+	// Registered for the life of this stream and forgotten when it ends, which
+	// is what makes WaitFor a number about now: a follower that is not connected
+	// is not going to acknowledge anything, and counting one that left an hour
+	// ago would be counting the past. The id is the follower's own; a stream
+	// without one is served exactly as before and simply never acknowledges.
+	id := r.URL.Query().Get("id")
+	s.followers.attach(id, from)
+	defer s.followers.detach(id)
+
 	// The stream ends when the client goes away or when this server is asked to
 	// stop serving streams. Follow takes one channel, so the two are merged.
 	// The third is this handler returning for any other reason, which net/http

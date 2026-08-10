@@ -99,8 +99,7 @@ func (s *Server) writeKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.wrote(w)
-	w.WriteHeader(http.StatusNoContent)
+	w.WriteHeader(s.wrote(w, r))
 }
 
 // deleteKey writes a tombstone for one key.
@@ -119,8 +118,7 @@ func (s *Server) deleteKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.wrote(w)
-	w.WriteHeader(http.StatusNoContent)
+	w.WriteHeader(s.wrote(w, r))
 }
 
 // expiryOf reads headerExpires. A request without one gets the zero time, which

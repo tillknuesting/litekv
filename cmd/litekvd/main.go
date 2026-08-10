@@ -69,6 +69,14 @@ func run() error {
 		leader = flag.String("leader", "",
 			"base URL of a leader to follow, such as http://10.0.0.2:8080. Its records are applied to this\n"+
 				"store as they are written. Empty follows nobody, which is what a leader does")
+		waitFor = flag.Int("wait-for", 0,
+			"how many followers must have a write before it is acknowledged (0 for none, which is\n"+
+				"asynchronous replication). This is semi-synchronous replication: it is what stops a\n"+
+				"failover losing acknowledged writes, and what it cannot do is take a write back — the\n"+
+				"record is in the log before anything waits, so a wait that runs out answers 202 rather\n"+
+				"than 204 and says how many followers had it")
+		waitTimeout = flag.Duration("wait-timeout", 0,
+			"how long a write waits for -wait-for followers before answering 202 (0 for five seconds)")
 		heartbeat = flag.Duration("heartbeat", 0,
 			"how often a leader with nothing to send tells its followers it is still there (0 for 10s).\n"+
 				"It is what stands between a follower and a connection that was blackholed rather than\n"+
@@ -136,13 +144,15 @@ func run() error {
 	}
 
 	api := server.New(db, server.Options{
-		MaxValue:  *maxValue,
-		MaxBatch:  *maxBatch,
-		MaxScan:   *maxScan,
-		Queue:     *queue,
-		Token:     token,
-		Heartbeat: *heartbeat,
-		Logger:    log,
+		MaxValue:    *maxValue,
+		MaxBatch:    *maxBatch,
+		MaxScan:     *maxScan,
+		Queue:       *queue,
+		Token:       token,
+		WaitFor:     *waitFor,
+		WaitTimeout: *waitTimeout,
+		Heartbeat:   *heartbeat,
+		Logger:      log,
 	})
 	defer api.Close()
 

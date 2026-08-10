@@ -3,15 +3,19 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"math/rand/v2"
+	mathrand "math/rand/v2"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tillknuesting/litekv"
@@ -86,9 +90,23 @@ type FollowerOptions struct {
 type Follower struct {
 	db     *litekv.DB
 	leader *url.URL
+	acking *url.URL
 	client *http.Client
 	log    *slog.Logger
 	opts   FollowerOptions
+
+	// id is what this follower calls itself when telling a leader how far it has
+	// got. Made up here and opaque to the leader, because the leader has nothing
+	// else to key on: two followers behind one NAT share an address, and one
+	// that reconnects has a new port.
+	id string
+
+	// latest is the newest position this follower has applied and not yet told
+	// the leader about, and nudge wakes the goroutine that tells it. One slot
+	// rather than a queue on purpose — a leader only ever wants the newest, and
+	// a backlog of stale positions is a backlog of requests saying nothing.
+	latest atomic.Pointer[litekv.DBPosition]
+	nudge  chan struct{}
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -152,18 +170,108 @@ func Follow(db *litekv.DB, leader string, opts FollowerOptions) (*Follower, erro
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	id, err := name()
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+
 	f := &Follower{
 		db:     db,
 		leader: base.JoinPath(replicaPath),
+		acking: base.JoinPath(ackPath),
 		client: opts.Client,
 		log:    opts.Logger,
 		opts:   opts,
+		id:     id,
+		nudge:  make(chan struct{}, 1),
 		cancel: cancel,
 		done:   make(chan struct{}),
 	}
 
 	go f.run(ctx)
+	go f.telling(ctx)
 	return f, nil
+}
+
+// name is this follower's id: sixteen random bytes, because the leader needs to
+// tell one follower from another and nothing about a follower's address does
+// that. It changes on restart, which is right — a follower that has restarted
+// has a new stream and the leader forgets the old one either way.
+func name() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("naming this follower: %w", err)
+	}
+	return hex.EncodeToString(raw[:]), nil
+}
+
+// tell remembers a position to acknowledge and wakes the goroutine that does it.
+//
+// Never blocks and never queues: the newest position replaces whatever was
+// waiting, since it says everything the older one said. A follower catching up
+// applies a thousand batches and sends the leader far fewer than a thousand
+// acknowledgements, which is the difference between a round trip per batch and a
+// round trip per moment the leader is listening.
+func (f *Follower) tell(at litekv.DBPosition) {
+	f.latest.Store(&at)
+
+	select {
+	case f.nudge <- struct{}{}:
+	default:
+	}
+}
+
+// telling is the goroutine that sends them.
+//
+// Its own goroutine rather than inline after each apply, because an
+// acknowledgement is a request over the same network as the stream, and waiting
+// for one before reading the next frame would put a round trip between every
+// batch of a catch-up.
+func (f *Follower) telling(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-f.nudge:
+		}
+
+		at := f.latest.Load()
+		if at == nil {
+			continue
+		}
+
+		encoded, err := positionParam(*at)
+		if err != nil {
+			continue
+		}
+
+		body, err := json.Marshal(ackBody{ID: f.id, At: encoded})
+		if err != nil {
+			continue
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+			f.acking.String(), bytes.NewReader(body))
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if f.opts.Token != "" {
+			req.Header.Set("Authorization", "Bearer "+f.opts.Token)
+		}
+
+		resp, err := f.client.Do(req)
+		if err != nil {
+			// Not worth retrying here and not worth logging loudly: the next
+			// apply nudges this again with a newer position, and a leader that
+			// cannot be reached is about to end the stream anyway.
+			f.log.Debug("an acknowledgement did not reach the leader", "err", err)
+			continue
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+		_ = resp.Body.Close()
+	}
 }
 
 // Close stops following and waits for the goroutine to finish. Closing twice is
@@ -229,7 +337,7 @@ func (f *Follower) run(ctx context.Context) {
 		// Half of the wait is fixed and half is jittered, so several followers
 		// that lost the same leader do not all come back at the same instant,
 		// and none of them comes back after no wait at all.
-		delay := wait/2 + rand.N(wait/2+1)
+		delay := wait/2 + mathrand.N(wait/2+1)
 
 		select {
 		case <-ctx.Done():
@@ -251,7 +359,7 @@ func (f *Follower) stream(ctx context.Context) error {
 	}
 
 	target := *f.leader
-	target.RawQuery = url.Values{"from": {at}}.Encode()
+	target.RawQuery = url.Values{"from": {at}, "id": {f.id}}.Encode()
 
 	// A context of this connection's own, so that going quiet can end it without
 	// ending the follower. Cancelling is the only way to interrupt a read on an
@@ -320,6 +428,7 @@ func (f *Follower) stream(ctx context.Context) error {
 			if err := f.db.ApplySnapshot(next, bytes.NewReader(payload), opts); err != nil {
 				return err
 			}
+			f.tell(f.db.Applied())
 
 		case frameBatch:
 			// From where the store says it is, not from where the last frame
@@ -330,6 +439,11 @@ func (f *Follower) stream(ctx context.Context) error {
 			if _, err := f.db.Apply(from, next, bytes.NewReader(payload), opts); err != nil {
 				return err
 			}
+
+			// Asked of the store rather than taken from the frame: what the
+			// leader is owed is what this store holds, and Apply is the only
+			// thing that knows whether it took all of it.
+			f.tell(f.db.Applied())
 
 		default:
 			return fmt.Errorf("a frame of kind %q", kind)

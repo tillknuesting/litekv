@@ -81,8 +81,7 @@ func (s *Server) writeBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.wrote(w)
-	w.WriteHeader(http.StatusNoContent)
+	w.WriteHeader(s.wrote(w, r))
 }
 
 // parseBatch reads a whole NDJSON body into a litekv.Batch, or fails without

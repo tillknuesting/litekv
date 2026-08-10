@@ -986,6 +986,8 @@ go run ./cmd/litekvd -dir /var/lib/litekv -addr 127.0.0.1:8080
 | `-queue`            | writes that may be waiting before a handler blocks               | 1024             |
 | `-leader`           | base URL of a leader to follow                                   | follow nobody    |
 | `-token-file`       | file holding a shared bearer token; empty means no auth           | none             |
+| `-wait-for`         | followers that must have a write before it is acknowledged       | 0 (async)        |
+| `-wait-timeout`     | how long a write waits for them before answering 202             | 5s               |
 | `-heartbeat`        | how often an idle leader says it is there                        | 10s              |
 | `-idle`             | how long a follower waits to hear it before reconnecting         | 30s              |
 | `-read-timeout`     | how long a request has to arrive, headers and body                | 60s              |
@@ -1017,6 +1019,7 @@ owns a directory: the store is not multi-process safe and nothing checks, so a s
 | `GET`       | `/health`        | whether this node can serve           | 200, 503         |
 | `GET`       | `/metrics`       | Prometheus text                       | 200              |
 | `POST`      | `/v1/promote`    | stop following and raise the term     | 200              |
+| `POST`      | `/v1/replica/ack` | a follower saying how far it has got | 204, 400, 409    |
 
 A value is the body, raw. There is no JSON envelope around a caller's bytes and nothing is base64 on the
 way through, because a key-value store's whole job is to hand back what it was given; the type is
@@ -1255,6 +1258,58 @@ What is **not** here yet is roles. Nothing marks a node as a follower, so one st
 takes writes of its own, and a write to it will diverge it from its leader — its own records go into its
 own log while the leader's position marches on. `litekvd` says so at startup and that is all it does
 about it. Do not write to a node with `-leader` on it.
+
+### Semi-synchronous replication
+
+Replication here is asynchronous by default: a write returns as soon as the leader has it, so a leader
+that dies loses whatever its followers had not received. `-wait-for` is the answer to exactly that — a
+write is not acknowledged until that many followers have it.
+
+```bash
+litekvd -dir /var/lib/litekv -addr 0.0.0.0:8080 -wait-for 1 -wait-timeout 5s
+```
+
+**What it cannot do is take a write back.** The record is in the leader's log before anything waits; it
+has to be, since there is nothing to replicate until it is written, and nothing here can unwrite it. So
+a wait that runs out is *reported* and never undone:
+
+| status | means                                                                       |
+| ------ | --------------------------------------------------------------------------- |
+| 204    | stored, and `Litekv-Replicated` followers had it — a failover will not lose it |
+| 202    | stored, and fewer than `-wait-for` had it before the wait ran out              |
+
+A client that reads 202 as a failure and retries will write the record twice. That is the honest shape
+of semi-synchronous replication and not a shortcut in this one; MySQL degrades to asynchronous after its
+timeout for the same reason.
+
+Every write carries `Litekv-Replicated` once `-wait-for` is set, including the ones that did not reach
+it, and `litekv_replication_followers` says how many the leader could wait for at all. A leader
+answering 202 to everything with that gauge at zero is a leader whose followers are gone, which is
+exactly the thing worth alerting on.
+
+What it costs, with a real follower on a real listener — a write is now a round trip to that follower
+and back:
+
+| `-wait-for` | a 128-byte write |
+| ----------- | ---------------- |
+| unset       | 8.3 µs           |
+| 1           | 215 µs           |
+
+Twenty-six times, and all of it is the network: the leader writes the frame, the follower applies it and
+posts an acknowledgement, and the leader wakes. On loopback that is 200 µs; between two machines it is
+whatever two round trips cost there. It is the price of the guarantee and there is no version of this
+that is cheaper.
+
+**An acknowledgement only counts from a follower this leader is streaming to.** An ack is a claim, and
+what makes it worth anything is that this leader is the one sending that follower records — otherwise
+anything that could reach `/v1/replica/ack` could satisfy a semi-synchronous write by asserting it had
+the data. A follower whose stream has ended is forgotten rather than kept at its last position, because
+`-wait-for` is a number about now and one that left an hour ago is not going to acknowledge anything.
+
+The acknowledgement is a route of its own rather than something coming back up the stream. A response
+body only goes one way, and the alternative — a request body the follower writes to while reading the
+response — is full-duplex HTTP/1.1, which is the thing proxies break. Riding one listener was the reason
+for choosing HTTP; a scheme a proxy mangles would give that back.
 
 ### A quiet stream and a dead one
 
@@ -1673,11 +1728,15 @@ anything either.
   safe while the store is being written steadily, because then it rests inside the log being written,
   which is never merged. So the answer is always another snapshot, and a loop that follows a `DB` has to
   be written with that in it.
-- **Replication is asynchronous, and only that.** A write returns as soon as the leader has it, so a
-  leader that dies loses whatever its followers had not received yet. There is no synchronous or
-  semi-synchronous mode, no acknowledgement from a follower, and nothing waits for one. `Reached` lets a
-  client refuse a replica that has not got to a write it already knows about, which is a different
-  thing: it hides the lag from that client, it does not remove it.
+- **The library's replication is asynchronous, and only that.** A write returns as soon as the leader
+  has it, so a leader that dies loses whatever its followers had not received yet. `server` adds
+  semi-synchronous replication on top — `-wait-for` — but the engine itself has no acknowledgement from
+  a follower and nothing in it waits for one. `Reached` lets a client refuse a replica that has not got
+  to a write it already knows about, which is a different thing: it hides the lag from that client, it
+  does not remove it.
+- **A semi-synchronous write cannot be taken back.** The record is in the leader's log before anything
+  waits, so a wait that runs out is reported — 202, and `Litekv-Replicated` — and never undone. A client
+  that retries on 202 writes the record twice.
 - **There is no failover.** Which store is the leader is your decision and nobody else's: `Promote`
   writes the decision down, it does not make it. Raising the term in two places at once puts two stores
   on the same term and gives the guarantee away, so whatever decides has to be the only thing deciding.

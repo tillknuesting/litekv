@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -224,17 +225,41 @@ func (s *Server) mayWrite(w http.ResponseWriter, r *http.Request) bool {
 	return false
 }
 
-// wrote puts the position on a write that succeeded, which is what makes a read
-// from a replica able to refuse to be older than it.
+// wrote puts the position on a write that succeeded, waits for as many
+// followers as Options.WaitFor asks for, and returns the status to answer with.
 //
-// It is the store's position and not the record's: at or after the write, never
+// The position is the store's and not the record's: at or after the write, never
 // before it, which is all headerAfter needs. Asking for the record's own would
 // mean the write path handing one back through the queue, and a position that is
 // merely at-or-after is the same answer to the only question anybody asks of it.
-func (s *Server) wrote(w http.ResponseWriter) {
-	if at, err := positionParam(s.db.Position()); err == nil {
-		w.Header().Set(headerPosition, at)
+//
+// 204 means the write is stored and as replicated as it was asked to be. 202
+// means it is stored and it is not — the record exists either way, and a client
+// that reads 202 as a failure and retries will write it twice. That is what a
+// semi-synchronous write can honestly say; see acks.go for why it cannot say
+// more.
+func (s *Server) wrote(w http.ResponseWriter, r *http.Request) int {
+	at := s.db.Position()
+
+	if encoded, err := positionParam(at); err == nil {
+		w.Header().Set(headerPosition, encoded)
 	}
+
+	need := s.opts.WaitFor
+	if need <= 0 {
+		return http.StatusNoContent
+	}
+
+	got := s.followers.await(r.Context(), at, need, s.opts.waitTimeout())
+	w.Header().Set(headerReplicated, strconv.Itoa(got))
+
+	if got >= need {
+		return http.StatusNoContent
+	}
+
+	s.log.Warn("a write was not replicated as far as asked",
+		"followers", got, "wanted", need)
+	return http.StatusAccepted
 }
 
 // notStale holds a read to headerAfter, if the client sent one.

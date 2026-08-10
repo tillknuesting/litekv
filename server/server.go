@@ -85,6 +85,24 @@ type Options struct {
 	// held while it is written.
 	Queue int
 
+	// WaitFor is how many followers must have a write before this server
+	// acknowledges it. Zero is asynchronous replication, which is what it has
+	// always been.
+	//
+	// This is semi-synchronous replication and it is what stops a failover
+	// losing acknowledged writes. What it cannot do is take a write back: the
+	// record is in the log before anything waits, so a wait that runs out is
+	// reported — 202 rather than 204, with Litekv-Replicated saying how many
+	// followers had it — and never undone. See acks.go.
+	//
+	// A number higher than the followers there are is a server that answers 202
+	// to everything, which is a choice and not a bug: it says the writes are not
+	// as safe as they were asked to be.
+	WaitFor int
+
+	// WaitTimeout is how long a write waits for that. Zero means five seconds.
+	WaitTimeout time.Duration
+
 	// Heartbeat is how often a leader with nothing to send tells a follower it
 	// is still there. Zero means ten seconds; negative turns it off.
 	//
@@ -113,6 +131,14 @@ type Options struct {
 }
 
 const defaultMaxValue = 16 << 20
+
+// waitTimeout is Options.WaitTimeout with the zero value filled in.
+func (o Options) waitTimeout() time.Duration {
+	if o.WaitTimeout <= 0 {
+		return defaultWaitTimeout
+	}
+	return o.WaitTimeout
+}
 
 // heartbeat is Options.Heartbeat with the zero value filled in. Negative is off
 // and is kept as such, which is what lets a test drive a stream with no beat in
@@ -153,6 +179,10 @@ type Server struct {
 
 	// metrics is what this server knows about itself. See ops.go.
 	metrics *metrics
+
+	// followers is what this leader knows about the nodes following it: who is
+	// streaming and how far each has got. See acks.go.
+	followers *followers
 
 	// streaming is how many replication streams are open. Separate from the
 	// request counter because that one counts requests that finished, and a
@@ -206,14 +236,15 @@ func New(db *litekv.DB, opts Options) *Server {
 	writer := db.Writer(litekv.WriterOptions{Queue: opts.Queue})
 
 	s := &Server{
-		db:      db,
-		opts:    opts,
-		log:     opts.Logger,
-		mux:     http.NewServeMux(),
-		writes:  writer,
-		writer:  writer,
-		streams: make(chan struct{}),
-		metrics: newMetrics(),
+		db:        db,
+		opts:      opts,
+		log:       opts.Logger,
+		mux:       http.NewServeMux(),
+		writes:    writer,
+		writer:    writer,
+		streams:   make(chan struct{}),
+		metrics:   newMetrics(),
+		followers: newFollowers(),
 	}
 
 	// GET also matches HEAD, which is what makes asking for a value's size
@@ -237,6 +268,7 @@ func New(db *litekv.DB, opts Options) *Server {
 	// replica is already behind — a second raw TCP listener would have needed
 	// every one of those again.
 	s.handle("GET "+replicaPath, s.streamReplica)
+	s.handle("POST "+ackPath, s.acknowledge)
 
 	// Which of the two this node is, and the one call that changes it.
 	s.handle("GET /v1/status", s.status)
