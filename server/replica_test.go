@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -632,7 +633,7 @@ func TestAFrameLengthIsBounded(t *testing.T) {
 	header[0] = frameBatch
 	copy(header[1:], marshal(t, litekv.DBPosition{}))
 
-	binary.LittleEndian.PutUint64(header[1+dbPositionSize:], 1<<40)
+	binary.LittleEndian.PutUint64(header[1+dbPositionSize:], 1<<45)
 
 	// Which error it is, and not merely that there was one. Take the bound away
 	// and this frame still fails — as a torn one, because the reader goes
@@ -641,7 +642,7 @@ func TestAFrameLengthIsBounded(t *testing.T) {
 	// for here.
 	_, _, _, err := readFrame(bytes.NewReader(header), defaultMaxFrame)
 	if !errors.Is(err, errFrameTooLarge) {
-		t.Fatalf("a frame claiming a terabyte reported '%v', want it refused on the bound", err)
+		t.Fatalf("a frame claiming 32 TiB reported '%v', want it refused on the bound", err)
 	}
 
 	// A length within the bound and not behind it is a torn frame, which is
@@ -1477,4 +1478,360 @@ func (r *refusing) Write(p []byte) (int, error) {
 		return 0, errors.New("the connection has gone")
 	}
 	return len(p), nil
+}
+
+// TestSendingASnapshotDoesNotHoldIt is what this framing exists for.
+//
+// A snapshot frame is the whole live store, and the leader used to build it in a
+// buffer: replicating a store cost that store in memory, in a database whose
+// whole point is that only the keys have to fit. It spools to a file now and
+// copies the file to the connection.
+//
+// Measured on the leader's send path alone, and that is deliberate. An earlier
+// version of this measured a real follower catching up and reported 221 MB for a
+// 32 MiB store — nearly all of it the follower *building* a store out of the
+// records, which is inherent and is not what is being asserted. Measuring both
+// ends together measures the wrong thing loudly.
+func TestSendingASnapshotDoesNotHoldIt(t *testing.T) {
+	db, err := litekv.OpenDB(t.TempDir(), litekv.DBOptions{Sync: litekv.SyncNever,
+		SegmentSize: 4 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	const (
+		records = 512
+		each    = 64 << 10
+		stored  = records * each
+	)
+
+	value := bytes.Repeat([]byte("x"), each)
+	for i := 0; i < records; i++ {
+		if err := db.Write([]byte(fmt.Sprintf("key-%05d", i)), value); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	s := New(db, Options{Logger: quiet(), SpoolDir: t.TempDir()})
+	defer s.Close()
+
+	var counted countingWriter
+	out := &stream{w: &counted, flusher: nothingToFlush{}}
+
+	// Held and not allocated, which are two different measurements and only one
+	// of them is the claim. TotalAlloc counts churn — the engine allocates every
+	// record as it reads it out of a frozen log, so producing a 32 MiB snapshot
+	// allocates about 32 MiB whatever it writes to, and an earlier version of
+	// this test failed on exactly that. HeapAlloc after a collection is what is
+	// still being held, which is what a buffer would show and a file will not.
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+
+	file, size, at, release, err := s.spooled()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	// Read here, with the snapshot produced and not yet sent: this is the moment
+	// the old arrangement was holding the whole live store in a bytes.Buffer.
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+
+	if err := out.frameFrom(frameSnapshot, at, size, file); err != nil {
+		t.Fatal(err)
+	}
+	_ = file.Close()
+
+	// It really did send the store, and not a header with nothing behind it.
+	if counted.n < stored {
+		t.Fatalf("a %d byte store went out as %d bytes", stored, counted.n)
+	}
+	if size < stored {
+		t.Errorf("a %d byte store spooled to %d bytes", stored, size)
+	}
+
+	// A descriptor, a hold and a frame header. Four megabytes is generous for
+	// all three and is an eighth of what holding the snapshot would cost.
+	const room = 4 << 20
+
+	if before.HeapAlloc+room < after.HeapAlloc {
+		t.Errorf("with a %d byte snapshot ready to send, the heap went from %d to %d; "+
+			"the leader is holding it", stored, before.HeapAlloc, after.HeapAlloc)
+	}
+}
+
+// countingWriter is a socket that costs nothing, so that what is measured above
+// is the sending and not the sink.
+type countingWriter struct{ n int64 }
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	c.n += int64(len(p))
+	return len(p), nil
+}
+
+// nothingToFlush stands in for the http.Flusher a real response has.
+type nothingToFlush struct{}
+
+func (nothingToFlush) Flush() {}
+
+// TestASnapshotLeavesNoFileBehind. The spool file is unlinked the moment it is
+// created, so nothing has to remember to remove it — not the ordinary path, not
+// a panic, not a follower that hangs up half way through.
+func TestASnapshotLeavesNoFileBehind(t *testing.T) {
+	spool := t.TempDir()
+
+	up := serving(t, litekv.DBOptions{Sync: litekv.SyncNever})
+	up.api.opts.SpoolDir = spool
+
+	for i := 0; i < 50; i++ {
+		if err := up.db.Write([]byte(fmt.Sprintf("key-%02d", i)), bytes.Repeat([]byte("v"), 4096)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	db, err := litekv.OpenDB(t.TempDir(), litekv.DBOptions{Sync: litekv.SyncNever})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	f := followingAt(t, db, up.srv.URL)
+	waitForPositions(t, db, up.db, "the snapshot to cross")
+
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	up.alone(t)
+
+	left, err := os.ReadDir(spool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 0 {
+		names := make([]string, 0, len(left))
+		for _, entry := range left {
+			names = append(names, entry.Name())
+		}
+		t.Errorf("the spool directory still holds %v", names)
+	}
+}
+
+// TestAShortSnapshotIsNotSentAsAWholeOne. The length goes out in the header
+// before the payload does, so a copy that stops early leaves the follower
+// waiting for bytes that are never coming — and every frame after it, on a
+// connection that is now reading a record as a header.
+//
+// Driven against frameFrom with a reader that runs out, because the file it
+// normally copies from never does.
+func TestAShortSnapshotIsNotSentAsAWholeOne(t *testing.T) {
+	var counted countingWriter
+	out := &stream{w: &counted, flusher: nothingToFlush{}}
+
+	short := strings.NewReader("only this much")
+
+	err := out.frameFrom(frameSnapshot, litekv.DBPosition{Term: 1},
+		int64(short.Size())+100, short)
+	if err == nil {
+		t.Fatal("a snapshot that ran a hundred bytes short went out as if it were whole")
+	}
+	if !strings.Contains(err.Error(), "snapshot") {
+		t.Errorf("the failure says %q", err)
+	}
+}
+
+// TestAHeartbeatCarryingBytesIsRefused. A heartbeat says only that the leader is
+// there, so its length is zero and a follower that did not check would leave the
+// payload on the connection — to be read as the next header.
+//
+// The payload here is a real batch frame, which is what makes the failure
+// visible rather than merely likely: a follower that ignores the length reads it
+// next and applies records the leader never framed as records.
+func TestAHeartbeatCarryingBytesIsRefused(t *testing.T) {
+	source, err := litekv.OpenDB(t.TempDir(), litekv.DBOptions{Sync: litekv.SyncNever})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+
+	if err := source.Write([]byte("smuggled"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+
+	var records bytes.Buffer
+	at, release, err := source.Snapshot(&records, litekv.ReplicaOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+
+	// A whole snapshot frame, hidden inside a heartbeat's payload.
+	var smuggled bytes.Buffer
+	if err := writeFrame(&smuggled, frameSnapshot, at, records.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+
+	var wire bytes.Buffer
+	if err := writeFrame(&wire, frameHeartbeat, at, smuggled.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+
+	served := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", contentTypeStream)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(wire.Bytes())
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer served.Close()
+
+	db, err := litekv.OpenDB(t.TempDir(), litekv.DBOptions{Sync: litekv.SyncNever})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	f, err := Follow(db, served.URL, FollowerOptions{Logger: quiet(),
+		MinBackoff: time.Millisecond, MaxBackoff: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Long enough to have read the frame several times over.
+	time.Sleep(200 * time.Millisecond)
+
+	if value, err := db.Read([]byte("smuggled")); err == nil {
+		t.Errorf("a follower applied %q out of a heartbeat's payload", value)
+	}
+}
+
+// TestAFollowerAppliesASnapshotAsItArrives is the other half of not holding one.
+// The leader spools to a file; the follower hands the payload to the store as a
+// reader rather than reading it into a slice first.
+//
+// Observable because ApplySnapshot empties the store before it reads anything, so
+// a follower that streams has emptied it while the snapshot is still crossing and
+// one that buffers has not. The sender stops half way and waits, which is what
+// makes that a fact rather than a race: an earlier version of this let the
+// transfer finish and polled, and the two orderings were microseconds apart, so
+// it passed against the buffering it was written to catch.
+//
+// It is also where the cost of this change is written down. A follower is now
+// emptied at the *start* of a snapshot rather than at the end, so a torn transfer
+// leaves it holding nothing rather than holding what it had. That is the trade
+// for not needing the leader's store twice over in memory.
+func TestAFollowerAppliesASnapshotAsItArrives(t *testing.T) {
+	source, err := litekv.OpenDB(t.TempDir(), litekv.DBOptions{Sync: litekv.SyncNever})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+
+	for i := 0; i < 64; i++ {
+		if err := source.Write([]byte(fmt.Sprintf("key-%02d", i)),
+			bytes.Repeat([]byte("x"), 16<<10)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var records bytes.Buffer
+	at, release, err := source.Snapshot(&records, litekv.ReplicaOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+
+	var header bytes.Buffer
+	if err := writeFrame(&header, frameSnapshot, at, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	half := make(chan struct{})    // the sender has sent half and stopped
+	carryOn := make(chan struct{}) // the test has looked; send the rest
+
+	served := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", contentTypeStream)
+		w.WriteHeader(http.StatusOK)
+
+		flush := func() {
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+
+		frame := header.Bytes()
+		binary.LittleEndian.PutUint64(frame[1+dbPositionSize:], uint64(records.Len()))
+		_, _ = w.Write(frame)
+		flush()
+
+		body := records.Bytes()
+		_, _ = w.Write(body[:len(body)/2])
+		flush()
+
+		close(half)
+		<-carryOn
+
+		_, _ = w.Write(body[len(body)/2:])
+		flush()
+
+		<-r.Context().Done()
+	}))
+	defer served.Close()
+
+	db, err := litekv.OpenDB(t.TempDir(), litekv.DBOptions{Sync: litekv.SyncNever})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Something of its own, so that "the store was emptied" is a change and not
+	// the state it started in.
+	if err := db.Write([]byte("had-before"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := Follow(db, served.URL, FollowerOptions{Logger: quiet(),
+		MinBackoff: time.Millisecond, MaxBackoff: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	<-half
+
+	// Half the snapshot has arrived and the rest is not coming until this
+	// returns. A follower that reads the payload into memory before applying any
+	// of it has not touched its store yet and never will inside this window.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := db.Read([]byte("had-before")); err != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			close(carryOn)
+			t.Fatal("half the snapshot has arrived and the follower has not touched its store; " +
+				"it is reading the whole payload into memory before applying any of it")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(carryOn)
+
+	// And it finishes: the rest arrives and the leader's records are there.
+	for deadline := time.Now().Add(15 * time.Second); ; {
+		if value, err := db.Read([]byte("key-63")); err == nil {
+			if len(value) != 16<<10 {
+				t.Fatalf("the last key came back as %d bytes", len(value))
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the snapshot never finished arriving")
+		}
+		time.Sleep(time.Millisecond)
+	}
 }

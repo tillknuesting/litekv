@@ -77,6 +77,11 @@ func run() error {
 				"than 204 and says how many followers had it")
 		waitTimeout = flag.Duration("wait-timeout", 0,
 			"how long a write waits for -wait-for followers before answering 202 (0 for five seconds)")
+		spoolDir = flag.String("spool-dir", "",
+			"where a snapshot on its way to a follower is written before it is sent (empty for the\n"+
+				"system temporary directory). It is spooled rather than held in memory, so this needs\n"+
+				"room for about the live records, transiently, per follower taking one — and on most\n"+
+				"Linux systems /tmp is a tmpfs, which would put it back in memory. -dir is usually right")
 		heartbeat = flag.Duration("heartbeat", 0,
 			"how often a leader with nothing to send tells its followers it is still there (0 for 10s).\n"+
 				"It is what stands between a follower and a connection that was blackholed rather than\n"+
@@ -151,6 +156,7 @@ func run() error {
 		Token:       token,
 		WaitFor:     *waitFor,
 		WaitTimeout: *waitTimeout,
+		SpoolDir:    *spoolDir,
 		Heartbeat:   *heartbeat,
 		Logger:      log,
 	})

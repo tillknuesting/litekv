@@ -1015,6 +1015,24 @@ every route that stores something: `TestAReplicaRefusesEveryWrite` runs all
 three, because a batch aimed at a replica is the same mistake as a `PUT` and a
 longer one.
 
+**Churn is not retention, and TotalAlloc measures the wrong one.** Two versions
+of the snapshot test failed on this. Measuring a follower catching up reported
+221 MB for a 32 MiB store — nearly all of it the follower *building* a store out
+of the records, which is inherent. Measuring the leader's send path reported
+40 MB, because the engine allocates every record as it reads it out of a frozen
+log, whatever it writes them to. What the claim actually is — that the leader is
+not *holding* the snapshot — is `HeapAlloc` after a collection, with the snapshot
+produced and not yet sent. That reads 611 KB against 67 MB, which is the
+difference stated plainly.
+
+**A test that watches for a race will lose it.** The first version of
+`TestAFollowerAppliesASnapshotAsItArrives` let the whole payload cross and polled
+for the store to be emptied, racing "the last byte arrived" against "the store
+was reset" — microseconds apart, and it passed against the buffering it was
+written to catch. The sender stops half way and waits now. If a test's assertion
+depends on which of two things happens first, arrange for one of them not to
+happen yet.
+
 **A measurement whose two arms agree is measuring the harness.** Semi-synchronous
 replication was first timed with a curl loop: 1507ms waiting for a follower
 against 1513ms not waiting, which reads as "it is free" and is really "a curl
@@ -1235,14 +1253,30 @@ before the first byte of the body, and a follower told 409 knows it is pointed a
 a store that has been replaced, where a stream that opened and then died says
 only that a connection ended.
 
-**The leader holds a whole snapshot in memory.** A snapshot frame carries a
-length in front of it, so the handler buffers the store's live records before it
-can write the header. That is fine for the stores this serves today and it is
-the wrong shape for the one the `DB` was built for — only the keys have to fit
-in memory, and this asks for all of it. Changing it means changing the framing:
-a length of nothing meaning "until the frame after this one", or a trailer, or
-chunking a snapshot across several frames with the reset only on the first.
-`FollowerOptions.MaxFrame` is the bound today, at a gigabyte.
+**The leader no longer holds a whole snapshot in memory, and neither does the
+follower.** It spools to a file and copies the file to the connection; the
+follower hands the payload to the store as a reader. The framing did not have to
+change at all — what changed is where the length comes from.
+
+**A file rather than the socket, and the reason is the engine's contract.**
+`DB.Snapshot` holds `mergeMu` for the whole of its call, so whatever it writes to
+decides how long merging is paused on that leader. A buffer is fast and costs the
+store in memory; the socket costs nothing in memory and pauses merging for the
+length of the transfer, which on a slow link is minutes of a leader that cannot
+compact while it is still taking writes. Anyone tempted to "simplify" this by
+handing the socket straight to `Snapshot` should read that sentence twice.
+
+**It cost the follower something and the cost is in a test.** `ApplySnapshot`
+resets the store before it reads, and it now reads from the wire, so a follower
+is emptied at the *start* of a snapshot rather than at the end and a torn
+transfer leaves it holding nothing. `TestAFollowerAppliesASnapshotAsItArrives`
+asserts exactly that, which is the same fact as "it streams" seen from the other
+side.
+
+**`MaxFrame` stopped being a memory bound.** It was a gigabyte and it was the
+largest store that could be replicated at all. It is a terabyte now and it is a
+sanity bound on a number a stranger sent: `readPayload` grows into a payload as
+the bytes arrive, so a header claiming more than it sends costs nothing.
 
 Below is what was on the list before that, kept because the reasoning is still
 the reasoning.

@@ -73,11 +73,13 @@ type FollowerOptions struct {
 	Idle time.Duration
 
 	// MaxFrame is the largest frame this follower will take, in bytes. Zero
-	// means 1 GiB.
+	// means 1 TiB.
 	//
-	// A snapshot arrives as one frame holding the leader's whole live store, so
-	// this is the largest store that can be followed as much as it is a bound
-	// on a hostile leader.
+	// A sanity bound on a number rather than a bound on memory: a snapshot is
+	// streamed into the store rather than held, and a batch is grown into as it
+	// arrives, so a frame claiming more than it sends costs nothing either way.
+	// It used to be a gigabyte and it used to be the largest store that could be
+	// followed, which is what it stopped being.
 	MaxFrame int64
 
 	// BatchSize is handed to the store as litekv.ReplicaOptions.BatchSize.
@@ -413,7 +415,7 @@ func (f *Follower) stream(ctx context.Context) error {
 	}
 
 	for {
-		kind, next, payload, err := readFrame(body, f.opts.MaxFrame)
+		kind, next, length, err := readHeader(body, f.opts.MaxFrame)
 		if err != nil {
 			return err // the connection ended, which is not a failure
 		}
@@ -423,14 +425,22 @@ func (f *Follower) stream(ctx context.Context) error {
 			// Nothing to do but have heard it, which the read above has already
 			// counted. The position on it is the leader's and names records
 			// this follower has not been sent; applying it would claim them.
+			if length != 0 {
+				return fmt.Errorf("a heartbeat carrying %d bytes", length)
+			}
 
 		case frameSnapshot:
-			if err := f.db.ApplySnapshot(next, bytes.NewReader(payload), opts); err != nil {
+			if err := f.take(next, body, length, opts); err != nil {
 				return err
 			}
 			f.tell(f.db.Applied())
 
 		case frameBatch:
+			payload, err := readPayload(body, length)
+			if err != nil {
+				return err
+			}
+
 			// From where the store says it is, not from where the last frame
 			// left it. They are the same until something else has written to
 			// this store, and when they are not, Apply refusing is the only
@@ -449,6 +459,35 @@ func (f *Follower) stream(ctx context.Context) error {
 			return fmt.Errorf("a frame of kind %q", kind)
 		}
 	}
+}
+
+// take applies a snapshot straight off the connection.
+//
+// The payload is handed to the store as a reader rather than read into a slice
+// first, which is the difference between a follower that needs the leader's
+// whole live store in memory and one that needs a buffer. It is also what makes
+// the largest replicable store a question about disks rather than about RAM.
+//
+// The remainder is drained whatever happens, and that drain cannot fire today.
+// ApplySnapshot reads to the end of what it is given and reports an error if it
+// stops early, and this returns that error, which ends the stream — so there is
+// never a next frame for a desynchronised connection to ruin. It is here because
+// "consume exactly what the header promised" is a property of the framing and
+// not of the store: an ApplySnapshot that one day returned nil having read less
+// would otherwise leave the reader in the middle of a record, and the next thing
+// off the wire would be interpreted as a header. The mutation that removes it
+// survives, and AGENTS.md says why.
+func (f *Follower) take(at litekv.DBPosition, from io.Reader, length int64,
+	opts litekv.ReplicaOptions) error {
+
+	payload := io.LimitReader(from, length)
+
+	applied := f.db.ApplySnapshot(at, payload, opts)
+
+	if _, err := io.Copy(io.Discard, payload); err != nil {
+		return err
+	}
+	return applied
 }
 
 // alive is the stream, with every byte off it counting as the leader still

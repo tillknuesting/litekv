@@ -103,6 +103,22 @@ type Options struct {
 	// WaitTimeout is how long a write waits for that. Zero means five seconds.
 	WaitTimeout time.Duration
 
+	// SpoolDir is where a snapshot on its way to a follower is written before it
+	// is sent. Empty means the system temporary directory.
+	//
+	// A snapshot is spooled rather than held in memory or written straight to
+	// the socket, and the reason is in spooled() — the short version is that the
+	// engine pauses merging for as long as DB.Snapshot is writing, so the thing
+	// it writes to has to be fast and local.
+	//
+	// Two reasons to set it. The default may be a tmpfs — on most Linux systems
+	// /tmp is memory, which puts the whole live store back in memory and undoes
+	// the point of spooling at all. And it needs room for about the size of the
+	// live records, transiently, per follower taking a snapshot at once. The
+	// store's own directory is usually the right answer: it is sized for the
+	// data and it is the same filesystem.
+	SpoolDir string
+
 	// Heartbeat is how often a leader with nothing to send tells a follower it
 	// is still there. Zero means ten seconds; negative turns it off.
 	//

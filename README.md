@@ -986,6 +986,7 @@ go run ./cmd/litekvd -dir /var/lib/litekv -addr 127.0.0.1:8080
 | `-queue`            | writes that may be waiting before a handler blocks               | 1024             |
 | `-leader`           | base URL of a leader to follow                                   | follow nobody    |
 | `-token-file`       | file holding a shared bearer token; empty means no auth           | none             |
+| `-spool-dir`        | where a snapshot is written on its way to a follower              | system temp      |
 | `-wait-for`         | followers that must have a write before it is acknowledged       | 0 (async)        |
 | `-wait-timeout`     | how long a write waits for them before answering 202             | 5s               |
 | `-heartbeat`        | how often an idle leader says it is there                        | 10s              |
@@ -1258,6 +1259,41 @@ What is **not** here yet is roles. Nothing marks a node as a follower, so one st
 takes writes of its own, and a write to it will diverge it from its leader — its own records go into its
 own log while the leader's position marches on. `litekvd` says so at startup and that is all it does
 about it. Do not write to a node with `-leader` on it.
+
+### Sending a snapshot without holding one
+
+A snapshot frame is the whole live store, and a frame carries its length in front
+of it — so the leader has to know how long the snapshot is before it can start sending. It used to find
+out by building the thing in memory, and the follower read it back into a slice, which meant replicating
+a store cost that store **twice over in RAM**, in a database whose whole premise is that only the keys
+have to fit.
+
+Neither end holds one now. The leader writes the snapshot to a file, then copies the file to the
+connection; the follower hands the payload straight to the store as a reader. What it costs is disk:
+about the size of the live records, transiently, per follower taking a snapshot at once.
+
+**Why a file and not the socket.** `DB.Snapshot` holds the merge lock for the whole of its call — it has
+to, or a merge could take a log out from under the walk — so whatever it writes to decides how long
+merging on that leader is paused. A buffer is fast and costs the store in memory. The socket costs
+nothing in memory and pauses merging for as long as the transfer takes, which over a slow link is
+minutes of a leader that cannot compact while it is still taking writes. A local file is the only one of
+the three that is both fast and bounded.
+
+`-spool-dir` is where it lands, and it is worth setting. The default is the system temporary directory,
+and **on most Linux systems `/tmp` is a tmpfs** — which puts the whole live store back in memory and
+undoes the point. The store's own directory is usually right: it is sized for the data and it is the
+same filesystem. The file is unlinked the moment it is created, so nothing has to remember to remove it —
+not a panic, not a killed process, not a follower that hangs up half way.
+
+**What this cost.** A follower is now emptied at the *start* of a snapshot rather than at the end,
+because `ApplySnapshot` resets the store before it reads anything and it is now reading from the wire. A
+transfer that breaks half way leaves that follower holding nothing until it reconnects and takes another,
+where before it held what it had until the snapshot was known-complete. That is the trade, and
+`TestAFollowerAppliesASnapshotAsItArrives` is where it is written down.
+
+The frame bound went from a gigabyte to a terabyte with it. It used to be the largest store that could
+be replicated at all; what is left is a sanity bound on a number a stranger sent, since a payload is
+grown into as it arrives and a header claiming more than it sends costs nothing.
 
 ### Semi-synchronous replication
 
@@ -1747,6 +1783,12 @@ anything either.
   `Since` or `Follow`. Until then it goes on taking writes, and those writes are lost when it finds out.
   `DB.Fenced` and `/v1/status` report the state once it is known, which is not the same as knowing it
   early. Fencing bounds the damage, it does not prevent it.
+- **Sending a snapshot needs disk, not memory.** The leader spools it to `-spool-dir` — about the size
+  of the live records, transiently, per follower taking one at once — and the default is the system
+  temporary directory, which on most Linux systems is a tmpfs and therefore memory. Set it.
+- **A snapshot empties a follower before it fills it.** `ApplySnapshot` resets the store and then reads,
+  and it now reads from the connection, so a transfer that breaks half way leaves that follower holding
+  nothing until it reconnects and takes another one.
 - **A follower is a whole copy.** There is no partial replication, no filtering by key, and no way to
   follow one part of a store. The unit is the log.
 - **A replica costs the leader a copy.** Each batch is copied out of `Data` under the read lock before

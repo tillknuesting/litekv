@@ -1,13 +1,14 @@
 package server
 
 import (
-	"bytes"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"os"
 	"slices"
 	"sync"
 	"time"
@@ -59,10 +60,20 @@ const (
 	// from the first byte that fails to parse.
 	contentTypeStream = "application/vnd.litekv.replica-stream"
 
-	// defaultMaxFrame bounds what one frame may claim, and so what a follower
-	// will hold for one. A snapshot frame is the whole live store, so this is
-	// also the largest store that can be replicated over this endpoint.
-	defaultMaxFrame = 1 << 30
+	// defaultMaxFrame bounds what one frame may claim.
+	//
+	// It used to be a memory bound and it used to be a gigabyte, which made it
+	// the largest store that could be replicated at all: a snapshot frame is the
+	// whole live store and a follower held it. Neither end holds one now — the
+	// leader spools to a file and the follower hands the payload to the store as
+	// a reader — so what is left is a sanity bound on a number a stranger sent,
+	// and it can be large enough that a real store never meets it.
+	//
+	// What bounds the memory instead is readPayload, which grows into a payload
+	// as the bytes arrive: a header claiming a terabyte with nothing behind it
+	// costs what a header claiming nothing costs. A leader that actually sends a
+	// terabyte is a volume no limit here would help with.
+	defaultMaxFrame = 1 << 40
 
 	// defaultHeartbeat is how often an idle leader says so, and defaultIdle is
 	// how long a follower waits to hear it before giving up on the connection.
@@ -137,29 +148,58 @@ func writeFrame(w io.Writer, kind byte, at litekv.DBPosition, payload []byte) er
 // cost what a header claiming nothing costs, or the claim itself is a way to
 // make this process ask for a gigabyte per connection.
 func readFrame(r io.Reader, most int64) (byte, litekv.DBPosition, []byte, error) {
+	kind, at, length, err := readHeader(r, most)
+	if err != nil {
+		return 0, litekv.DBPosition{}, nil, err
+	}
+
+	payload, err := readPayload(r, length)
+	if err != nil {
+		return 0, litekv.DBPosition{}, nil, err
+	}
+	return kind, at, payload, nil
+}
+
+// readHeader takes the header off r and leaves the payload on it, which is what
+// lets a snapshot be handed to the store as a reader rather than as a slice.
+//
+// The length is bounded here and only here. A leader this follower has not
+// authenticated — and it cannot authenticate one — is a leader that can name any
+// number, so most is what stands between a header and a number this process is
+// asked to believe.
+func readHeader(r io.Reader, most int64) (byte, litekv.DBPosition, int64, error) {
 	header := make([]byte, frameHeader)
 	if _, err := io.ReadFull(r, header); err != nil {
 		// io.EOF here is a stream that ended between frames, which is the
 		// ordinary way one ends. Anything shorter is a torn header.
-		return 0, litekv.DBPosition{}, nil, err
+		return 0, litekv.DBPosition{}, 0, err
 	}
 
 	var at litekv.DBPosition
 	if err := at.UnmarshalBinary(header[1 : 1+dbPositionSize]); err != nil {
-		return 0, litekv.DBPosition{}, nil, err
+		return 0, litekv.DBPosition{}, 0, err
 	}
 
 	length := binary.LittleEndian.Uint64(header[1+dbPositionSize:])
-	if most < 0 || length > uint64(most) {
-		return 0, litekv.DBPosition{}, nil,
+	if most < 0 || length > uint64(most) || length > math.MaxInt64 {
+		return 0, litekv.DBPosition{}, 0,
 			fmt.Errorf("%w: %d bytes, over the %d allowed", errFrameTooLarge, length, most)
 	}
+	return header[0], at, int64(length), nil
+}
 
+// readPayload takes length bytes off r, growing into them as they arrive.
+//
+// Grown into rather than allocated at the size claimed: a header claiming a
+// gigabyte with nothing behind it must cost what a header claiming nothing
+// costs, or the claim itself is a way to make this process ask for a gigabyte
+// per connection.
+func readPayload(r io.Reader, length int64) ([]byte, error) {
 	const chunk = 64 << 10
 
 	payload := make([]byte, 0, min(length, chunk))
-	for uint64(len(payload)) < length {
-		room := int(min(length-uint64(len(payload)), chunk))
+	for int64(len(payload)) < length {
+		room := int(min(length-int64(len(payload)), chunk))
 
 		payload = slices.Grow(payload, room)
 		if _, err := io.ReadFull(r, payload[len(payload):len(payload)+room]); err != nil {
@@ -168,11 +208,11 @@ func readFrame(r io.Reader, most int64) (byte, litekv.DBPosition, []byte, error)
 				// and not a stream that ended tidily.
 				err = io.ErrUnexpectedEOF
 			}
-			return 0, litekv.DBPosition{}, nil, err
+			return nil, err
 		}
 		payload = payload[:len(payload)+room]
 	}
-	return header[0], at, payload, nil
+	return payload, nil
 }
 
 // stream is the one thing allowed to write to a replication response.
@@ -199,6 +239,43 @@ func (o *stream) frame(kind byte, at litekv.DBPosition, payload []byte) error {
 	if err := writeFrame(o.w, kind, at, payload); err != nil {
 		return err
 	}
+	o.flusher.Flush()
+	return nil
+}
+
+// frameFrom writes a frame whose payload comes off a reader rather than out of a
+// slice, for the one frame that is too large to hold: the snapshot.
+//
+// length has to be known before the header goes out, which is the whole reason a
+// snapshot is spooled to a file first. Copying fewer bytes than promised leaves
+// the follower waiting for a payload that will never arrive, so a short read is
+// reported and the stream ends rather than being left out of step.
+func (o *stream) frameFrom(kind byte, at litekv.DBPosition, length int64, from io.Reader) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	encoded, err := at.MarshalBinary()
+	if err != nil {
+		return err
+	}
+
+	header := make([]byte, frameHeader)
+	header[0] = kind
+	copy(header[1:1+dbPositionSize], encoded)
+	binary.LittleEndian.PutUint64(header[1+dbPositionSize:], uint64(length))
+
+	if _, err := o.w.Write(header); err != nil {
+		return err
+	}
+
+	sent, err := io.Copy(o.w, from)
+	if err != nil {
+		return err
+	}
+	if sent != length {
+		return fmt.Errorf("a snapshot of %d bytes went out as %d", length, sent)
+	}
+
 	o.flusher.Flush()
 	return nil
 }
@@ -237,6 +314,55 @@ func positionParam(pos litekv.DBPosition) (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(encoded), nil
+}
+
+// spooled writes the store's live records to a file and hands it back rewound,
+// with its size and the hold on the log its position names.
+//
+// A file and not a buffer, and not the socket either, and the reason is the
+// engine's contract rather than memory alone. DB.Snapshot holds mergeMu for the
+// whole of its call — it has to, or a merge could take a log out from under the
+// walk — so whatever it writes to decides how long merging on this leader is
+// paused. A buffer is fast and costs the whole live store in memory. The socket
+// costs nothing in memory and pauses merging for as long as the transfer takes,
+// which over a slow link is minutes of a leader that cannot compact while it is
+// still taking writes. A local file is fast to write and bounded in memory, and
+// it is the only one of the three that is both.
+//
+// What it costs is disk: transiently, about the size of the live records. See
+// Options.SpoolDir for where that lands and why the default may be the wrong
+// filesystem.
+func (s *Server) spooled() (*os.File, int64, litekv.DBPosition, func(), error) {
+	file, err := os.CreateTemp(s.opts.SpoolDir, "litekv-snapshot-*")
+	if err != nil {
+		return nil, 0, litekv.DBPosition{}, nil, err
+	}
+
+	// Unlinked while it is still open, so the bytes go when this handler does
+	// however it goes — a panic, a killed process, a follower that hung up. The
+	// file stays readable through the descriptor; only the name is gone.
+	if err := os.Remove(file.Name()); err != nil {
+		_ = file.Close()
+		return nil, 0, litekv.DBPosition{}, nil, err
+	}
+
+	at, release, err := s.db.Snapshot(file, litekv.ReplicaOptions{})
+	if err != nil {
+		_ = file.Close()
+		return nil, 0, litekv.DBPosition{}, nil, err
+	}
+
+	size, err := file.Seek(0, io.SeekEnd)
+	if err == nil {
+		_, err = file.Seek(0, io.SeekStart)
+	}
+	if err != nil {
+		release()
+		_ = file.Close()
+		return nil, 0, litekv.DBPosition{}, nil, err
+	}
+
+	return file, size, at, release, nil
 }
 
 // streamReplica answers GET /v1/replica/stream, which is a leader's side of a
@@ -312,16 +438,23 @@ func (s *Server) streamReplica(w http.ResponseWriter, r *http.Request) {
 	// stream that dies for reasons it cannot see. Every later snapshot happens
 	// mid-body, where ending the stream is all there is to do.
 	var (
-		body    bytes.Buffer
-		holding func()
+		snapshot *os.File
+		size     int64
+		holding  func()
 	)
+	defer func() {
+		if snapshot != nil {
+			_ = snapshot.Close()
+		}
+	}()
+
 	if from == (litekv.DBPosition{}) {
-		at, release, err := s.db.Snapshot(&body, litekv.ReplicaOptions{})
+		file, bytes, at, release, err := s.spooled()
 		if err != nil {
 			s.fail(w, r, err)
 			return
 		}
-		from, holding = at, release
+		snapshot, size, from, holding = file, bytes, at, release
 	}
 
 	w.Header().Set("Content-Type", contentTypeStream)
@@ -419,13 +552,14 @@ func (s *Server) streamReplica(w http.ResponseWriter, r *http.Request) {
 
 	for {
 		if holding != nil {
-			err := out.frame(frameSnapshot, from, body.Bytes())
+			err := out.frameFrom(frameSnapshot, from, size, snapshot)
 
-			// A snapshot is the whole live store, and this handler lives as
-			// long as the connection does. Letting go of it here rather than
-			// keeping the buffer around costs one allocation on the rare
-			// occasion a second snapshot is needed.
-			body = bytes.Buffer{}
+			// Let go of as soon as it has gone out. This handler lives as long
+			// as the connection does, and a descriptor on a file nobody can
+			// name any more is the one thing here that would be held for the
+			// life of it for no reason.
+			_ = snapshot.Close()
+			snapshot, size = nil, 0
 
 			if err != nil {
 				holding()
@@ -468,11 +602,11 @@ func (s *Server) streamReplica(w http.ResponseWriter, r *http.Request) {
 		default:
 		}
 
-		at, release, err := s.db.Snapshot(&body, litekv.ReplicaOptions{})
+		file, bytes, at, release, err := s.spooled()
 		if err != nil {
 			s.log.Debug("a stranded follower could not be sent a snapshot", "err", err)
 			return
 		}
-		from, holding = at, release
+		snapshot, size, from, holding = file, bytes, at, release
 	}
 }
