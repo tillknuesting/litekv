@@ -963,7 +963,7 @@ reads carry on, which is only true if the queue is in the path.
 `TestClosingTheServerStopsWritesAndNotReads` is doing that job, and three
 mutations depend on it. If it is ever weakened, four things stop being tested.
 
-**Four mutations survive on purpose, and no others.** Written down so that
+**Five mutations survive on purpose, and no others.** Written down so that
 nobody goes hunting for a test that was never written, and so that a fourth
 survivor is read as news rather than as normal:
 
@@ -986,6 +986,14 @@ survivor is read as news rather than as normal:
   still running, so a batch that arrives in it is applied by a node that has
   just fenced the sender. Reproducing that needs the window held open, and
   there is no seam for it.
+- **The drain after a snapshot.** `take` consumes whatever `ApplySnapshot` did
+  not, and that cannot fire today: ApplySnapshot reads to the end of what it is
+  given and reports an error if it stops early, and `take` returns that error,
+  which ends the stream — so there is never a next frame for a desynchronised
+  connection to ruin. It stays because "consume exactly what the header
+  promised" is a property of the framing and not of the store, and an
+  ApplySnapshot that one day returned nil having read less would leave the
+  reader in the middle of a record.
 - **The backoff not resetting after a long-lived connection.** With it gone,
   reconnects still happen and still converge; what is lost is that a leader
   restarting once a day is reconnected to at 5s instead of 100ms. That the
