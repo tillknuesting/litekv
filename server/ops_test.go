@@ -310,3 +310,55 @@ func TestAStreamTakesItsWriteDeadlineOff(t *testing.T) {
 		t.Errorf("the follower opened %d streams; the first one was cut by a write deadline", opened)
 	}
 }
+
+// TestStreamsAreCountedWhileTheyAreOpen. litekv_requests_total counts requests
+// that finished, and a replication stream finishing is the thing that is not
+// supposed to happen — one that has been up for a week has never been counted.
+// The gauge is the number an operator wants, and it is the only one here that a
+// request still in flight contributes to.
+func TestStreamsAreCountedWhileTheyAreOpen(t *testing.T) {
+	up := serving(t, litekv.DBOptions{Sync: litekv.SyncNever})
+
+	if err := up.db.Write([]byte("k"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+
+	gauge := func() string {
+		t.Helper()
+
+		for _, line := range strings.Split(string(wants(t,
+			do(t, up.api, http.MethodGet, metricsPath, nil), http.StatusOK)), "\n") {
+			if strings.HasPrefix(line, "litekv_replication_streams ") {
+				return strings.TrimPrefix(line, "litekv_replication_streams ")
+			}
+		}
+		t.Fatal("there is no litekv_replication_streams in /metrics")
+		return ""
+	}
+
+	if got := gauge(); got != "0" {
+		t.Errorf("a leader with no followers reports %s streams", got)
+	}
+
+	db, err := litekv.OpenDB(t.TempDir(), litekv.DBOptions{Sync: litekv.SyncNever})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	f := followingAt(t, db, up.srv.URL)
+	waitForPositions(t, db, up.db, "the follower to attach")
+
+	if got := gauge(); got != "1" {
+		t.Errorf("a leader with one follower attached reports %s streams", got)
+	}
+
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	up.alone(t)
+
+	if got := gauge(); got != "0" {
+		t.Errorf("after the follower went, the leader reports %s streams", got)
+	}
+}

@@ -53,6 +53,21 @@ type FollowerOptions struct {
 	// 100ms and 5s.
 	MinBackoff, MaxBackoff time.Duration
 
+	// Idle is how long this follower waits to hear anything from a leader before
+	// dropping the connection and dialling again. Zero means thirty seconds;
+	// negative waits forever.
+	//
+	// The leader's heartbeat is what fills a quiet stream, so this wants to be a
+	// few beats rather than one — see Options.Heartbeat. What it protects
+	// against is a connection that was blackholed rather than closed, where
+	// nothing arrives, nothing errors, and the OS keepalive is fifteen minutes
+	// away.
+	//
+	// It is a bound on silence and not on a frame: a snapshot of a large store
+	// takes as long as it takes, and every chunk of it that arrives counts as
+	// the leader being alive.
+	Idle time.Duration
+
 	// MaxFrame is the largest frame this follower will take, in bytes. Zero
 	// means 1 GiB.
 	//
@@ -130,6 +145,9 @@ func Follow(db *litekv.DB, leader string, opts FollowerOptions) (*Follower, erro
 	}
 	if opts.MaxFrame <= 0 {
 		opts.MaxFrame = defaultMaxFrame
+	}
+	if opts.Idle == 0 {
+		opts.Idle = defaultIdle
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -235,6 +253,12 @@ func (f *Follower) stream(ctx context.Context) error {
 	target := *f.leader
 	target.RawQuery = url.Values{"from": {at}}.Encode()
 
+	// A context of this connection's own, so that going quiet can end it without
+	// ending the follower. Cancelling is the only way to interrupt a read on an
+	// http.Client body — there is no deadline to set on it.
+	ctx, quiet := context.WithCancel(ctx)
+	defer quiet()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
 		return err
@@ -267,13 +291,31 @@ func (f *Follower) stream(ctx context.Context) error {
 
 	opts := litekv.ReplicaOptions{BatchSize: f.opts.BatchSize}
 
+	// Reset on bytes and not on frames, which is the whole of getting this
+	// right. A snapshot of a large store is one frame that takes minutes, and a
+	// deadline that only moved when a frame completed would cancel the transfer
+	// of a store this follower was in the middle of receiving — turning a slow
+	// first sync into a loop that never finishes one.
+	body := io.Reader(resp.Body)
+	if f.opts.Idle > 0 {
+		silent := time.AfterFunc(f.opts.Idle, quiet)
+		defer silent.Stop()
+
+		body = &alive{r: resp.Body, beat: func() { silent.Reset(f.opts.Idle) }}
+	}
+
 	for {
-		kind, next, payload, err := readFrame(resp.Body, f.opts.MaxFrame)
+		kind, next, payload, err := readFrame(body, f.opts.MaxFrame)
 		if err != nil {
 			return err // the connection ended, which is not a failure
 		}
 
 		switch kind {
+		case frameHeartbeat:
+			// Nothing to do but have heard it, which the read above has already
+			// counted. The position on it is the leader's and names records
+			// this follower has not been sent; applying it would claim them.
+
 		case frameSnapshot:
 			if err := f.db.ApplySnapshot(next, bytes.NewReader(payload), opts); err != nil {
 				return err
@@ -293,6 +335,21 @@ func (f *Follower) stream(ctx context.Context) error {
 			return fmt.Errorf("a frame of kind %q", kind)
 		}
 	}
+}
+
+// alive is the stream, with every byte off it counting as the leader still
+// being there.
+type alive struct {
+	r    io.Reader
+	beat func()
+}
+
+func (a *alive) Read(p []byte) (int, error) {
+	n, err := a.r.Read(p)
+	if n > 0 {
+		a.beat()
+	}
+	return n, err
 }
 
 // refusedError is a leader that answered with a status rather than a stream.

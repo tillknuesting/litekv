@@ -69,6 +69,14 @@ func run() error {
 		leader = flag.String("leader", "",
 			"base URL of a leader to follow, such as http://10.0.0.2:8080. Its records are applied to this\n"+
 				"store as they are written. Empty follows nobody, which is what a leader does")
+		heartbeat = flag.Duration("heartbeat", 0,
+			"how often a leader with nothing to send tells its followers it is still there (0 for 10s).\n"+
+				"It is what stands between a follower and a connection that was blackholed rather than\n"+
+				"closed, which the OS keepalive notices about fifteen minutes later; negative turns it off")
+		idle = flag.Duration("idle", 0,
+			"how long this node waits to hear anything from its -leader before reconnecting (0 for 30s).\n"+
+				"A few heartbeats rather than one, since dropping a working connection over a late beat\n"+
+				"costs a reconnect and gains nothing")
 		tokenFile = flag.String("token-file", "",
 			"file holding a shared secret every request must carry as `Authorization: Bearer <token>`.\n"+
 				"A file and not a flag value: an argument is visible in ps to every process on the machine.\n"+
@@ -128,12 +136,13 @@ func run() error {
 	}
 
 	api := server.New(db, server.Options{
-		MaxValue: *maxValue,
-		MaxBatch: *maxBatch,
-		MaxScan:  *maxScan,
-		Queue:    *queue,
-		Token:    token,
-		Logger:   log,
+		MaxValue:  *maxValue,
+		MaxBatch:  *maxBatch,
+		MaxScan:   *maxScan,
+		Queue:     *queue,
+		Token:     token,
+		Heartbeat: *heartbeat,
+		Logger:    log,
 	})
 	defer api.Close()
 
@@ -143,7 +152,8 @@ func run() error {
 	// while it is following diverges from its leader for good. api.Close stops
 	// it, in the right order, which is why there is no second defer here.
 	if *leader != "" {
-		if err := api.Follow(*leader, server.FollowerOptions{Token: token, Logger: log}); err != nil {
+		if err := api.Follow(*leader, server.FollowerOptions{
+			Token: token, Idle: *idle, Logger: log}); err != nil {
 			return err
 		}
 	}

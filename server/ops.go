@@ -244,6 +244,13 @@ func (s *Server) exposition(w http.ResponseWriter, r *http.Request) {
 		name, help string
 		value      int
 	}{
+		// A counter of requests answered says nothing about a stream, because a
+		// stream is answered when it ends: one that has been up for a week has
+		// never been counted. This is the number an operator actually wants —
+		// how many followers are attached right now — and it is the only one
+		// here that a request in flight contributes to.
+		{"litekv_replication_streams", "Replication streams open right now.",
+			int(s.streaming.Load())},
 		{"litekv_term", "The term this store is on.", int(s.db.Term())},
 		{"litekv_store_keys", "Keys the store holds, tombstones included.", s.db.Len()},
 		{"litekv_store_segments", "Logs the store is spread across.", s.db.Segments()},

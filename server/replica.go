@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/tillknuesting/litekv"
@@ -36,6 +37,19 @@ const (
 	frameSnapshot = 'S'
 	frameBatch    = 'B'
 
+	// frameHeartbeat carries no payload and says only that the leader is still
+	// there. It exists because a stream that is quiet and a stream that is dead
+	// look exactly alike from the follower's end: a TCP connection that has been
+	// blackholed — a cable pulled, a firewall dropping instead of refusing, a
+	// leader that lost power — is noticed by the OS keepalive in about fifteen
+	// minutes and by nothing else before that. A follower that is not being
+	// written to has no other way to tell.
+	//
+	// The position on it is the leader's own, so a follower can see how far
+	// behind it is even while nothing is being written. It is not applied and
+	// must not be: it names records this follower has not been sent.
+	frameHeartbeat = 'H'
+
 	// replicaPath is the route, and is also what a Follower appends to the
 	// address it is pointed at.
 	replicaPath = "/v1/replica/stream"
@@ -49,6 +63,15 @@ const (
 	// will hold for one. A snapshot frame is the whole live store, so this is
 	// also the largest store that can be replicated over this endpoint.
 	defaultMaxFrame = 1 << 30
+
+	// defaultHeartbeat is how often an idle leader says so, and defaultIdle is
+	// how long a follower waits to hear it before giving up on the connection.
+	//
+	// Three beats rather than one: a heartbeat is a write on a network, and
+	// dropping a working connection because one of them was late is a
+	// reconnect, a possible snapshot, and nothing gained.
+	defaultHeartbeat = 10 * time.Second
+	defaultIdle      = 30 * time.Second
 )
 
 // dbPositionSize is what a litekv.DBPosition takes on the wire.
@@ -150,6 +173,34 @@ func readFrame(r io.Reader, most int64) (byte, litekv.DBPosition, []byte, error)
 		payload = payload[:len(payload)+room]
 	}
 	return header[0], at, payload, nil
+}
+
+// stream is the one thing allowed to write to a replication response.
+//
+// It exists because there are now two goroutines with something to say on one
+// connection — the records, and the heartbeat that goes out while there are no
+// records — and an http.ResponseWriter written by two goroutines at once is a
+// data race and a corrupted frame, in that order.
+type stream struct {
+	mu      sync.Mutex
+	w       io.Writer
+	flusher http.Flusher
+}
+
+// frame writes one and pushes it out.
+//
+// Flushed every time, and that is not belt and braces: net/http buffers, and a
+// leader whose store has gone quiet has nothing coming along behind to push the
+// last frame out. That is exactly the case a heartbeat is for.
+func (o *stream) frame(kind byte, at litekv.DBPosition, payload []byte) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	if err := writeFrame(o.w, kind, at, payload); err != nil {
+		return err
+	}
+	o.flusher.Flush()
+	return nil
 }
 
 // positionOf decodes the from parameter of a stream request.
@@ -276,13 +327,38 @@ func (s *Server) streamReplica(w http.ResponseWriter, r *http.Request) {
 	// A leader with an idle store may have nothing for hours.
 	flusher.Flush()
 
+	out := &stream{w: w, flusher: flusher}
+
+	s.streaming.Add(1)
+	defer s.streaming.Add(-1)
+
 	// The stream ends when the client goes away or when this server is asked to
 	// stop serving streams. Follow takes one channel, so the two are merged.
 	// The third is this handler returning for any other reason, which net/http
 	// would signal by cancelling the request anyway; a test driving the handler
 	// with a recorder is the caller that would not.
+	// Waited for before this handler returns, and the ordering of these two
+	// defers is the whole of it: close(served) runs first, which ends the
+	// watcher, which closes until, which is what the heartbeat is selecting on
+	// — and only then does beating.Wait let this return.
+	//
+	// A ResponseWriter may not be touched once its handler has returned, and
+	// the heartbeat is a second goroutine holding one. Left to stop in its own
+	// time it writes into a response net/http is finishing, which is a data
+	// race and a corrupted last frame. The race detector found this; nothing
+	// else would have, because the window is a scheduling accident.
+	var beating sync.WaitGroup
+	defer beating.Wait()
+
 	served := make(chan struct{})
 	defer close(served)
+
+	// broken is the heartbeat failing to go out. Without it a leader whose
+	// store is quiet would sit in Follow with a dead socket until the client's
+	// context noticed, and the whole reason the heartbeat exists is that
+	// noticing takes about fifteen minutes.
+	broken := make(chan struct{})
+	var once sync.Once
 
 	until := make(chan struct{})
 	go func() {
@@ -291,21 +367,44 @@ func (s *Server) streamReplica(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 		case <-s.streams:
+		case <-broken:
 		case <-served:
 		}
 	}()
 
+	if beat := s.opts.heartbeat(); beat > 0 {
+		beating.Add(1)
+		go func() {
+			defer beating.Done()
+
+			ticker := time.NewTicker(beat)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ticker.C:
+					// The leader's own position, so that a follower can see how
+					// far behind it is without anything being written. Follow
+					// is what sends records; this only says the leader is here.
+					if err := out.frame(frameHeartbeat, s.db.Position(), nil); err != nil {
+						s.log.Debug("a heartbeat did not reach a follower", "err", err)
+						once.Do(func() { close(broken) })
+						return
+					}
+				case <-until:
+					return
+				}
+			}
+		}()
+	}
+
 	send := func(batch []byte, next litekv.DBPosition) error {
-		if err := writeFrame(w, frameBatch, next, batch); err != nil {
-			return err
-		}
-		flusher.Flush()
-		return nil
+		return out.frame(frameBatch, next, batch)
 	}
 
 	for {
 		if holding != nil {
-			err := writeFrame(w, frameSnapshot, from, body.Bytes())
+			err := out.frame(frameSnapshot, from, body.Bytes())
 
 			// A snapshot is the whole live store, and this handler lives as
 			// long as the connection does. Letting go of it here rather than
@@ -318,7 +417,6 @@ func (s *Server) streamReplica(w http.ResponseWriter, r *http.Request) {
 				s.log.Debug("a snapshot did not reach a follower", "err", err)
 				return
 			}
-			flusher.Flush()
 		}
 
 		// The hold that came back with the snapshot goes to Follow, which takes

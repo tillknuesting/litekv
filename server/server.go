@@ -35,6 +35,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tillknuesting/litekv"
@@ -84,6 +85,14 @@ type Options struct {
 	// held while it is written.
 	Queue int
 
+	// Heartbeat is how often a leader with nothing to send tells a follower it
+	// is still there. Zero means ten seconds; negative turns it off.
+	//
+	// It is the only thing between a follower and a connection that has been
+	// blackholed rather than closed, which the OS keepalive notices in about
+	// fifteen minutes. See FollowerOptions.Idle for the other end of it.
+	Heartbeat time.Duration
+
 	// Token, if set, is a shared secret every request must carry as
 	// `Authorization: Bearer <token>`. Empty means no authentication at all,
 	// which is what listening on loopback is for.
@@ -104,6 +113,16 @@ type Options struct {
 }
 
 const defaultMaxValue = 16 << 20
+
+// heartbeat is Options.Heartbeat with the zero value filled in. Negative is off
+// and is kept as such, which is what lets a test drive a stream with no beat in
+// it.
+func (o Options) heartbeat() time.Duration {
+	if o.Heartbeat == 0 {
+		return defaultHeartbeat
+	}
+	return o.Heartbeat
+}
 
 // Server serves a litekv.DB over HTTP. It is safe for concurrent use, which is
 // what an http.Handler has to be.
@@ -134,6 +153,11 @@ type Server struct {
 
 	// metrics is what this server knows about itself. See ops.go.
 	metrics *metrics
+
+	// streaming is how many replication streams are open. Separate from the
+	// request counter because that one counts requests that finished, and a
+	// stream finishing is the thing that is not supposed to happen.
+	streaming atomic.Int64
 }
 
 // writes is the calls a handler makes to store something. A *litekv.DB

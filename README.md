@@ -986,6 +986,8 @@ go run ./cmd/litekvd -dir /var/lib/litekv -addr 127.0.0.1:8080
 | `-queue`            | writes that may be waiting before a handler blocks               | 1024             |
 | `-leader`           | base URL of a leader to follow                                   | follow nobody    |
 | `-token-file`       | file holding a shared bearer token; empty means no auth           | none             |
+| `-heartbeat`        | how often an idle leader says it is there                        | 10s              |
+| `-idle`             | how long a follower waits to hear it before reconnecting         | 30s              |
 | `-read-timeout`     | how long a request has to arrive, headers and body                | 60s              |
 | `-write-timeout`    | how long a response has to be written (streams exempt)            | 60s              |
 | `-idle-timeout`     | how long an idle keep-alive connection is held                    | 120s             |
@@ -1254,6 +1256,32 @@ takes writes of its own, and a write to it will diverge it from its leader — i
 own log while the leader's position marches on. `litekvd` says so at startup and that is all it does
 about it. Do not write to a node with `-leader` on it.
 
+### A quiet stream and a dead one
+
+They look alike from the follower's end, and that is the problem. A TCP connection that has been
+blackholed rather than closed — a cable pulled, a firewall dropping instead of refusing, a leader that
+lost power — delivers nothing and reports nothing, and the OS keepalive notices in about fifteen
+minutes. A follower that is not being written to has no other way to tell.
+
+So a leader with nothing to send says so: a heartbeat frame every `Heartbeat` (10s by default), carrying
+the leader's own position so a follower can see how far behind it is while nothing is being written. It
+is not applied and must not be — it names records the follower has not been sent.
+
+A follower that hears nothing for `Idle` (30s by default, three beats) drops the connection and dials
+again, which costs it nothing: it comes back at the position it had.
+
+**The deadline is on silence, not on a frame.** A snapshot of a large store is one frame that takes as
+long as it takes, and a deadline that only moved when a frame completed would cancel the transfer it was
+in the middle of — turning a slow first sync into a loop that never finishes one. Every chunk that
+arrives counts as the leader being alive.
+
+Two things this cost, both worth knowing. There are now two goroutines with something to say on one
+connection, so every frame goes out under one lock — an `http.ResponseWriter` written by two goroutines
+at once is a data race and a corrupted frame, in that order. And the handler waits for its heartbeat
+goroutine before returning, because a `ResponseWriter` may not be touched once its handler has returned;
+left to stop in its own time it writes into a response net/http is already finishing. The race detector
+found the second one. Nothing else would have.
+
 ### Which of the two, and reads that are not stale
 
 A node started with `-leader` is a **replica**. It refuses every write with 409 and a `Litekv-Leader`
@@ -1310,11 +1338,17 @@ route, and the store's own numbers:
 ```
 litekv_requests_total{route="/v1/keys/{key}",method="GET",status="200"} 41231
 litekv_request_duration_seconds_bucket{route="/v1/keys/{key}",le="0.001"} 41180
+litekv_replication_streams 2
 litekv_role{role="leader",leader=""} 1
 litekv_term 1
 litekv_store_keys 812
 litekv_store_segments 3
 ```
+
+`litekv_replication_streams` is the one gauge a request in flight contributes to, and it exists because
+`litekv_requests_total` counts requests that *finished*: a replication stream that has been up for a
+week has never been counted once. How many followers are attached right now is the number an operator
+actually wants.
 
 The route label is the **pattern** and never the path. A label taken from the URL would be one series
 per key, and `/metrics` would grow with the store until it was the largest thing this server sends

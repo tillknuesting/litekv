@@ -1014,6 +1014,30 @@ every route that stores something: `TestAReplicaRefusesEveryWrite` runs all
 three, because a batch aimed at a replica is the same mistake as a `PUT` and a
 longer one.
 
+**A goroutine that outlives its handler is a race the tests cannot see.** The
+heartbeat is a second goroutine holding the stream's `http.ResponseWriter`, and
+a ResponseWriter may not be touched once its handler has returned. Left to stop
+in its own time it writes into a response net/http is finishing. The fix is two
+defers whose order is the whole of it — `close(served)` runs first, which ends
+the watcher, which closes `until`, which the heartbeat selects on, and only then
+does `beating.Wait()` let the handler return. **The race detector is the only
+thing that found this**, which is why the sweep now runs `go test -race`: it
+costs about a second a mutation and buys a class of bug no assertion covers.
+
+**A fake leader has to flush.** A test server that writes frames and then holds
+the connection open leaves all of them in net/http's buffer, so the follower
+reads nothing and sits there. `TestAFollowerReadsPastAHeartbeat` failed against
+correct code for exactly that, and the failure looks identical to the bug it was
+written to catch. The real leader flushes every frame; a fake that does not is
+testing the buffer.
+
+**Slowing a writer is not the same as trickling bytes.** The first version of
+`TestSilenceIsBytesAndNotFrames` slept once per `Write`, which is one long
+silence — and silence is what the idle deadline is meant to end, so it made the
+correct code fail and the bug pass. It sends the payload in flushed pieces now.
+The version before that just made the store bigger, which on loopback crossed in
+under the deadline and proved nothing at all.
+
 **A test that hangs when it fails is worse than one that fails.** The token
 test asks every route for a 401, and one of those routes is the replication
 stream: with the check removed it does not answer, it starts streaming, and the

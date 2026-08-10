@@ -98,7 +98,12 @@ def run(pool, path, name, old, new):
         # is a caught mutation; the real suite takes three seconds, so ninety
         # is room to spare and a two-order-of-magnitude saving on the one
         # mutation that wedges something.
-        test = subprocess.run(["go", "test", "-count=1", "-timeout", "90s", "./server/"],
+        # -race, because some of what this package promises is only visible to
+        # the detector: a heartbeat goroutine writing to a ResponseWriter after
+        # its handler returned is a race and nothing else, and a sweep without
+        # the flag reports it as caught by nobody. It costs about a second a
+        # mutation and buys the whole class.
+        test = subprocess.run(["go", "test", "-race", "-count=1", "-timeout", "90s", "./server/"],
                               cwd=where, capture_output=True, text=True, errors="replace")
         if test.returncode == 0:
             return "SURVIVED"

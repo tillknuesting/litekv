@@ -47,7 +47,8 @@ type leader struct {
 	srv    *httptest.Server
 	frames *frameCounter
 
-	live atomic.Int64
+	live    atomic.Int64
+	streams atomic.Int64
 }
 
 // serving opens a store and serves it, with the closes registered in the order
@@ -69,6 +70,10 @@ func serving(t *testing.T, opts litekv.DBOptions) *leader {
 	up.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		up.live.Add(1)
 		defer up.live.Add(-1)
+
+		if r.URL.Path == replicaPath {
+			up.streams.Add(1)
+		}
 
 		up.api.ServeHTTP(up.frames.wrap(w), r)
 	}))
@@ -765,6 +770,7 @@ type frameCounter struct {
 	mu    sync.Mutex
 	snap  int
 	batch int
+	beat  int
 }
 
 func (c *frameCounter) wrap(w http.ResponseWriter) http.ResponseWriter {
@@ -780,6 +786,8 @@ func (c *frameCounter) saw(kind byte) {
 		c.snap++
 	case frameBatch:
 		c.batch++
+	case frameHeartbeat:
+		c.beat++
 	}
 }
 
@@ -788,6 +796,13 @@ func (c *frameCounter) snapshots() int {
 	defer c.mu.Unlock()
 
 	return c.snap
+}
+
+func (c *frameCounter) beats() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.beat
 }
 
 func (c *frameCounter) batches() int {
@@ -1121,4 +1136,345 @@ func TestOneSmallRecordArrivesAtOnce(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+// A quiet stream and a dead one look alike from the follower's end. These are
+// the two halves of telling them apart: a leader that says so while it has
+// nothing to send, and a follower that gives up when it stops hearing it.
+
+// TestAQuietLeaderSaysSo. Nothing is written for the length of several beats,
+// and the frames still arrive — which is the only evidence that a follower
+// resting on an idle leader is resting on a connection somebody is checking.
+func TestAQuietLeaderSaysSo(t *testing.T) {
+	up := serving(t, litekv.DBOptions{Sync: litekv.SyncNever})
+	up.api.opts.Heartbeat = 20 * time.Millisecond
+
+	if err := up.db.Write([]byte("k"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := litekv.OpenDB(t.TempDir(), litekv.DBOptions{Sync: litekv.SyncNever})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	followingAt(t, db, up.srv.URL)
+	waitForPositions(t, db, up.db, "the follower to catch up")
+
+	// Idle throughout: anything counted here is a heartbeat and nothing else.
+	before, streams := up.frames.beats(), up.streams.Load()
+	time.Sleep(200 * time.Millisecond)
+
+	if got := up.frames.beats() - before; got < 3 {
+		t.Errorf("a leader idle for ten beats sent %d heartbeats", got)
+	}
+
+	// On one connection throughout, and connections are what to count. A
+	// follower that did not know what a heartbeat was would end the stream on
+	// the first one and come back — and it would come back to a position that
+	// is still good, so it would be sent a batch and not a snapshot, and
+	// counting snapshots would see nothing at all.
+	if got := up.streams.Load(); got != streams {
+		t.Errorf("the follower opened %d more streams while nothing was written", got-streams)
+	}
+
+	// And the follower is still on the same connection, none the worse for
+	// frames it does nothing with.
+	if got, err := db.Read([]byte("k")); err != nil || string(got) != "v" {
+		t.Errorf("the follower lost what it had: %q, '%v'", got, err)
+	}
+}
+
+// TestAFollowerGivesUpOnSilence is the other half. A leader that accepts the
+// connection and then says nothing at all — which is what a blackholed socket
+// looks like, since nothing errors and nothing arrives — has to be noticed by
+// the follower rather than waited on until the OS keepalive fires a quarter of
+// an hour later.
+func TestAFollowerGivesUpOnSilence(t *testing.T) {
+	var opened atomic.Int64
+
+	mute := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		opened.Add(1)
+
+		w.Header().Set("Content-Type", contentTypeStream)
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+
+		// Connected, accepted, and silent. Held rather than returned, so this
+		// is a stream that is up and saying nothing and not one that ended.
+		select {
+		case <-r.Context().Done():
+		case <-time.After(30 * time.Second):
+		}
+	}))
+	defer mute.Close()
+
+	db, err := litekv.OpenDB(t.TempDir(), litekv.DBOptions{Sync: litekv.SyncNever})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	f, err := Follow(db, mute.URL, FollowerOptions{Logger: quiet(),
+		MinBackoff: time.Millisecond, MaxBackoff: 5 * time.Millisecond,
+		Idle: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Several idle periods. A follower that waits for a silent leader for ever
+	// opens one connection and sits on it.
+	deadline := time.Now().Add(15 * time.Second)
+	for opened.Load() < 3 {
+		if time.Now().After(deadline) {
+			t.Fatalf("a follower held a silent connection: %d opened", opened.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestSilenceIsBytesAndNotFrames is the trap in the deadline. A snapshot of a
+// large store is one frame that takes as long as it takes, and a follower whose
+// deadline only moved when a frame completed would cancel the transfer it was
+// in the middle of — turning a slow first sync into a loop that never finishes
+// one. Every chunk that arrives counts.
+func TestSilenceIsBytesAndNotFrames(t *testing.T) {
+	db, err := litekv.OpenDB(t.TempDir(), litekv.DBOptions{Sync: litekv.SyncNever})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Write([]byte("k"), bytes.Repeat([]byte("x"), 256<<10)); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(db, Options{Logger: quiet(), Heartbeat: -1})
+
+	// The snapshot is made to take much longer than the deadline below, by
+	// slowing the writes rather than by making the store enormous: on loopback
+	// thirteen megabytes cross in a few milliseconds, and a version of this test
+	// that grew the store instead passed against the bug it was written for.
+	wire := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.ServeHTTP(&dawdling{ResponseWriter: w, every: 5 * time.Millisecond}, r)
+	}))
+
+	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(wire.Close)
+	t.Cleanup(func() { _ = s.Close() })
+
+	follower, err := litekv.OpenDB(t.TempDir(), litekv.DBOptions{Sync: litekv.SyncNever})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer follower.Close()
+
+	// Shorter than the whole snapshot takes to cross, and longer than the gap
+	// between the chunks of it. What must not happen is the transfer being
+	// cancelled part way and started again, for ever.
+	f, err := Follow(follower, wire.URL, FollowerOptions{Logger: quiet(),
+		MinBackoff: time.Millisecond, MaxBackoff: 5 * time.Millisecond,
+		Idle: 25 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	waitForPositions(t, follower, db, "a slow snapshot to cross under a short idle deadline")
+
+	if got, err := follower.Read([]byte("k")); err != nil || len(got) != 256<<10 {
+		t.Errorf("the key came back as %d bytes, '%v'", len(got), err)
+	}
+}
+
+// dawdling writes slowly, so that a transfer takes many times an idle deadline
+// without the store having to be many times larger.
+type dawdling struct {
+	http.ResponseWriter
+	every time.Duration
+}
+
+func (d *dawdling) Write(p []byte) (int, error) {
+	// In pieces, each one flushed. A single slow Write is a long silence, and a
+	// long silence is exactly what the idle deadline is supposed to end — a
+	// version of this that slept once per Write made the correct code fail and
+	// the bug pass.
+	const piece = 16 << 10
+
+	sent := 0
+	for len(p) > 0 {
+		time.Sleep(d.every)
+
+		n, err := d.ResponseWriter.Write(p[:min(len(p), piece)])
+		sent += n
+		d.Flush()
+
+		if err != nil {
+			return sent, err
+		}
+		p = p[n:]
+	}
+	return sent, nil
+}
+
+func (d *dawdling) Flush() {
+	if f, ok := d.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// TestAFollowerReadsPastAHeartbeat. A frame kind a follower does not know ends
+// its stream, so a heartbeat it did not understand would be a stream that dies
+// on the first quiet moment and a follower that spends its life reconnecting.
+//
+// Driven off a fake leader rather than a real one, because what is being
+// asserted is a decision about one frame and not a race between a ticker and a
+// test: heartbeat, snapshot, heartbeat, and the records have to arrive through
+// the middle of them.
+func TestAFollowerReadsPastAHeartbeat(t *testing.T) {
+	source, err := litekv.OpenDB(t.TempDir(), litekv.DBOptions{Sync: litekv.SyncNever})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+
+	if err := source.Write([]byte("through-the-beats"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+
+	var records bytes.Buffer
+	at, release, err := source.Snapshot(&records, litekv.ReplicaOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+
+	var wire bytes.Buffer
+	for _, frame := range []struct {
+		kind    byte
+		at      litekv.DBPosition
+		payload []byte
+	}{
+		{frameHeartbeat, at, nil},
+		{frameSnapshot, at, records.Bytes()},
+		{frameHeartbeat, at, nil},
+	} {
+		if err := writeFrame(&wire, frame.kind, frame.at, frame.payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	beating := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", contentTypeStream)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(wire.Bytes())
+
+		// Flushed, or none of it leaves: net/http buffers, and this handler then
+		// blocks below with the whole stream sitting in that buffer. The real
+		// leader flushes every frame for the same reason, and a fake that did
+		// not made this test fail against correct code.
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+
+		// Held open afterwards, so that the follower is reading a stream rather
+		// than reconnecting to a fresh copy of these three frames.
+		<-r.Context().Done()
+	}))
+	defer beating.Close()
+
+	db, err := litekv.OpenDB(t.TempDir(), litekv.DBOptions{Sync: litekv.SyncNever})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	f, err := Follow(db, beating.URL, FollowerOptions{Logger: quiet(),
+		MinBackoff: time.Millisecond, MaxBackoff: 5 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if value, err := db.Read([]byte("through-the-beats")); err == nil {
+			if string(value) != "v" {
+				t.Fatalf("the record arrived as %q", value)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a snapshot between two heartbeats never arrived; the first beat ended the stream")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestAHeartbeatThatFailsEndsTheStream. The heartbeat is the only thing writing
+// to a connection whose store has gone quiet, so it is the only thing that can
+// find out the connection is gone — Follow is blocked with nothing to send and
+// will not touch the socket again until something is written to the store.
+//
+// Driven with a recorder rather than a socket precisely because a recorder has
+// no context to cancel: over a real connection the request's context eventually
+// fires and hides this, and what is being asserted is that the leader does not
+// wait for it.
+func TestAHeartbeatThatFailsEndsTheStream(t *testing.T) {
+	s, db := newServer(t, Options{Heartbeat: 10 * time.Millisecond})
+
+	if err := db.Write([]byte("k"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Everything after the snapshot fails, which is what a socket that has gone
+	// away looks like to a handler.
+	w := &refusing{after: 2}
+
+	ended := make(chan struct{})
+	go func() {
+		defer close(ended)
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, replicaPath, nil))
+	}()
+
+	select {
+	case <-ended:
+	case <-time.After(15 * time.Second):
+		t.Fatal("a stream whose heartbeat could not go out is still running; " +
+			"Follow is blocked and nothing else was going to notice")
+	}
+}
+
+// refusing takes a few writes and then fails every one, without the request
+// being cancelled.
+type refusing struct {
+	mu      sync.Mutex
+	after   int
+	written int
+	header  http.Header
+}
+
+func (r *refusing) Header() http.Header {
+	if r.header == nil {
+		r.header = http.Header{}
+	}
+	return r.header
+}
+
+func (r *refusing) WriteHeader(int) {}
+
+func (r *refusing) Flush() {}
+
+func (r *refusing) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.written++
+	if r.written > r.after {
+		return 0, errors.New("the connection has gone")
+	}
+	return len(p), nil
 }
