@@ -166,9 +166,18 @@ func (s *Server) promote(w http.ResponseWriter, r *http.Request) {
 // what a client can do with a position is give it to headerAfter, and taking one
 // apart out here would be a second place that has to know the format.
 type statusBody struct {
-	Role     string `json:"role"`
-	Term     uint64 `json:"term"`
-	Leader   string `json:"leader,omitempty"`
+	Role   string `json:"role"`
+	Term   uint64 `json:"term"`
+	Leader string `json:"leader,omitempty"`
+
+	// Fenced is a store that has heard of a newer leader. It says role "leader"
+	// and it is not one any more — which is the state worth seeing, because
+	// nothing else about the node looks wrong: it serves reads, it reports a
+	// term, and every write it takes is refused.
+	//
+	// Absent when false, since a node that has not been replaced has nothing to
+	// say about it.
+	Fenced   bool   `json:"fenced,omitempty"`
 	Position string `json:"position"`
 	Applied  string `json:"applied,omitempty"`
 	Segments int    `json:"segments"`
@@ -185,7 +194,7 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	leader, replica := s.following()
 
 	body := statusBody{Role: "leader", Term: s.db.Term(), Leader: leader,
-		Segments: s.db.Segments(), Keys: s.db.Len()}
+		Fenced: s.db.Fenced(), Segments: s.db.Segments(), Keys: s.db.Len()}
 	if replica {
 		body.Role = "replica"
 	}

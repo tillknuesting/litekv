@@ -371,3 +371,103 @@ func TestFollowerAdoptsTheTermFromABatch(t *testing.T) {
 		t.Errorf("the follower's positions carry term %d, want 2", got)
 	}
 }
+
+// TestFollowFencesALeaderTheWaySinceDoes. Streaming and polling are two ways of
+// asking a store for records, and until this test existed only one of them told
+// a replaced leader it had been replaced: Since wrote the term down, Follow
+// reported the same error and recorded nothing.
+//
+// That asymmetry is the worst kind. A leader with a follower attached — the
+// ordinary arrangement, and the one the server uses — went on taking writes
+// after being replaced, and those writes are lost when it finds out.
+func TestFollowFencesALeaderTheWaySinceDoes(t *testing.T) {
+	for _, how := range []string{"Since", "Follow"} {
+		t.Run(how, func(t *testing.T) {
+			replaced, err := OpenDB(t.TempDir(), DBOptions{Sync: SyncNever})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer replaced.Close()
+
+			if err := replaced.Write([]byte("k"), []byte("v")); err != nil {
+				t.Fatal(err)
+			}
+			if replaced.Fenced() {
+				t.Fatal("a store nobody has replaced says it is fenced")
+			}
+
+			// Somebody on a newer term asks it for records, which is the only
+			// way this news ever reaches a leader.
+			from := DBPosition{Term: replaced.Term() + 1}
+
+			switch how {
+			case "Since":
+				_, err = replaced.Since(from, io.Discard, ReplicaOptions{})
+			case "Follow":
+				stop := make(chan struct{})
+				close(stop)
+
+				send := func(batch []byte, next DBPosition) error { return nil }
+				_, err = replaced.Follow(from, nil, send, stop, ReplicaOptions{})
+			}
+
+			if !errors.Is(err, ErrorFenced) {
+				t.Fatalf("%s from a newer term reported '%v', want fenced", how, err)
+			}
+
+			// Written down, not merely reported. A store that reported it and
+			// carried on is a store still taking writes it is going to lose.
+			if !replaced.Fenced() {
+				t.Errorf("after %s refused a newer term, the store does not know it is fenced", how)
+			}
+			if err := replaced.Write([]byte("k"), []byte("after")); !errors.Is(err, ErrorFenced) {
+				t.Errorf("a fenced store took a write: %v", err)
+			}
+		})
+	}
+}
+
+// TestFencedSurvivesTheStoreBeingReopened. The term heard of goes on the disk,
+// which is what makes fencing a fence rather than a note in memory: a store that
+// forgot it over a restart would come back believing itself current and take
+// writes again.
+func TestFencedSurvivesTheStoreBeingReopened(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := OpenDB(dir, DBOptions{Sync: SyncNever})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.Since(DBPosition{Term: db.Term() + 1}, io.Discard, ReplicaOptions{}); !errors.Is(err, ErrorFenced) {
+		t.Fatalf("asking on a newer term: %v", err)
+	}
+	if !db.Fenced() {
+		t.Fatal("the store does not know it is fenced")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	again, err := OpenDB(dir, DBOptions{Sync: SyncNever})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer again.Close()
+
+	if !again.Fenced() {
+		t.Error("a fenced store came back from a restart believing itself current")
+	}
+
+	// And Promote is how it stops being fenced, which is somebody deciding it
+	// is the leader again rather than the store deciding for itself.
+	if _, err := again.Promote(); err != nil {
+		t.Fatal(err)
+	}
+	if again.Fenced() {
+		t.Error("a promoted store still says it is fenced")
+	}
+	if err := again.Write([]byte("k"), []byte("v")); err != nil {
+		t.Errorf("a promoted store refused a write: %v", err)
+	}
+}

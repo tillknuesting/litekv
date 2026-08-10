@@ -2,7 +2,9 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -410,4 +412,67 @@ func TestClosingTheServerStopsTheFollower(t *testing.T) {
 	if leader, replica := s.following(); replica {
 		t.Errorf("a closed server still says it follows %q", leader)
 	}
+}
+
+// TestAFencedLeaderSaysSo. A store that has been replaced still calls itself a
+// leader, still serves reads, and still reports a term — and every write it
+// takes is refused. Nothing about it looks wrong from outside, which is why the
+// status and the metrics have to say it outright.
+func TestAFencedLeaderSaysSo(t *testing.T) {
+	s, db := newServer(t, Options{})
+
+	read := func() statusBody {
+		t.Helper()
+
+		var body statusBody
+		if err := json.Unmarshal(wants(t, do(t, s, http.MethodGet, "/v1/status", nil),
+			http.StatusOK), &body); err != nil {
+			t.Fatalf("the status is not the status shape: %v", err)
+		}
+		return body
+	}
+
+	if read().Fenced {
+		t.Error("a store nobody has replaced reports itself fenced")
+	}
+
+	gauge := func() string {
+		t.Helper()
+
+		for _, line := range strings.Split(string(wants(t,
+			do(t, s, http.MethodGet, metricsPath, nil), http.StatusOK)), "\n") {
+			if strings.HasPrefix(line, "litekv_fenced ") {
+				return strings.TrimPrefix(line, "litekv_fenced ")
+			}
+		}
+		t.Fatal("there is no litekv_fenced in /metrics")
+		return ""
+	}
+
+	if got := gauge(); got != "0" {
+		t.Errorf("litekv_fenced is %s on a store nobody has replaced", got)
+	}
+
+	// Replaced: something on a newer term asks it for records, which is the only
+	// way this news ever reaches a leader.
+	if _, err := db.Since(litekv.DBPosition{Term: db.Term() + 1}, io.Discard,
+		litekv.ReplicaOptions{}); !errors.Is(err, litekv.ErrorFenced) {
+		t.Fatalf("asking on a newer term reported '%v', want fenced", err)
+	}
+
+	after := read()
+	if !after.Fenced {
+		t.Error("a fenced store does not say so in its status")
+	}
+	if after.Role != "leader" {
+		t.Errorf("a fenced store reports the role %q; it still calls itself a leader, "+
+			"which is exactly why fenced has to be its own field", after.Role)
+	}
+	if got := gauge(); got != "1" {
+		t.Errorf("litekv_fenced is %s on a store that has been replaced", got)
+	}
+
+	// And the behaviour the flag is describing: writes refused, reads served.
+	wants(t, do(t, s, http.MethodPut, "/v1/keys/k", strings.NewReader("v")), http.StatusConflict)
+	wants(t, do(t, s, http.MethodGet, "/v1/keys", nil), http.StatusOK)
 }

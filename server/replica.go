@@ -287,10 +287,16 @@ func (s *Server) streamReplica(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// A follower carrying a newer term is how a leader finds out it has been
-	// replaced, and it is the only way the news reaches one. Since writes that
-	// down and Follow does not, so it is asked here — it costs nothing, because
-	// a store that refuses on the term refuses before it reads a record. The
-	// asymmetry is in the engine; this stands in for it until it is not.
+	// replaced, and it is the only way the news reaches one.
+	//
+	// Follow records it now — that asymmetry with Since was an engine gap and is
+	// fixed — so this is not standing in for anything. What it is doing is
+	// deciding a status: everything answerable with one has to be answered
+	// before the first byte of the body, and a follower told 409 knows it is
+	// pointed at a store that has been replaced, where a stream that opened and
+	// then died says only that a connection ended. Asking for one batch both
+	// finds that out and writes the term down, which is why it is Since and not
+	// a look at the term alone.
 	if from.Term > s.db.Term() {
 		if _, noted := s.db.Since(from, io.Discard, litekv.ReplicaOptions{}); noted != nil {
 			s.log.Warn("a follower reported a newer term and it could not be written down",

@@ -1743,9 +1743,10 @@ anything either.
   That is consensus, and it is not here — see `AGENTS.md` for why an external lease is the pragmatic
   answer and why Raft for the data path would replace this work rather than sit on it.
 - **A fenced leader has to be told, and only replication tells it.** It cannot know it was replaced;
-  the news reaches it when something carrying a newer term asks it for records. Until then it goes on
-  taking writes, and those writes are lost when it finds out. Fencing bounds the damage, it does not
-  prevent it.
+  the news reaches it when something carrying a newer term asks it for records — either kind of asking,
+  `Since` or `Follow`. Until then it goes on taking writes, and those writes are lost when it finds out.
+  `DB.Fenced` and `/v1/status` report the state once it is known, which is not the same as knowing it
+  early. Fencing bounds the damage, it does not prevent it.
 - **A follower is a whole copy.** There is no partial replication, no filtering by key, and no way to
   follow one part of a store. The unit is the log.
 - **A replica costs the leader a copy.** Each batch is copied out of `Data` under the read lock before

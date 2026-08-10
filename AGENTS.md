@@ -1217,10 +1217,23 @@ also what a heartbeat would need, which is the other thing missing: a stream
 over a blackholed TCP connection is noticed by the OS keepalive in about fifteen
 minutes and by nothing else.
 
-**Two engine gaps this piece worked around rather than fixed**, both written up
-under "The server, and what its tests can and cannot say": `Follow` does not
-write down a newer term where `Since` does, and there is no exported way to ask
-a store whether it is fenced.
+**Two engine gaps this piece worked around are now fixed.** `Follow` writes down
+a newer term where before only `Since` did, and `DB.Fenced` is exported.
+
+The first was a real bug and not a tidiness complaint. Streaming and polling are
+two ways of asking a store for records, and only one of them told a replaced
+leader it had been replaced — so a leader with a follower attached, which is the
+ordinary arrangement and the one the server uses, went on taking writes after
+being superseded, and those writes are lost when it finds out.
+`TestFollowFencesALeaderTheWaySinceDoes` runs both calls through the same
+assertions for that reason: the answer to "who is the leader now" must not depend
+on which one was used.
+
+The handler still asks `Since` before it starts a stream, and that is no longer
+standing in for anything. Everything answerable with a status has to be answered
+before the first byte of the body, and a follower told 409 knows it is pointed at
+a store that has been replaced, where a stream that opened and then died says
+only that a connection ended.
 
 **The leader holds a whole snapshot in memory.** A snapshot frame carries a
 length in front of it, so the handler buffers the store's live records before it

@@ -242,4 +242,11 @@ MUTATIONS = [
     ("follower.go", "a follower does not say who it is",
      '\ttarget.RawQuery = url.Values{"from": {at}, "id": {f.id}}.Encode()',
      '\ttarget.RawQuery = url.Values{"from": {at}}.Encode()'),
+    ("role.go", "a fenced store does not say so in its status",
+     "\t\tFenced: s.db.Fenced(), Segments: s.db.Segments(), Keys: s.db.Len()}",
+     "\t\tSegments: s.db.Segments(), Keys: s.db.Len()}"),
+    ("ops.go", "the fenced gauge is always zero",
+     '\t\t\tboolean(s.db.Fenced())},', "\t\t\t0},"),
+    ("ops.go", "the fenced gauge is always one",
+     "\tif yes {\n\t\treturn 1\n\t}\n\treturn 0", "\t_ = yes\n\treturn 1"),
 ]

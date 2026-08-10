@@ -422,6 +422,22 @@ func (db *DB) Hold(pos DBPosition) (release func()) {
 	return db.hold(pos)
 }
 
+// Fenced reports whether this store has heard of a leader newer than itself, in
+// which case it has been replaced and is refusing writes.
+//
+// What it cannot tell you is whether this store is *about* to be replaced. A
+// store finds out it has been fenced when something carrying a newer term asks
+// it for records — a follower that has moved on, or the new leader itself — and
+// until that happens this returns false however long ago the promotion was. So
+// false means "nothing has told this store otherwise", not "this store is the
+// leader". Fencing bounds the damage; it does not prevent it, and this reports
+// the same thing.
+//
+// It is here so that something running a store can say which it is without
+// waiting for a write to be refused. Promote is how a store that has been
+// fenced becomes a leader again.
+func (db *DB) Fenced() bool { return db.isFencedLocked() }
+
 // isFencedLocked reports whether this store has been replaced, taking the lock
 // itself, for the callers that are not already holding it.
 func (db *DB) isFencedLocked() bool {
@@ -508,6 +524,21 @@ func (db *DB) Follow(pos DBPosition, holding func(), send func(batch []byte, nex
 			batch, next, err := db.batch(pos, opts.batchSize(), (*bufp)[:0])
 			*bufp = batch
 
+			if errors.Is(err, ErrorFenced) {
+				// Written down before it is reported, exactly as Since does.
+				// Streaming and polling are two ways of asking this store for
+				// records and the answer to "who is the leader now" cannot
+				// depend on which one was used: a store that reported the
+				// fencing without recording it would go on taking writes until
+				// somebody read the error, and those writes are lost when it
+				// finds out.
+				//
+				// This is the only way a leader learns it has been replaced.
+				// Nothing else tells it.
+				if noted := db.noteTerm(pos.Term); noted != nil {
+					return pos, noted
+				}
+			}
 			if err != nil {
 				return pos, err
 			}

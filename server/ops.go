@@ -259,6 +259,11 @@ func (s *Server) exposition(w http.ResponseWriter, r *http.Request) {
 		{"litekv_replication_followers", "Followers this leader can wait for.",
 			s.attached()},
 		{"litekv_term", "The term this store is on.", int(s.db.Term())},
+		// One when this store has heard of a newer leader. Nothing else about a
+		// fenced node looks wrong — it serves reads and reports a term — and
+		// every write it takes is refused, so this is the gauge to alert on.
+		{"litekv_fenced", "One when this store has been replaced by a newer leader.",
+			boolean(s.db.Fenced())},
 		{"litekv_store_keys", "Keys the store holds, tombstones included.", s.db.Len()},
 		{"litekv_store_segments", "Logs the store is spread across.", s.db.Segments()},
 	} {
@@ -303,4 +308,13 @@ func (s *Server) allowed(r *http.Request) bool {
 func unauthorized(w http.ResponseWriter) {
 	w.Header().Set("WWW-Authenticate", `Bearer realm="litekv"`)
 	writeError(w, http.StatusUnauthorized, "a bearer token is required")
+}
+
+// boolean is a gauge's version of a bool: Prometheus has numbers and nothing
+// else.
+func boolean(yes bool) int {
+	if yes {
+		return 1
+	}
+	return 0
 }
