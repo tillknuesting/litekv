@@ -30,6 +30,13 @@ import (
 
 // FollowerOptions configures a Follower. The zero value is usable.
 type FollowerOptions struct {
+	// Token is the bearer token this follower presents to the leader, for a
+	// leader started with one. Empty sends no Authorization header.
+	//
+	// The replication route is behind the token like everything else, and it is
+	// the route that matters most: it hands over the whole database.
+	Token string
+
 	// Client is the HTTP client to dial with. Nil means one of this package's
 	// own.
 	//
@@ -233,6 +240,9 @@ func (f *Follower) stream(ctx context.Context) error {
 		return err
 	}
 	req.Header.Set("Accept", contentTypeStream)
+	if f.opts.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+f.opts.Token)
+	}
 
 	resp, err := f.client.Do(req)
 	if err != nil {

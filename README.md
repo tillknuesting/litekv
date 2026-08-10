@@ -985,6 +985,10 @@ go run ./cmd/litekvd -dir /var/lib/litekv -addr 127.0.0.1:8080
 | `-max-scan`         | the most pairs a range answers with, and the most `?limit=` may ask for | 1000      |
 | `-queue`            | writes that may be waiting before a handler blocks               | 1024             |
 | `-leader`           | base URL of a leader to follow                                   | follow nobody    |
+| `-token-file`       | file holding a shared bearer token; empty means no auth           | none             |
+| `-read-timeout`     | how long a request has to arrive, headers and body                | 60s              |
+| `-write-timeout`    | how long a response has to be written (streams exempt)            | 60s              |
+| `-idle-timeout`     | how long an idle keep-alive connection is held                    | 120s             |
 | `-shutdown-timeout` | how long requests in flight get once it is asked to stop         | 10s              |
 
 `-sync` defaults to `always` because the library does: a binary that quietly weakened durability
@@ -1008,6 +1012,8 @@ owns a directory: the store is not multi-process safe and nothing checks, so a s
 | `POST`      | `/v1/batch`      | several records, all of them or none  | 204, 400, 413    |
 | `GET`       | `/v1/replica/stream?from=` | the records after a position, streamed | 200, 400, 409 |
 | `GET`       | `/v1/status`     | which of the two this node is         | 200              |
+| `GET`       | `/health`        | whether this node can serve           | 200, 503         |
+| `GET`       | `/metrics`       | Prometheus text                       | 200              |
 | `POST`      | `/v1/promote`    | stop following and raise the term     | 200              |
 
 A value is the body, raw. There is no JSON envelope around a caller's bytes and nothing is base64 on the
@@ -1290,6 +1296,62 @@ Without `Litekv-Wait` a replica that is behind answers 412 at once, with its own
 on `Await` and answers 504 if the time runs out — which says the wait was too short, not that the
 records are never coming. This is read-your-writes across a load balancer, and it hides the replication
 lag from the client that just wrote; it does not remove it.
+
+### Running it
+
+`GET /health` answers 200 while the store can serve and 503 once it is closing, and it asks the store
+the cheapest question that touches its state — no disk. **It is the one route a token does not cover**:
+a load balancer probing this node is not a client and has no business holding the secret that opens the
+database.
+
+`GET /metrics` is Prometheus text — a counter per route, method and status, a latency histogram per
+route, and the store's own numbers:
+
+```
+litekv_requests_total{route="/v1/keys/{key}",method="GET",status="200"} 41231
+litekv_request_duration_seconds_bucket{route="/v1/keys/{key}",le="0.001"} 41180
+litekv_role{role="leader",leader=""} 1
+litekv_term 1
+litekv_store_keys 812
+litekv_store_segments 3
+```
+
+The route label is the **pattern** and never the path. A label taken from the URL would be one series
+per key, and `/metrics` would grow with the store until it was the largest thing this server sends
+anybody. Every route is registered through one function so that it cannot be forgotten, and
+`TestEveryRouteIsCounted` holds it there.
+
+Requests are logged at Debug, so turning request logging on is a level rather than a flag. A server
+logging every request at Info is a server whose log nobody reads, and the failures that matter log
+themselves already.
+
+### Keeping strangers out
+
+`-token-file` names a file holding a shared secret that every request must carry as
+`Authorization: Bearer <token>`. A file and not a flag value, because an argument is visible in `ps` to
+every process on the machine. The same token authenticates this node to its `-leader`.
+
+It covers everything except `/health` — **replication included**, which is the route that matters most,
+since it hands the whole database to whoever asks. The comparison is constant time: one that stopped at
+the first wrong byte would tell a caller how much of the token it had right, and a few thousand requests
+turn that into all of it.
+
+This is a shared secret and nothing else. There are no users, no scopes, and no read-only credential:
+anything that can read can also write. It is not a substitute for TLS, which is still not here.
+
+### Timeouts, and the one route exempt from them
+
+Without timeouts a client that opens a connection and sends a byte an hour holds a handler for as long
+as it likes, and enough of them are the whole server. `litekvd` sets a 10s header timeout and the three
+above.
+
+`-write-timeout` bounds how long a response may take to write, and there is exactly one response here
+that is meant to still be being written next week: the replication stream. Rather than go without the
+timeout because of that route, **the route takes its own deadline off** — one call to
+`http.ResponseController`. `TestAStreamTakesItsWriteDeadlineOff` runs a real follower over a listener
+with a 150ms write timeout and counts connections rather than records, because a stream cut by a
+deadline is one the follower reconnects to and the records arrive either way. One connection is the
+assertion; two means the deadline cut it.
 
 ## Concurrency
 

@@ -33,6 +33,7 @@ package server
 import (
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -83,8 +84,22 @@ type Options struct {
 	// held while it is written.
 	Queue int
 
+	// Token, if set, is a shared secret every request must carry as
+	// `Authorization: Bearer <token>`. Empty means no authentication at all,
+	// which is what listening on loopback is for.
+	//
+	// It guards every route but /health, replication included — that one ships
+	// the whole database to whoever asks, so it is the last thing to leave
+	// open. /health is exempt because a load balancer probing it is not a
+	// client and has no business holding the secret.
+	//
+	// This is a shared secret and nothing more. There are no users, no scopes
+	// and no read-only credential: anything that can read can also write.
+	Token string
+
 	// Logger is where a request that failed for a reason the client is not told
-	// gets written down. Nil means slog.Default().
+	// gets written down, and where every request is written at Debug. Nil means
+	// slog.Default().
 	Logger *slog.Logger
 }
 
@@ -116,6 +131,9 @@ type Server struct {
 	// it. See role.go: the store cannot answer that question, because the thing
 	// pulling the records is up here.
 	role role
+
+	// metrics is what this server knows about itself. See ops.go.
+	metrics *metrics
 }
 
 // writes is the calls a handler makes to store something. A *litekv.DB
@@ -171,38 +189,62 @@ func New(db *litekv.DB, opts Options) *Server {
 		writes:  writer,
 		writer:  writer,
 		streams: make(chan struct{}),
+		metrics: newMetrics(),
 	}
 
 	// GET also matches HEAD, which is what makes asking for a value's size
 	// without fetching it free. The mux answers a path it knows with a method
 	// it does not with 405 and an Allow header of its own accord.
-	s.mux.HandleFunc("GET /v1/keys/{key}", s.readKey)
-	s.mux.HandleFunc("PUT /v1/keys/{key}", s.writeKey)
-	s.mux.HandleFunc("DELETE /v1/keys/{key}", s.deleteKey)
+	s.handle("GET /v1/keys/{key}", s.readKey)
+	s.handle("PUT /v1/keys/{key}", s.writeKey)
+	s.handle("DELETE /v1/keys/{key}", s.deleteKey)
 
 	// Several at once, and ranges. /v1/keys is the exact path and does not
 	// collide with /v1/keys/{key} above it: a pattern without a trailing slash
 	// matches that path and nothing under it, and a wildcard will not match an
 	// empty segment, so /v1/keys/ is still nothing at all.
 	// TestScanDoesNotCollideWithOneKey holds all three of those.
-	s.mux.HandleFunc("POST /v1/batch", s.writeBatch)
-	s.mux.HandleFunc("GET /v1/keys", s.scanKeys)
+	s.handle("POST /v1/batch", s.writeBatch)
+	s.handle("GET /v1/keys", s.scanKeys)
 
 	// Replication rides this listener rather than one of its own. One port to
 	// open, one thing to shut down, one place for authentication to go when
 	// there is any, and it goes through whatever proxy or load balancer a read
 	// replica is already behind — a second raw TCP listener would have needed
 	// every one of those again.
-	s.mux.HandleFunc("GET "+replicaPath, s.streamReplica)
+	s.handle("GET "+replicaPath, s.streamReplica)
 
 	// Which of the two this node is, and the one call that changes it.
-	s.mux.HandleFunc("GET /v1/status", s.status)
-	s.mux.HandleFunc("POST /v1/promote", s.promote)
+	s.handle("GET /v1/status", s.status)
+	s.handle("POST /v1/promote", s.promote)
+
+	// What somebody running this asks it. See ops.go for why /health is the one
+	// route the token does not cover.
+	s.handle("GET "+healthPath, s.health)
+	s.handle("GET "+metricsPath, s.exposition)
 
 	return s
 }
 
+// handle registers one route, counted and timed under the pattern it is
+// registered with. Everything goes through here: a route registered straight on
+// the mux is a route missing from /metrics, and nothing would say so.
+func (s *Server) handle(pattern string, h http.HandlerFunc) {
+	route := pattern
+	if _, path, found := strings.Cut(pattern, " "); found {
+		route = path
+	}
+	s.mux.HandleFunc(pattern, s.instrument(route, h))
+}
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Before the mux, so that a route this server does not have is refused on
+	// the token rather than telling a stranger which routes exist.
+	if !s.allowed(r) {
+		unauthorized(w)
+		return
+	}
+
 	s.mux.ServeHTTP(w, r)
 }
 

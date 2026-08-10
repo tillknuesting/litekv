@@ -93,13 +93,24 @@ def run(pool, path, name, old, new):
 
         # -count=1 because the mutated tree is otherwise a cache hit away from
         # reporting the unmutated result.
-        test = subprocess.run(["go", "test", "-count=1", "./server/"], cwd=where,
-                              capture_output=True, text=True, errors="replace")
+        # -timeout, because go test defaults to ten minutes and a mutation that
+        # deadlocks the suite would spend all of it. A mutated tree that hangs
+        # is a caught mutation; the real suite takes three seconds, so ninety
+        # is room to spare and a two-order-of-magnitude saving on the one
+        # mutation that wedges something.
+        test = subprocess.run(["go", "test", "-count=1", "-timeout", "90s", "./server/"],
+                              cwd=where, capture_output=True, text=True, errors="replace")
         if test.returncode == 0:
             return "SURVIVED"
 
-        caught = [l.split()[2] for l in test.stdout.splitlines()
-                  if l.startswith("--- FAIL")]
+        # Stripped, because a subtest's FAIL line is indented under its parent
+        # and an unstripped prefix check reports "failed without naming a test"
+        # for every mutation that only a t.Run caught.
+        caught = []
+        for line in test.stdout.splitlines():
+            fields = line.strip().split()
+            if len(fields) >= 3 and fields[0] == "---" and fields[1] == "FAIL:":
+                caught.append(fields[2])
         if not caught:
             # Failed without naming a test: a panic, or a build failure of the
             # test binary that vet did not see. Caught, but say so.

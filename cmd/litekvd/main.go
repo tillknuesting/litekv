@@ -34,6 +34,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -68,6 +69,17 @@ func run() error {
 		leader = flag.String("leader", "",
 			"base URL of a leader to follow, such as http://10.0.0.2:8080. Its records are applied to this\n"+
 				"store as they are written. Empty follows nobody, which is what a leader does")
+		tokenFile = flag.String("token-file", "",
+			"file holding a shared secret every request must carry as `Authorization: Bearer <token>`.\n"+
+				"A file and not a flag value: an argument is visible in ps to every process on the machine.\n"+
+				"The same token authenticates this node to -leader. Empty means no authentication at all")
+		readTimeout = flag.Duration("read-timeout", 60*time.Second,
+			"how long a request has to arrive, headers and body. Raise it if a large -max-batch has to\n"+
+				"cross a slow link; 0 turns it off")
+		idleTimeout  = flag.Duration("idle-timeout", 120*time.Second, "how long an idle keep-alive connection is held open")
+		writeTimeout = flag.Duration("write-timeout", 60*time.Second,
+			"how long a response has to be written. Replication streams are exempt and set no deadline,\n"+
+				"since a stream is a response meant to still be going next week; 0 turns it off")
 		shutdown = flag.Duration("shutdown-timeout", 10*time.Second, "how long requests in flight get once the server is asked to stop")
 	)
 	flag.Parse()
@@ -78,6 +90,11 @@ func run() error {
 	}
 
 	policy, err := syncPolicy(*syncing)
+	if err != nil {
+		return err
+	}
+
+	token, err := tokenFrom(*tokenFile)
 	if err != nil {
 		return err
 	}
@@ -115,6 +132,7 @@ func run() error {
 		MaxBatch: *maxBatch,
 		MaxScan:  *maxScan,
 		Queue:    *queue,
+		Token:    token,
 		Logger:   log,
 	})
 	defer api.Close()
@@ -125,12 +143,29 @@ func run() error {
 	// while it is following diverges from its leader for good. api.Close stops
 	// it, in the right order, which is why there is no second defer here.
 	if *leader != "" {
-		if err := api.Follow(*leader, server.FollowerOptions{Logger: log}); err != nil {
+		if err := api.Follow(*leader, server.FollowerOptions{Token: token, Logger: log}); err != nil {
 			return err
 		}
 	}
 
-	srv := &http.Server{Handler: api}
+	srv := &http.Server{
+		Handler: api,
+
+		// Without these a client that opens a connection and sends a byte an
+		// hour holds a handler for as long as it likes, and enough of them are
+		// the whole server. ReadHeaderTimeout is the one that stops that, and
+		// it is short because a request line and its headers are small however
+		// slow the link.
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       *readTimeout,
+		IdleTimeout:       *idleTimeout,
+
+		// WriteTimeout is a bound on how long a response may take to write, and
+		// a replication stream is a response meant to be still being written
+		// next week. Rather than go without the timeout because of that one
+		// route, the route takes its own deadline off — see streamReplica.
+		WriteTimeout: *writeTimeout,
+	}
 
 	// A replication stream is a request that never finishes on its own, and
 	// Shutdown waits for every request rather than cancelling any of them. Left
@@ -146,7 +181,13 @@ func run() error {
 	go func() { serving <- srv.Serve(listener) }()
 
 	log.Info("serving", "addr", listener.Addr().String(), "dir", *dir,
-		"sync", *syncing, "keys", db.Len(), "logs", db.Segments(), "leader", *leader)
+		"sync", *syncing, "keys", db.Len(), "logs", db.Segments(), "leader", *leader,
+		"authenticated", token != "")
+
+	if token == "" && !strings.HasPrefix(*addr, "127.0.0.1:") && !strings.HasPrefix(*addr, "localhost:") {
+		log.Warn("listening off loopback with no -token-file; anything that can reach this address "+
+			"can read and write the whole store", "addr", listener.Addr().String())
+	}
 
 	select {
 	case err := <-serving:
@@ -176,6 +217,30 @@ func run() error {
 		}
 		return db.Close()
 	}
+}
+
+// tokenFrom reads the shared secret out of a file.
+//
+// A file rather than a flag value because an argument is visible in ps to every
+// process on the machine, and a secret that every process can read is not one.
+// Trailing whitespace is trimmed, since a token in a file almost always arrived
+// with a newline on the end and a token that fails for that reason is an
+// afternoon nobody gets back.
+func tokenFrom(path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("reading the token: %w", err)
+	}
+
+	token := strings.TrimSpace(string(raw))
+	if token == "" {
+		return "", fmt.Errorf("the token in %s is empty", path)
+	}
+	return token, nil
 }
 
 func syncPolicy(name string) (litekv.SyncPolicy, error) {

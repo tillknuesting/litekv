@@ -61,6 +61,8 @@ And outside the engine, in packages of their own:
 | `server/scan.go`     | `GET /v1/keys`: ranges and prefixes, the query, and the limits     |
 | `server/errors.go`   | which store error is which status, and what a client is not told   |
 | `server/role.go`     | leader or replica, promotion, status, and reads that are not stale |
+| `server/ops.go`      | health, metrics, request logging, and the bearer token             |
+| `tools/mutate.py`    | the mutation sweep, and `tools/mutations.py` is what it breaks      |
 | `server/replica.go`  | the frames, the position on the wire, and the leader's stream       |
 | `server/follower.go` | the other end of it: dial, apply, reconnect                         |
 | `cmd/litekvd/main.go`| flags, the listener, signals, and the order things shut down in    |
@@ -1012,6 +1014,23 @@ every route that stores something: `TestAReplicaRefusesEveryWrite` runs all
 three, because a batch aimed at a replica is the same mistake as a `PUT` and a
 longer one.
 
+**A test that hangs when it fails is worse than one that fails.** The token
+test asks every route for a 401, and one of those routes is the replication
+stream: with the check removed it does not answer, it starts streaming, and the
+suite sat for the full timeout instead of naming the route that was open. That
+request goes on a two-second context now. The same shape bit the write-deadline
+test, where `defer wire.Close()` waited on a stream whose follower had not been
+stopped yet — a defer runs before every `t.Cleanup`, so the ordering `serving()`
+uses is the ordering to copy: store, listener, server, and the follower's own
+cleanup last-registered so it runs first.
+
+**"The record arrived" is not the same claim as "the stream stayed up."** A
+stream cut by a write deadline is one the follower reconnects to, and everything
+arrives either way, a little later. `TestAStreamTakesItsWriteDeadlineOff` counts
+connections for that reason: one is the assertion, and two means the deadline
+cut it and the reconnect hid it. Anything asserting that replication works has
+to be asked which of the two it is actually testing.
+
 **The shutdown order is four things now and only one of them is obvious.** Stop
 taking requests, stop the follower, close the `Server`, close the store. The
 `Server` step exists because a handler blocked on the queue is holding a request
@@ -1124,7 +1143,7 @@ now done, so the list has become the server, in six pieces:
 | 3 | several at once, and ranges              | done  |
 | 4 | replication over the wire                | done  |
 | 5 | two roles, and reads that are not stale  | done  |
-| 6 | operations, and writing it down          |       |
+| 6 | operations, and writing it down          | done  |
 
 Piece 4 was the one the rest of the engine was waiting on, and it is done: there
 is now a connection for a leader to hang something off, which is what
@@ -1141,9 +1160,11 @@ node started with `-leader` still serves `PUT` and `DELETE`, and a write to it
 goes into its own active log while `applied` stays where the leader put it. The
 next batch is accepted — `Apply` compares `from` against `applied`, and
 `applied` did not move — so the leader's records land on top of the local ones
-and the two stores disagree with nothing reporting it. `litekvd` warns at
-startup and that is all it does. Piece 5 refusing writes on a node that is
-following is what closes this, and it is not a small hole.
+and the two stores disagree with nothing reporting it. `litekvd` warned at
+startup and that was all it did. Piece 5 closed it — `role.go`, and a check on
+every route that stores anything — and this paragraph is kept because the shape
+of the hole is worth knowing: it is what a store does when nothing tells it
+which of the two it is.
 
 **A leader keeps no list of followers, on purpose and only for now.** The
 handler holds one connection and knows nothing about any other. Semi-synchronous

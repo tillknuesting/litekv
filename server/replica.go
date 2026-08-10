@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"slices"
+	"time"
 
 	"github.com/tillknuesting/litekv"
 )
@@ -209,6 +210,19 @@ func (s *Server) streamReplica(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		s.fail(w, r, errNoFlusher)
 		return
+	}
+
+	// And this stream keeps no write deadline. A server wants one — without it
+	// a client that stops reading holds a handler for as long as it likes — but
+	// a deadline is a bound on how long a response may take to write, and this
+	// response is meant to still be being written next week. It is the one route
+	// where the number is wrong, so it is the one route that takes it off,
+	// rather than the server going without because of it.
+	//
+	// A failure here is not fatal: it means the writer has no deadline to set,
+	// which is the state this wants anyway.
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Time{}); err != nil {
+		s.log.Debug("a replication stream could not clear its write deadline", "err", err)
 	}
 
 	select {
