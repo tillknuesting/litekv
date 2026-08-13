@@ -57,7 +57,8 @@ And beside it:
 
 | file            | owns                                                            |
 | --------------- | --------------------------------------------------------------- |
-| `tools/mutate/` | the mutation sweep, and `mutations.go` beside it is what it breaks |
+| `mutate/`       | the mutation sweep's machinery, exported because the daemon runs it too |
+| `tools/mutate/` | this repository's own list of what to break, and its timeout       |
 
 The HTTP server, the replication endpoint and the `litekvd` binary used to be
 `server/` and `cmd/` here. They are
@@ -1123,11 +1124,17 @@ here would break the daemon, the daemon's own suite is where that shows up, and
 it is a separate `go test` in a separate checkout — there is no single command
 that runs both. Tag a release here before expecting the daemon to see a change.
 
-**The mutation sweep is in both repositories and they are not the same sweep.**
-This one has the eight for the directory lock and runs the engine's suite at ten
-minutes a mutation; the daemon's has a hundred and nine and runs its own at
-ninety seconds. The runner is duplicated, deliberately — a shared tool would be
-a third module for four hundred lines that change about once a year.
+**The mutation sweep runs in both repositories and the machinery is in this
+one.** `mutate/` is the runner and it is exported, because the daemon needs it
+and neither repository should hold a copy of it. Each side owns only what is
+actually its own: its list of what to break, and the timeout its suite needs —
+eight mutations at ten minutes here, a hundred and nine at ninety seconds there.
+
+That the runner is a public package of a storage engine is a wart, and it is the
+smaller of two. A separate module for it would be this module's first dependency
+outside the standard library, and "no dependencies" is a claim the README makes
+in its first paragraph. It is a development tool: nothing in the engine imports
+it, and nothing that imports the engine gets it.
 
 ## What to build next, and what it needs
 

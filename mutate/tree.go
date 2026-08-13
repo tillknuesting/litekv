@@ -1,4 +1,4 @@
-package main
+package mutate
 
 import (
 	"errors"
@@ -124,23 +124,13 @@ func copyFile(from, to string, perm os.FileMode) error {
 	return target.Close()
 }
 
-// suiteTimeout is how long a mutated tree gets before its tests are killed.
-//
-// This suite takes about forty-five seconds under -race, so ten minutes is room
-// to spare on a machine running eight of them at once. Raising it is cheap;
-// lowering it below what the suite honestly needs is the worst thing that can be
-// done to this tool, because a test binary killed by the deadline exits non-zero
-// exactly like a failing one — every mutation would report caught and the sweep
-// would be testing nothing.
-const suiteTimeout = "600s"
-
 // locate is the file to break and the package to run it in.
 //
-// A path relative to the repository root, always: "db.go". It used to take a
-// bare name as meaning server/ and a slash as meaning the root, which saved
-// some typing and cost a rule nobody could keep in their head — and a sweep
-// that breaks a file nobody meant to break is the failure this whole tool
-// exists to avoid.
+// A path relative to the repository root, always: "db.go", "server/keys.go". It
+// used to take a bare name as meaning one directory and a slash as meaning the
+// root, which saved some typing and cost a rule nobody could keep in their head
+// — and a sweep that breaks a file nobody meant to break is the failure this
+// whole tool exists to avoid.
 func locate(where, path string) (full, pkg string) {
 	clean := filepath.Clean(path)
 
