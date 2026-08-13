@@ -65,7 +65,7 @@ And outside the engine, in packages of their own:
 | `server/role.go`     | leader or replica, promotion, status, and reads that are not stale |
 | `server/ops.go`      | health, metrics, request logging, and the bearer token             |
 | `server/acks.go`     | who is following, how far each has got, and what a write waits for |
-| `tools/mutate.py`    | the mutation sweep, and `tools/mutations.py` is what it breaks      |
+| `tools/mutate/`      | the mutation sweep, and `mutations.go` beside it is what it breaks   |
 | `server/replica.go`  | the frames, the position on the wire, and the leader's stream       |
 | `server/follower.go` | the other end of it: dial, apply, reconnect                         |
 | `cmd/litekvd/main.go`| flags, the listener, signals, and the order things shut down in    |
@@ -98,13 +98,13 @@ The `^...$` matters: `-fuzz FuzzApply` now matches `FuzzApplySnapshot` too, and
 the go tool refuses to run rather than choosing.
 
 Anything touching `server/` also gets mutation tested and driven end to end.
-`tools/mutate.py` is the sweep — a hundred and seventeen mutations, eight
-workers, and it prints each verdict as it lands rather than at the end:
+`tools/mutate` is the sweep — a hundred and seventeen mutations, eight workers,
+and it prints each verdict as it lands rather than at the end:
 
 ```bash
-python3 tools/mutate.py                 # all of them
-python3 tools/mutate.py replica batch   # only those whose name matches
-python3 tools/mutate.py lock            # the eight for the directory lock
+go run ./tools/mutate                 # all of them
+go run ./tools/mutate replica batch   # only those whose name matches
+go run ./tools/mutate lock            # the eight for the directory lock
 ```
 
 Most of them are server mutations, named by a bare file — `keys.go` means
@@ -119,9 +119,15 @@ tests nothing. `locate` sets 90s for the server and 600s for the engine, and a
 deadline that fires is reported as itself unless the dump names a test it hung.
 
 It used to be an ad-hoc script in a scratch directory, rewritten from memory
-each time, which is how two of the traps below were discovered twice. The
-mutations themselves are in `tools/mutations.py`; adding one is four lines and
-is part of writing the code, not a thing to come back to.
+each time, which is how two of the traps below were discovered twice. Then it
+was Python, which is how the repository came to have two languages in it for one
+tool. The mutations themselves are in `tools/mutate/mutations.go`; adding one is
+six lines and is part of writing the code, not a thing to come back to.
+
+Being Go, it is checked by everything above — `gofmt`, `go vet` and `go build
+./...` cover it, so a tool that no longer compiles is caught by the same command
+that catches a store that no longer compiles, rather than by somebody running a
+sweep three weeks later.
 
 The end-to-end run matters separately, because a handler test builds its own
 request and the interesting question is often whether a request can be built at
