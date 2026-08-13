@@ -38,6 +38,25 @@ type fileSystem interface {
 
 	// MkdirAll creates a directory and its parents.
 	MkdirAll(name string, perm os.FileMode) error
+
+	// Lock takes an exclusive lock on the file at name, creating it if it is
+	// not there. It does not wait for a lock somebody else holds: it reports
+	// ErrorLocked and leaves.
+	//
+	// The lock is released by Unlock, and by the process ending however it
+	// ends — including a kill, a panic and losing the machine. That is the
+	// whole reason it is a lock rather than a file that is created and
+	// deleted: a store that will not open after a crash until somebody logs in
+	// and removes something is worse than the corruption it was meant to
+	// prevent.
+	Lock(name string) (diskLock, error)
+}
+
+// diskLock is a lock somebody is holding on a file.
+type diskLock interface {
+	// Unlock releases it. Releasing one twice is the caller's mistake and not
+	// something this reports.
+	Unlock() error
 }
 
 // diskFile is the part of *os.File this package uses. Nothing here needs a real
@@ -75,3 +94,9 @@ func (osDisk) ReadDir(name string) ([]os.DirEntry, error) { return os.ReadDir(na
 func (osDisk) ReadFile(name string) ([]byte, error) { return os.ReadFile(name) }
 
 func (osDisk) MkdirAll(name string, perm os.FileMode) error { return os.MkdirAll(name, perm) }
+
+// Lock is the one operation here that needs a real file rather than a diskFile:
+// an advisory lock is taken on a descriptor and diskFile has none, since nothing
+// else in this package wants one. So the platform half lives in lock_unix.go and
+// its neighbours, and this seam is where a test gets in.
+func (osDisk) Lock(name string) (diskLock, error) { return lockFile(name) }

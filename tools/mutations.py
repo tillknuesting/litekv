@@ -267,4 +267,44 @@ MUTATIONS = [
     ("follower.go", "a heartbeat may carry a payload",
      "\t\t\tif length != 0 {\n\t\t\t\treturn fmt.Errorf(\"a heartbeat carrying %d bytes\", length)\n\t\t\t}",
      "\t\t\t_ = length"),
+    # --- one process owns a directory ---------------------------------------
+    # Engine files, named with a leading ./ — see locate() in mutate.py. These
+    # run the engine's suite, which is fifteen times the server's, so a sweep
+    # that includes them is minutes rather than seconds.
+    ("./lock_flock.go", "the lock is shared rather than exclusive",
+     "syscall.LOCK_EX|syscall.LOCK_NB", "syscall.LOCK_SH|syscall.LOCK_NB"),
+    ("./db.go", "the lock is taken after the directory has been read",
+     "\tlock, err := disk.Lock(filepath.Join(dir, lockName))\n\tif err != nil {\n\t\treturn nil, err\n\t}",
+     "\tif _, err := segmentIDs(dir); err != nil {\n\t\treturn nil, err\n\t}\n\tlock, err := disk.Lock(filepath.Join(dir, lockName))\n\tif err != nil {\n\t\treturn nil, err\n\t}"),
+    ("./db.go", "an open that fails keeps the lock",
+     "\tdb, err := openLocked(dir, opts, lock)\n\tif err != nil {\n\t\tlock.Unlock()\n\t\treturn nil, err\n\t}",
+     "\tdb, err := openLocked(dir, opts, lock)\n\tif err != nil {\n\t\treturn nil, err\n\t}"),
+    ("./db.go", "Close lets go of the lock before it closes the logs",
+     "\terr := db.closeSegments()\n",
+     "\tif uerr := db.lock.Unlock(); uerr != nil {\n\t\treturn uerr\n\t}\n\terr := db.closeSegments()\n"),
+    ("./db.go", "Close never lets go of the lock",
+     "\tif uerr := db.lock.Unlock(); err == nil {\n\t\terr = uerr\n\t}",
+     "\t_ = db.lock"),
+    # Both filters, not one. LOCK is turned away twice over — it has no .seg
+    # suffix and its name is not a number — and removing either alone changes
+    # nothing, which is two checks hiding each other in the way AGENTS.md
+    # describes for latestOffsets. The mutation has to take both.
+    ("./db.go", "the lock file is counted as a log",
+     "\t\tif entry.IsDir() || !strings.HasSuffix(name, segmentSuffix) {\n\t\t\tcontinue\n\t\t}\n\t\tid, err := strconv.ParseUint(strings.TrimSuffix(name, segmentSuffix), 10, 64)\n\t\tif err != nil {\n\t\t\tcontinue // not ours\n\t\t}",
+     "\t\tif entry.IsDir() {\n\t\t\tcontinue\n\t\t}\n\t\tid, _ := strconv.ParseUint(strings.TrimSuffix(name, segmentSuffix), 10, 64)"),
+    # The errors.Is call is left standing and only its result widened: taking
+    # the call out leaves "errors" imported and not used, which is a mutation
+    # that does not build and therefore never ran. See the mutation traps in
+    # AGENTS.md.
+    ("./lock_flock.go", "any failure to lock is reported as somebody else holding it",
+     "\treturn errors.Is(err, syscall.EWOULDBLOCK)\n",
+     "\treturn errors.Is(err, syscall.EWOULDBLOCK) || true\n"),
+    ("./lock_flock.go", "the lock is taken but waited for rather than refused",
+     "syscall.LOCK_EX|syscall.LOCK_NB", "syscall.LOCK_EX"),
+    # There is deliberately no mutation for dropping the explicit LOCK_UN from
+    # Unlock. Closing the descriptor releases the lock by itself, so a version
+    # without it behaves identically — an equivalent mutant, not a mutation,
+    # and one that would sit in the survivor list forever implying a missing
+    # test. The explicit call is there for the ordering, which
+    # TestTheLockIsReleasedAfterTheLastLogIsClosed checks through the seam.
 ]

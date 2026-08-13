@@ -80,6 +80,10 @@ type DB struct {
 	// log's own channel, because rotation replaces the log. See dbreplica.go.
 	waiters atomic.Pointer[chan struct{}]
 
+	// lock is this process's claim on the directory, held from OpenDB until
+	// Close. See lockName.
+	lock diskLock
+
 	// mergeMu lets only one merge run at a time. Two at once would build the
 	// same file under the same temporary name and rename it out from under
 	// each other. It is taken before db.mu, never the other way round.
@@ -153,7 +157,25 @@ const (
 
 	segmentSuffix = ".seg"
 	mergeSuffix   = ".merging"
+
+	// lockName is the file whose lock says who owns this directory. It is
+	// never removed, by Close or by anything else: removing it is what turns
+	// one lock into two. Process B opens the file and takes the lock, A
+	// removes the file it was holding, C creates a fresh one and takes a lock
+	// on that, and now B and C each hold a lock on a different file with the
+	// same name and each believes it is alone.
+	//
+	// Nothing sweeps it either. segmentIDs takes only names ending in .seg,
+	// removeStaleMerges only .merging and orphaned .hint, and the reset in
+	// ApplySnapshot only .seg and .hint — so LOCK falls through all three
+	// without needing to be named in any of them.
+	lockName = "LOCK"
 )
+
+// ErrorLocked is returned by OpenDB when another process has the directory
+// open. See the Limitations section of the README for what the lock does and
+// does not cover.
+const ErrorLocked = Error("store directory is open in another process")
 
 func (o DBOptions) segmentSize() int64 {
 	if o.SegmentSize <= 0 {
@@ -267,6 +289,13 @@ func (db *DB) pickMerge() (victims []*diskSegment, dropTombstones, ok bool) {
 // OpenDB opens the DB in dir, creating the directory if it does not exist.
 // Close it when finished.
 //
+// One process may have a directory open at a time, and this is what enforces
+// it: a second OpenDB reports ErrorLocked rather than writing over the first
+// one's logs. The lock is held until Close, and released by the process ending
+// however it ends, so a crash never leaves a directory that will not open.
+// Windows and a few other platforms cannot take the lock, and open without one
+// — see lock_none.go, and the Limitations section of the README.
+//
 // Every log in the directory is read and indexed. A crash can leave the active
 // one with a record half written, which is recovered exactly as for a single
 // store, and can leave a half built merge behind, which is discarded.
@@ -275,13 +304,39 @@ func OpenDB(dir string, opts DBOptions) (*DB, error) {
 		return nil, err
 	}
 
+	// Before the directory is so much as listed, and long before anything in
+	// it is written. What the lock is worth depends on it being taken before
+	// the first thing that could collide, not merely before the first write:
+	// two opens that both read a directory and then find out about each other
+	// have already both decided which log to carry on writing to.
+	lock, err := disk.Lock(filepath.Join(dir, lockName))
+	if err != nil {
+		return nil, err
+	}
+
+	// An open that fails gives the lock back, because there is nobody to give
+	// it back later: OpenDB returned no DB to call Close on, and a process that
+	// held the lock for a store it could not open would keep the directory shut
+	// against its own next attempt. TestAFailedOpenLetsGoOfTheLock is the case;
+	// TestShortReadWhileIndexing and the chaos runs reopen after a failed open
+	// and would be refused here without it.
+	db, err := openLocked(dir, opts, lock)
+	if err != nil {
+		lock.Unlock()
+		return nil, err
+	}
+	return db, nil
+}
+
+// openLocked is the whole of opening, with the directory already locked.
+func openLocked(dir string, opts DBOptions, lock diskLock) (*DB, error) {
 	ids, err := segmentIDs(dir)
 	if err != nil {
 		return nil, err
 	}
 
 	term, seen, applied := readReplicaState(dir)
-	db := &DB{dir: dir, opts: opts, term: term, seen: seen, applied: applied}
+	db := &DB{dir: dir, opts: opts, term: term, seen: seen, applied: applied, lock: lock}
 
 	// An interrupted merge leaves its half built file behind. The logs it was
 	// merging are all still there, so it can simply go.
@@ -1148,9 +1203,13 @@ func (db *DB) Sync() error {
 	return err
 }
 
-// Close waits for a running merge and closes every log. A closed DB refuses
-// everything: the values of its frozen logs are on the disk, and their files
-// are shut. Len and Segments still report what it was holding.
+// Close waits for a running merge, closes every log and lets go of the
+// directory. A closed DB refuses everything: the values of its frozen logs are
+// on the disk, and their files are shut. Len and Segments still report what it
+// was holding.
+//
+// Closing twice is not an error and does not release the lock twice: the second
+// call sees the store already closed and leaves.
 func (db *DB) Close() error {
 	db.mu.Lock()
 	if db.closed {
@@ -1168,7 +1227,18 @@ func (db *DB) Close() error {
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	return db.closeSegments()
+
+	err := db.closeSegments()
+
+	// After every log and not before. Until the last one is synced and shut
+	// this process is still writing to the directory, and a lock let go early
+	// is a second process opening a store the first has not finished putting
+	// down — which is the whole failure this is here to prevent, arrived at
+	// through the door marked exit.
+	if uerr := db.lock.Unlock(); err == nil {
+		err = uerr
+	}
+	return err
 }
 
 // closeSegments closes every log, returning the first error. Callers must hold

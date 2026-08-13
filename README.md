@@ -312,6 +312,31 @@ to oldest, stopping at the first answer. That is what makes a record in a newer 
 and a tombstone in a newer log shadow a value in an older one. Merging keeps the number of logs small, so
 a lookup does not have many to ask.
 
+### One process owns the directory
+
+`OpenDB` takes an exclusive lock on a `LOCK` file in the directory and holds it until `Close`. A second
+process opening the same directory gets `ErrorLocked` — `store directory is open in another process` —
+instead of quietly writing over the first one's active log, which is what used to happen and which
+announced itself, days later, as a checksum that did not match.
+
+```go
+db, err := litekv.OpenDB("data", litekv.DBOptions{})
+if errors.Is(err, litekv.ErrorLocked) {
+    // something else has this directory; find it rather than waiting for it
+}
+```
+
+It is a lock the kernel holds, not a file that is created and deleted, and the difference is what
+happens after a crash. A `LOCK` file with a pid in it survives the process that wrote it, so a machine
+that lost power comes back with a store that refuses to open until somebody logs in and removes
+something — the crash the rest of this package is built to survive turned into one that needs a human.
+A lock on a descriptor is dropped when the process ends however it ends, so there is nothing to clean up
+and nothing to remember. The file itself stays where it is: deleting it is how one lock becomes two.
+
+The lock is advisory and local. It excludes anything that asks for the same lock, which means another
+litekv and nothing else, and it does not cross machines on a network filesystem. Windows and a few
+other platforms cannot take it at all and open without it; see Limitations.
+
 ### Only the keys have to fit in memory
 
 A frozen log holds nothing but its index. Its records stay on the disk and are read back when a key asks
@@ -1002,8 +1027,11 @@ and the one to reach for.
 
 It listens on loopback unless told otherwise. There is no authentication and no TLS here yet, so put it
 behind a proxy or on a private network before giving it an address a stranger can reach. One `litekvd`
-owns a directory: the store is not multi-process safe and nothing checks, so a second one on the same
-`-dir` writes over the first one's log.
+owns a directory, and the store enforces it: a second one on the same `-dir` fails to start with
+`store directory is open in another process` rather than writing over the first one's log. The claim
+is a lock held for as long as the process lives, so a machine that lost power comes back and starts
+normally — there is nothing to clean up by hand. See Limitations for the platforms that cannot take
+it.
 
 ### The routes
 
@@ -1794,9 +1822,18 @@ anything either.
 - **A replica costs the leader a copy.** Each batch is copied out of `Data` under the read lock before
   it is written to the connection, which is what keeps a slow follower from blocking writes. Ten
   followers catching up at once is ten copies.
-- **One process owns a directory, and nothing enforces it.** There is no lock file. Two programs with
-  the same store open — two `litekvd`s on the same `-dir`, or a binary and a shell script — will write
-  over each other's log, and the first either of them hears of it is a checksum that does not match.
+- **One process owns a directory, and the lock is advisory.** `OpenDB` takes an exclusive lock on a
+  `LOCK` file in the directory and holds it until `Close`, so a second `litekvd` on the same `-dir`
+  reports `store directory is open in another process` and stops instead of writing over the first
+  one's log. What it excludes is anything asking for the same lock, which means another litekv and
+  nothing else: a shell redirect into a log is unaffected. It is also local to the machine — `flock`
+  is emulated or machine-local on network filesystems — and a store on NFS is already outside what
+  the sync policies can promise.
+- **The lock is not taken at all on Windows, solaris, aix, plan9 or wasm.** `syscall.Flock` is missing
+  on the last four and `LockFileEx` is not in the standard library on Windows; it lives in
+  `golang.org/x/sys`, and this module has no dependencies. Those platforms open exactly as every
+  platform did before the lock existed, which is to say unprotected, and they create no `LOCK` file —
+  one that locked nothing would read as protection. `lock_none.go` is the whole of it.
 - **The HTTP API has no authentication and no TLS.** `litekvd` listens on loopback for that reason. Put
   it behind a proxy or on a private network before it has an address a stranger can reach, and note that
   this applies to every route: there is nothing to stop a client writing as well as reading.

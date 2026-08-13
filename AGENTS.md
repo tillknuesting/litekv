@@ -49,6 +49,8 @@ so this section stays as written. It changes which of the missing things matter:
 | `replica.go` | `Position`, shipping the log to a follower: `Since`, `Follow`, `Apply`, and `Reached` |
 | `dbreplica.go` | `DBPosition`, shipping a `DB`'s records: `Snapshot`, `Since`, `Follow`, and `Reached` |
 | `fs.go`      | the one seam through which this package touches a disk                    |
+| `lock_flock.go` | the lock that makes one process the owner of a directory, where there is one |
+| `lock_none.go`  | and where there is not: the platforms that open without it               |
 
 And outside the engine, in packages of their own:
 
@@ -96,13 +98,25 @@ The `^...$` matters: `-fuzz FuzzApply` now matches `FuzzApplySnapshot` too, and
 the go tool refuses to run rather than choosing.
 
 Anything touching `server/` also gets mutation tested and driven end to end.
-`tools/mutate.py` is the sweep — sixty-six mutations, eight workers, about ten
-minutes, and it prints each verdict as it lands rather than at the end:
+`tools/mutate.py` is the sweep — a hundred and seventeen mutations, eight
+workers, and it prints each verdict as it lands rather than at the end:
 
 ```bash
 python3 tools/mutate.py                 # all of them
 python3 tools/mutate.py replica batch   # only those whose name matches
+python3 tools/mutate.py lock            # the eight for the directory lock
 ```
+
+Most of them are server mutations, named by a bare file — `keys.go` means
+`server/keys.go`. A name with a slash is relative to the repository, which is
+how an engine file is written: `./db.go`. The two are not interchangeable and
+the difference is not cosmetic, because the timeout goes with the package. The
+server's suite takes three seconds and the engine's takes forty-five under
+`-race`, and a timeout below what a suite honestly needs is the worst setting
+there is: a test binary killed by the deadline exits non-zero exactly like a
+failing one, so every mutation in that package reports caught and the sweep
+tests nothing. `locate` sets 90s for the server and 600s for the engine, and a
+deadline that fires is reported as itself unless the dump names a test it hung.
 
 It used to be an ad-hoc script in a scratch directory, rewritten from memory
 each time, which is how two of the traps below were discovered twice. The
@@ -134,6 +148,22 @@ the background.
 Each of these has a test behind it. If you change the code near one, read the
 test first, and if you think the invariant is wrong, be sure before you decide
 that.
+
+**A directory is locked before it is read, and unlocked after the last log is
+closed.** Both ends matter and for the same reason. Two opens that each list the
+directory and only then discover each other have already both decided which log
+to carry on writing to, and they have decided the same one; a store that let go
+of the lock before its last sync hands the directory over mid-sentence.
+`TestTheLockIsTakenBeforeTheDirectoryIsRead` and
+`TestTheLockIsReleasedAfterTheLastLogIsClosed` watch the order through the seam
+rather than the result.
+
+**An open that fails gives the lock back.** There is nobody to give it back
+later — `OpenDB` returned no store to close — so a lock kept on a failure is a
+directory this process has shut against its own next attempt, and the symptom
+shows up at that next attempt pointing at nothing.
+`TestAFailedOpenLetsGoOfTheLock` sweeps every operation an open makes and
+reopens after each one.
 
 **A record reaches `Data`, then the log, then the index.** In that order, in
 `appendRecord`. The index is pointed at a record only once both have taken it,
@@ -481,6 +511,87 @@ and `TestDBRotationFailureLeavesTheStoreWritable` holds the first two.
 full log is housekeeping that happens after the record is safe; a failure there
 is remembered in `db.rotateErr` and reported by `Sync` and `Close`.
 
+## One process owns a directory
+
+The failure this closes is the quiet one. Two processes with the same directory
+open both write to the active log, both keep an index of where they put things,
+and neither is wrong about anything it can see. The first news either gets is a
+checksum that does not match, some minutes or days later, and by then there is
+no way to say which records were lost or which of the two lost them. Nothing
+checked before this; a typo in a unit file was enough.
+
+**It is a lock on a descriptor, not a file that is created and deleted, and
+that is the whole design.** The `O_CREAT|O_EXCL` version is portable and needs
+no syscall this package did not already make, and it is wrong for a database:
+after a crash the file is still there, so the store refuses to open until
+somebody logs in and removes it. The crash this package is built to survive
+becomes the crash that needs a human at three in the morning. Writing the pid in
+and checking whether it is alive is the usual patch and it is worse — a race
+against pid reuse, and meaningless in a container where everything is pid 1. A
+lock the kernel holds is dropped when the process ends however it ends, and
+`TestAnotherProcessIsKeptOutAndAKillLetsItIn` is that claim tested the only way
+it can be: another process, killed outright, and the directory open immediately
+afterwards.
+
+**The build constraint is a list and not `unix`, and the list was measured.**
+`syscall.Flock` is missing on solaris and aix, which the `unix` tag covers, so a
+build there would fail. `LockFileEx` is not in the standard library on Windows —
+it is in `golang.org/x/sys`, and this module has no dependencies and is not
+taking its first one for a lock file. So `lock_flock.go` names the six platforms
+that have `Flock` and `lock_none.go` takes the rest. Check by cross-compiling
+before changing that list; the list is what `GOOS=solaris go build` says, not
+what the `unix` tag suggests.
+
+**`lock_none.go` opens without a lock rather than refusing to open.** Refusing
+would take away platforms that work today to gain a guarantee those platforms
+cannot give, which is a regression dressed as safety. It creates no file either:
+a `LOCK` sitting in a directory locking nothing is a thing an operator would
+reasonably read as protection. `lockingEnforced` is what the tests skip on, so a
+platform without a lock reports the tests it did not run instead of passing
+them.
+
+**The lock file is never removed, and that is not laziness.** Removing it is how
+one lock becomes two: B opens the file and takes the lock, A removes the file it
+is holding, C creates a fresh one and locks that, and now B and C each hold a
+lock on a different inode with the same name and each believes it is alone. It
+survives `Close`, and three separate directory walks step over it without naming
+it — `segmentIDs` takes only `.seg`, `removeStaleMerges` only `.merging` and
+orphaned `.hint`, and the reset in `ApplySnapshot` only `.seg` and `.hint`.
+`TestTheLockFileIsLeftBehindAndIgnored` is what holds that, because "it happens
+to fall through three filters" is exactly the kind of thing a fourth filter
+breaks.
+
+**`fileSystem.Lock` is a seam and `lockFile` is under it.** A lock is taken on a
+descriptor and `diskFile` deliberately has none, so the platform half calls
+`os.OpenFile` directly — the one place besides `os.Stat` where this package
+touches a disk without going through `disk`. The seam is one level up, at
+`osDisk.Lock`, which is where the watcher gets in and why the ordering tests can
+exist at all.
+
+**Eight mutations cover it and all eight are caught.** The lock never taken
+exclusively, taken after the directory is read, waited for rather than refused,
+kept by an open that failed, released by `Close` before the logs or not at all,
+the lock file counted as a log, and any failure to lock reported as contention.
+Three of them are caught by tests that were already here — the chaos runs and
+`TestShortReadWhileIndexing` reopen a directory after making an open fail,
+which is exactly the invariant, written down years before there was a lock to
+break.
+
+A ninth was written and deleted rather than kept: dropping the explicit
+`LOCK_UN` from `Unlock` and closing the descriptor instead. Closing releases the
+lock by itself, so that version behaves identically — an equivalent mutant, and
+one that would have sat in the survivor list forever implying a test somebody
+forgot to write. The explicit call earns its place through the ordering, not
+through the release.
+
+**Adding the operation shifted every fault index.** `watchedDisk.record` counts
+operations for `failNth` and `failFrom`, so a new operation at the front of
+`OpenDB` moves the numbering that every chaos sweep indexes into. That was
+harmless here because those sweeps run to `operations()` rather than to a
+number somebody wrote down — but it is worth knowing before adding the next
+operation, and it is the reason no test in this repository should ever hard-code
+a fault ordinal.
+
 ## Replication over a real socket
 
 It lives in `server/replica_test.go` now. It was `tcp_test.go` in this package,
@@ -758,6 +869,26 @@ invariant above is phrased as slow-never-wrong rather than as a rule to follow.
   right until a second layout existed and `headerSize` became the largest of
   them rather than the one a plain `Write` uses. Ask `decodeHeader`, or ask
   `parseRecordAt` for the record and use what it hands back.
+- **A count of logs is not a fixed number.** `TestTheLockFileIsLeftBehindAndIgnored`
+  compares `Segments()` across a close and reopen, which is a real claim — the
+  `LOCK` file must not be counted as one — and it was written with merging left
+  on. Merging is a background thing, so the count is whatever the merges
+  happened to have finished by, and the test passed alone and failed under the
+  suite. It surfaced as a mutation verdict rather than as a flake: an unlock
+  that only closed the file was reported as caught by that test, which cannot
+  be right, since closing the descriptor releases the lock and the mutation
+  changes nothing. Running it by hand passed; running the suite failed with
+  "logs after reopening: 8, want 14". Set `MergeTrigger: 1` in any test that
+  counts logs, and treat a catch you cannot explain as a broken test rather
+  than as good news.
+- **A test that waits where the code should refuse.** The mutation removing
+  `LOCK_NB` — a lock waited for rather than refused — was caught by the suite
+  hanging until the ten-minute deadline, which is a catch and a useless one:
+  ten minutes for a verdict, and a report that could not tell it from a
+  timeout set too low. Every test here that expects `ErrorLocked` goes through
+  `openWithin`, which fails in fifteen seconds. If a mutation's correct
+  behaviour is "answers quickly", the test has to say so; a test that blocks
+  forever is not testing that.
 - **A mutation script that does not run the test that would catch it.** Each
   script has a `-run` filter, and twice a new test was written whose name did
   not match it, so a mutation was reported as surviving when the test for it was
@@ -925,14 +1056,21 @@ a crash survivable and none of them show up in the result of a call.
   follower disagrees, eventually" into "log 24 is on the disk and not in the
   store, at step 68". That check is worth rebuilding if anything like it comes
   back.
-- **Two fuzz runs have failed and neither was explained.** Different targets,
-  months apart: one of the original targets, and once `FuzzDBSince` reported
-  FAIL at the end of a long verification run. Neither wrote anything to
-  `testdata/fuzz`, which a target that actually found an input always does, so
-  neither was the fuzzing finding a bug — something else about the run failed.
-  The second did not recur in thirteen further runs, alone, in sequence, and
-  under load. If it returns, look for `testdata/fuzz` first: if there is nothing
-  there, it is not the store.
+- **Three fuzz runs have failed and none was explained.** Different targets,
+  months apart: one of the original targets, once `FuzzDBSince` at the end of a
+  long verification run, and once `FuzzApply` during the lock work. None wrote
+  anything to `testdata/fuzz`, which a target that actually found an input
+  always does, so none was the fuzzing finding a bug — something else about the
+  run failed. The second did not recur in thirteen further runs, alone, in
+  sequence, and under load; the third did not recur in five, including the same
+  back-to-back pair that produced it, against a target that touches nothing the
+  lock changed. If it returns, look for `testdata/fuzz` first: if there is
+  nothing there, it is not the store.
+
+  The third one also lost its own evidence: it was run as `go test … | tail -3`,
+  which kept `FAIL` and threw away the reason. That is the mistake the bullet
+  below this one is about, made again by somebody who had read it. Capture to a
+  file and grep the file.
 - **One suite run failed and the output was thrown away.** It happened in a
   verification chain that redirected `go test` to `/dev/null` and printed only
   the exit code, so there is nothing to go on. Thirty-seven captured runs since
@@ -964,7 +1102,7 @@ reads carry on, which is only true if the queue is in the path.
 mutations depend on it. If it is ever weakened, four things stop being tested.
 
 **Five mutations survive on purpose, and no others.** Written down so that
-nobody goes hunting for a test that was never written, and so that a fourth
+nobody goes hunting for a test that was never written, and so that a sixth
 survivor is read as news rather than as normal:
 
 - **`Options.Queue` dropped on the way to `litekv.WriterOptions`.** The depth
@@ -1209,6 +1347,34 @@ now done, so the list has become the server, in six pieces:
 | 4 | replication over the wire                | done  |
 | 5 | two roles, and reads that are not stale  | done  |
 | 6 | operations, and writing it down          | done  |
+
+The server is finished. Three things were weighed after it, and the first is
+done:
+
+| what                                | state | why it was or was not next          |
+| ----------------------------------- | ----- | ----------------------------------- |
+| a lock file                         | done  | hours of work against silent corruption |
+| a lease, and a way down             | open  | the one real gap left; see below    |
+| ranges that stream and page         | open  | scaling, and nobody has hit it yet  |
+
+**A lease, and a way down** is the gap worth naming clearly, because it is the
+only one where the current behaviour loses acknowledged writes. A replaced
+leader finds out it was replaced when something carrying a newer term asks it
+for records, and until then it goes on taking writes that are lost the moment it
+finds out. There is also no way down at all: the route table has
+`POST /v1/promote` and nothing opposite it, so a node that should hand over has
+to be killed. The shape is `DB.Demote`, a `POST /v1/demote`, and an optional
+lease loop in `litekvd` where a leader that cannot renew stops taking writes on
+its own — the external-lease arrangement argued for under "Consensus, and why it
+is not on that list". It bounds the window at the lease TTL less the clock skew
+rather than closing it, which is a much smaller number than "until a follower
+turns up" and is still a number.
+
+**Ranges that stream and page** is the k-way merge described under range and
+prefix queries below, plus a cursor a client can resume from. The hard half is
+the cursor, not the merge: a resume has to stay correct across a merge that
+moved the keys under it, which is the same class of problem as carrying a
+stranded follower and took longer than it looked there too.
 
 Piece 4 was the one the rest of the engine was waiting on, and it is done: there
 is now a connection for a leader to hang something off, which is what

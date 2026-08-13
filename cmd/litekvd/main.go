@@ -1,9 +1,12 @@
 // Command litekvd serves a litekv store over HTTP.
 //
 // It opens one store in one directory and hands it to package server. Nothing
-// else may have that directory open while it runs: the store is not
-// multi-process safe and nothing checks, so a second litekvd on the same -dir
-// will quietly write over the first one's log.
+// else may have that directory open while it runs, and the store enforces that:
+// a second litekvd on the same -dir fails to start, saying the directory is
+// open in another process, rather than writing over the first one's log. The
+// lock goes when the process does, however it goes, so a machine that lost
+// power comes back and starts normally. See the Limitations in the README for
+// the platforms that cannot take it.
 //
 //	litekvd -dir /var/lib/litekv -addr 127.0.0.1:8080
 //

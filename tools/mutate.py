@@ -5,8 +5,8 @@
     python3 tools/mutate.py replica batch   # only those whose name matches
 
 Every mutation must be caught. A mutation that survives is a promise the code
-makes that nothing is holding it to; the four that are allowed to survive are
-listed in AGENTS.md with the reason for each, and a fifth is news.
+makes that nothing is holding it to; the five that are allowed to survive are
+listed in AGENTS.md with the reason for each, and a sixth is news.
 
 # Why this is parallel, and why each worker gets its own copy of the tree
 
@@ -66,9 +66,33 @@ def tree(pool):
     return workers.dir
 
 
+def locate(where, path):
+    """The file to break, the package to run, and how long to give it.
+
+    A bare name is a file under server/, which is what every mutation was when
+    this tool was written and what most of them still are. A name with a slash
+    in it is relative to the repository — "./db.go" is the engine — because
+    "db.go" on its own would silently mean server/db.go, and a sweep that broke
+    a file nobody meant to break is the failure this whole tool exists to
+    avoid.
+
+    The timeout goes with the package because the two suites are not the same
+    size. The server's takes three seconds and the engine's takes about two
+    minutes under -race, and a timeout below what the suite honestly needs is
+    the worst possible setting: every mutation reports caught, because a test
+    binary killed by the deadline exits non-zero exactly like a failing one.
+    """
+    if "/" not in path:
+        return os.path.join(where, "server", path), "./server/", "90s"
+
+    inside = os.path.dirname(os.path.normpath(path))
+    full = os.path.normpath(os.path.join(where, path))
+    return full, "./" + inside if inside else "./", "600s"
+
+
 def run(pool, path, name, old, new):
     where = tree(pool)
-    full = os.path.join(where, "server", path)
+    full, package, timeout = locate(where, path)
 
     source = open(full).read()
     if source.count(old) != 1:
@@ -103,10 +127,35 @@ def run(pool, path, name, old, new):
         # its handler returned is a race and nothing else, and a sweep without
         # the flag reports it as caught by nobody. It costs about a second a
         # mutation and buys the whole class.
-        test = subprocess.run(["go", "test", "-race", "-count=1", "-timeout", "90s", "./server/"],
+        test = subprocess.run(["go", "test", "-race", "-count=1", "-timeout", timeout, package],
                               cwd=where, capture_output=True, text=True, errors="replace")
         if test.returncode == 0:
             return "SURVIVED"
+
+        # A deadline that fired is reported as itself and never as a catch. A
+        # test binary killed by -timeout exits non-zero exactly like a failing
+        # one, so a timeout set below what a suite honestly needs turns every
+        # mutation in that package into a pass — a sweep that reports 100%
+        # caught and tested nothing. Since the engine's suite is forty-five
+        # seconds where the server's is three, that stopped being hypothetical.
+        if "test timed out" in test.stdout or "test timed out" in test.stderr:
+            # Go names what was still running in the dump it prints. A test
+            # that was running when the deadline fired is a test the mutation
+            # hung, which is a catch and a legitimate one — the suite hangs
+            # rather than passes. A deadline that fired with nothing running is
+            # the deadline being too short, and that is not a catch at all.
+            # Go indents these by two tabs under a "running tests:" line, not
+            # one. Matching a single tab found nothing and reported a hang as
+            # an unraised timeout, which is the same kind of quiet miss this
+            # tool is otherwise careful about.
+            hung = []
+            for line in (test.stdout + test.stderr).splitlines():
+                stripped = line.strip()
+                if line.startswith("\t") and stripped.startswith("Test") and " (" in stripped:
+                    hung.append(stripped.split(" (")[0])
+            if hung:
+                return "caught (hung " + ", ".join(hung[:3]) + ")"
+            return f"TIMED OUT after {timeout} (raise it; this is not a catch)"
 
         # Stripped, because a subtest's FAIL line is indented under its parent
         # and an unstripped prefix check reports "failed without naming a test"
@@ -161,7 +210,7 @@ def main():
         shutil.rmtree(pool, ignore_errors=True)
 
     missed = {n: v for n, v in results.items()
-              if v.startswith("SURVIVED") or v.startswith("SKIPPED")}
+              if v.startswith(("SURVIVED", "SKIPPED", "TIMED OUT"))}
 
     print(f"\n{len(results) - len(missed)}/{len(chosen)} caught "
           f"in {time.time() - started:.0f}s on {WORKERS} workers")

@@ -166,6 +166,45 @@ func (w *watchedDisk) MkdirAll(name string, perm os.FileMode) error {
 	return osDisk{}.MkdirAll(name, perm)
 }
 
+// Lock is recorded like the rest, and counts towards failNth like the rest: a
+// chaos run that sweeps every operation an open makes should include the first
+// one it makes, and a lock that could not be taken is a real way for an open to
+// fail on a real disk — a full one, or a directory the process cannot write.
+func (w *watchedDisk) Lock(name string) (diskLock, error) {
+	if err := w.record("lock", name); err != nil {
+		return nil, err
+	}
+
+	lock, err := osDisk{}.Lock(name)
+	if err != nil {
+		return nil, err
+	}
+	return &watchedLock{inner: lock, disk: w, name: name}, nil
+}
+
+type watchedLock struct {
+	inner diskLock
+	disk  *watchedDisk
+	name  string
+}
+
+// Unlock records itself before releasing, so that "the lock went last" is
+// checked against the operation and not against the moment the descriptor
+// happened to close.
+//
+// An injected failure is reported but the real lock still goes, because that is
+// the only failure a real one has: flock and close can report an error, and
+// neither leaves the lock held afterwards. A stand-in that kept it would lock
+// the rest of the test process out of a directory over a fault that does not
+// do that.
+func (l *watchedLock) Unlock() error {
+	err := l.disk.record("unlock", l.name)
+	if ierr := l.inner.Unlock(); err == nil {
+		err = ierr
+	}
+	return err
+}
+
 // allowWrite reports how many of these bytes the file may take before it has
 // had all it is going to.
 func (w *watchedDisk) allowWrite(name string, n int) (int, bool) {
