@@ -93,7 +93,12 @@ The `^...$` matters: `-fuzz FuzzApply` now matches `FuzzApplySnapshot` too, and
 the go tool refuses to run rather than choosing.
 
 `go fix` rewrites rather than reports, which is why the check is to run it and
-see whether anything moved. Read what it did before committing it: it is an
+see whether anything moved — and **run it twice**, because it is not idempotent.
+It folds an if-and-assign into `max`, and on a second pass it will fold the
+result of its own first pass; where the `if` held a comment it puts that comment
+*inside* the call, which is worse than what it replaced. `diskSegment.batch` is
+written by hand for that reason. CI runs one pass, so a tree that has only been
+fixed once fails there rather than here. Read what it did before committing it: it is an
 automated edit to code that is under test, and it once touched twenty-seven
 files here in one go — `min`, `max`, `for i := range n`, `slices.Sort`,
 `WaitGroup.Go`, `fmt.Appendf`. Then **run the mutation sweep**, because the
