@@ -6,32 +6,33 @@ to save you a day, not to introduce the code.
 
 ## Where this is going
 
-This is not meant to stay a library. The intent is a standalone database with a
-real API over HTTP, and what is here is the storage engine it will sit on. That
-has now started — `server/` and `cmd/litekvd` exist and serve one key at a time
-— but the engine is still where nearly all of the code and all of the risk is,
-so this section stays as written. It changes which of the missing things matter:
+This is the storage engine. The database that sits on it exists and is a
+repository of its own —
+[litekvd](https://github.com/tillknuesting/litekvd) — which is what this section
+spent a long time working towards and what the split finally made true: the
+engine is a library anybody can take, and the server is somebody's dependency
+rather than a directory in here. The engine is still where nearly all of the
+code and all of the risk is, so what follows stays as written:
 
 - **Read scaling and failover stop being theoretical.** For an embedded store
   the readers are in the same process and a replica buys little. For a server
   the readers are clients, and a replica behind a load balancer is the ordinary
   way to serve more of them — and a database that cannot survive losing a node
   is a hard sell.
-- **Keep the engine free of a wire.** Nothing in package `litekv` opens a socket
-  and nothing should; `server/` owns the protocol. This is not a style rule. It
-  is what keeps the store embeddable, and it is also the thing that makes the
-  server's tests worth anything — they exercise the exported API and nothing
-  else, so a change that breaks a caller breaks them. If the server turns out to
+- **Keep the engine free of a wire.** Nothing in this module opens a socket and
+  nothing should; the daemon owns the protocol. This is not a style rule. It is
+  what keeps the store embeddable, and it is also the thing that makes the
+  daemon's tests worth anything — they exercise the exported API and nothing
+  else, so a change that breaks a caller breaks them. If the daemon turns out to
   need something the engine does not export, that is a separate, deliberate
-  commit to the engine, not a quiet widening while building something else.
-  `tcp_test.go` was a sketch of the replication endpoint and has been promoted
-  into `server/replica.go` and `server/replica_test.go` rather than reinvented;
-  the engine gave up nothing to make that possible.
+  commit here and a new tag, not a quiet widening while building something else.
+  The split made this cheap to check: `go list -deps` on this module names no
+  `net/*` package at all.
 - **Format changes are cheapest now.** A batch commit marker: anything touching
   the record layout costs less before there is data anyone minds losing. The
   version byte exists for this, and has now carried three changes — the
   timestamp, the expiry, the sequence number — each costing compatibility work.
-  Server-layer decisions can wait; on-disk ones cannot.
+  Decisions in the daemon can wait; on-disk ones cannot.
 
 ## Where things are
 
@@ -52,23 +53,16 @@ so this section stays as written. It changes which of the missing things matter:
 | `lock_flock.go` | the lock that makes one process the owner of a directory, where there is one |
 | `lock_none.go`  | and where there is not: the platforms that open without it               |
 
-And outside the engine, in packages of their own:
+And beside it:
 
-| file                 | owns                                                              |
-| -------------------- | ----------------------------------------------------------------- |
-| `server/server.go`   | the handler, its options, the routes, and the writer in front      |
-| `server/keys.go`     | one key at a time: read, write, delete, and the expiry header      |
-| `server/ndjson.go`   | how a key or a value goes in a JSON object, in both directions     |
-| `server/batch.go`    | `POST /v1/batch`: a body of operations parsed whole, then stored   |
-| `server/scan.go`     | `GET /v1/keys`: ranges and prefixes, the query, and the limits     |
-| `server/errors.go`   | which store error is which status, and what a client is not told   |
-| `server/role.go`     | leader or replica, promotion, status, and reads that are not stale |
-| `server/ops.go`      | health, metrics, request logging, and the bearer token             |
-| `server/acks.go`     | who is following, how far each has got, and what a write waits for |
-| `tools/mutate/`      | the mutation sweep, and `mutations.go` beside it is what it breaks   |
-| `server/replica.go`  | the frames, the position on the wire, and the leader's stream       |
-| `server/follower.go` | the other end of it: dial, apply, reconnect                         |
-| `cmd/litekvd/main.go`| flags, the listener, signals, and the order things shut down in    |
+| file            | owns                                                            |
+| --------------- | --------------------------------------------------------------- |
+| `tools/mutate/` | the mutation sweep, and `mutations.go` beside it is what it breaks |
+
+The HTTP server, the replication endpoint and the `litekvd` binary used to be
+`server/` and `cmd/` here. They are
+[litekvd](https://github.com/tillknuesting/litekvd) now, which depends on this
+module the way anybody else would.
 
 `KeyValueStore` and `DB` are deliberately separate. The first is one log with
 everything in memory and `Data` as a public byte slice people are expected to
@@ -91,32 +85,38 @@ go run ./example      # it exercises every exported call
 go test -run xxx -fuzz FuzzSegmentBytes -fuzztime 30s .
 go test -run xxx -fuzz '^FuzzApply$' -fuzztime 30s .     # what arrives over a wire
 go test -run xxx -fuzz '^FuzzDBApply$' -fuzztime 30s .   # and into a DB
-go test -run xxx -fuzz '^FuzzReadFrame$' -fuzztime 30s ./server/   # and off a socket
 ```
 
 The `^...$` matters: `-fuzz FuzzApply` now matches `FuzzApplySnapshot` too, and
 the go tool refuses to run rather than choosing.
 
-Anything touching `server/` also gets mutation tested and driven end to end.
-`tools/mutate` is the sweep — a hundred and seventeen mutations, eight workers,
-and it prints each verdict as it lands rather than at the end:
+Anything with a test behind it also gets mutation tested. `tools/mutate` is the
+sweep — eight mutations, eight workers, and it prints each verdict as it lands
+rather than at the end:
 
 ```bash
-go run ./tools/mutate                 # all of them
-go run ./tools/mutate replica batch   # only those whose name matches
-go run ./tools/mutate lock            # the eight for the directory lock
+go run ./tools/mutate          # all of them
+go run ./tools/mutate lock     # only those whose name matches
 ```
 
-Most of them are server mutations, named by a bare file — `keys.go` means
-`server/keys.go`. A name with a slash is relative to the repository, which is
-how an engine file is written: `./db.go`. The two are not interchangeable and
-the difference is not cosmetic, because the timeout goes with the package. The
-server's suite takes three seconds and the engine's takes forty-five under
-`-race`, and a timeout below what a suite honestly needs is the worst setting
-there is: a test binary killed by the deadline exits non-zero exactly like a
-failing one, so every mutation in that package reports caught and the sweep
-tests nothing. `locate` sets 90s for the server and 600s for the engine, and a
-deadline that fires is reported as itself unless the dump names a test it hung.
+Eight is not many, and the reason is worth knowing rather than reading as
+neglect: a hundred and nine of them went to the daemon with the code they broke.
+What is left is the directory lock, which is the only engine work done since the
+sweep was built. **Everything older in this file that says a mutation was caught
+was checked by hand, before the tool existed, and those runs are written up
+below per feature — thirteen for the numbering, thirteen for batches, seven for
+the writer.** Adding to `mutations.go` when you change the engine is how that
+stops being true.
+
+Each mutation names a file relative to the repository root and the tool runs
+`go vet` and then the tests for whatever package that file is in.
+`suiteTimeout` is ten minutes, which is generous on purpose: the suite takes
+forty-five seconds and eight of them at once on one machine is not eight times
+as fast. Lowering it to make a sweep finish sooner is the worst thing that can
+be done to this tool, because a test binary killed by the deadline exits
+non-zero exactly like a failing one — every mutation would report caught and the
+sweep would be testing nothing. A deadline that fires is reported as itself
+unless the dump names a test it hung.
 
 It used to be an ad-hoc script in a scratch directory, rewritten from memory
 each time, which is how two of the traps below were discovered twice. Then it
@@ -129,21 +129,20 @@ Being Go, it is checked by everything above — `gofmt`, `go vet` and `go build
 that catches a store that no longer compiles, rather than by somebody running a
 sweep three weeks later.
 
-The end-to-end run matters separately, because a handler test builds its own
-request and the interesting question is often whether a request can be built at
-all:
+A change to replication or to anything the daemon leans on wants the daemon's
+suite run too, in its own checkout, against this working tree:
 
 ```bash
-go build -o /tmp/litekvd ./cmd/litekvd && /tmp/litekvd -dir "$(mktemp -d)" -addr 127.0.0.1:18080 &
-curl -X PUT --data-binary 'v' http://127.0.0.1:18080/v1/keys/a%2Fb && curl http://127.0.0.1:18080/v1/keys/a%2Fb
+cd ../litekvd && go mod edit -replace github.com/tillknuesting/litekv=../litekv \
+  && go test -race ./... ; go mod edit -dropreplace github.com/tillknuesting/litekv
 ```
 
-Anything touching replication gets two of them, one following the other, with
-the follower killed and restarted while the leader is being written to. Count
-what `ForEach` yields when comparing them afterwards and not `Len`, for the
-reason "Replication over a real socket" gives; and stop both with a signal
-rather than a kill, because how long the leader takes to go down with a follower
-attached is itself a thing that has been broken.
+That is the only way a change here is checked against a real client before it is
+tagged, and there is no single command that runs both suites. The daemon's own
+`AGENTS.md` has what its two-process runs look like — a leader and a follower,
+the follower killed and restarted mid-stream — including the two traps that
+matter when comparing two stores: count what `ForEach` yields and not `Len`, and
+stop both with a signal rather than a kill.
 
 `GOMAXPROCS=1` is not paranoia. The lock shards on `GOMAXPROCS`, so a one-core
 machine takes a different path through it, and background merging stops being in
@@ -154,6 +153,17 @@ the background.
 Each of these has a test behind it. If you change the code near one, read the
 test first, and if you think the invariant is wrong, be sure before you decide
 that.
+
+**A replaced leader hears about it from `Follow` as well as from `Since`.**
+Streaming and polling are two ways of asking a store for records, and for a
+while only one of them wrote down a newer term — so a leader with a follower
+attached, which is the ordinary arrangement and the one a server uses, went on
+taking writes after being superseded, and those writes are lost when it finds
+out. `TestFollowFencesALeaderTheWaySinceDoes` runs both calls through the same
+assertions for exactly that reason: the answer to "who is the leader now" must
+not depend on which call was used to ask. It was found from the server side and
+fixed here, which is the shape most engine bugs of this kind will have — the
+caller notices, the invariant belongs to the store.
 
 **A directory is locked before it is read, and unlocked after the last log is
 closed.** Both ends matter and for the same reason. Two opens that each list the
@@ -600,13 +610,15 @@ a fault ordinal.
 
 ## Replication over a real socket
 
-It lives in `server/replica_test.go` now. It was `tcp_test.go` in this package,
+It lives in the daemon repository now. It was `tcp_test.go` in this package,
 where it was the only place the library was put on a wire and where the framing
-beside it was a sketch; the sketch is `server/replica.go` and the test moved
-with it. This package has no over-a-socket coverage any more and that is the
-right way round — the server's version exercises the engine through its exported
-API and nothing else, so a change that breaks a caller breaks it, which a test
-living next to the unexported names could not say.
+beside it was a sketch; the sketch became that repository's `replica.go` and the
+test moved with it. This package has no over-a-socket coverage any more and that
+is the right way round — the daemon's version exercises the engine through its
+exported API and nothing else, so a change that breaks a caller breaks it, which
+a test living next to the unexported names could not say. The cost is that it
+is a different `go test`, in a different checkout, against a tagged version:
+see "Verifying a change" for the one-liner that points it at a working tree.
 
 Why either version exists: everything else here moves records through a
 `bytes.Buffer` or an `io.Pipe`, which says what the records are but not that the
@@ -702,14 +714,14 @@ for minutes rather than the seconds CI gives them:
 | `FuzzDBApplySnapshot`  | arbitrary bytes as a snapshot                         |
 | `FuzzDBSince`          | arbitrary positions to a leader                       |
 | `FuzzDBPosition`       | arbitrary bytes to the position parser                |
-| `FuzzReadFrame`        | arbitrary bytes to the frame reader, in `server/`     |
 
-`FuzzReadFrame` is the one outside this package, and what it is really asserting
-is about memory rather than about frames: a header claiming a gigabyte with
-nothing behind it must cost what a header claiming nothing costs. The reader
-grows into the bytes that arrive instead of allocating the length it was told
-about, and a version that did the obvious thing would show up here as a fuzzer
-taking the machine down rather than as a failure.
+`FuzzReadFrame` went with the daemon, and it is recorded here because what it
+asserts is about memory rather than about frames: a header claiming a gigabyte
+with nothing behind it must cost what a header claiming nothing costs. The
+reader grows into the bytes that arrive instead of allocating the length it was
+told about, and a version that did the obvious thing shows up as a fuzzer taking
+the machine down rather than as a failure. The same shape of mistake is
+available in this package to anyone who allocates from a number a stranger sent.
 
 `FuzzDBApply` and `FuzzDBApplySnapshot` reuse one store rather than opening one
 per execution, and install `unsyncedDisk` from `fs_test.go`, which is the real
@@ -1090,287 +1102,53 @@ a crash survivable and none of them show up in the result of a call.
   starts from the seeds in the code every time, so its thirty seconds a target
   is a smoke test. Real coverage comes from running one for minutes locally.
 
-## The server, and what its tests can and cannot say
+## The server left, and where it went
 
-**Two ways of asking, and the difference matters.** `httptest.NewRecorder`
-drives the handler directly and is enough for anything about statuses, headers
-and bodies. `httptest.NewServer` puts a real client, a real parser and a real
-socket in between, and is the only way to answer a question about whether a
-request can be *built* — which is exactly what `TestKeyOfAnyBytes` asks. A
-recorder is handed a request some other code already made.
+The HTTP server and the `litekvd` daemon are their own repository now:
+[github.com/tillknuesting/litekvd](https://github.com/tillknuesting/litekvd).
+Its `AGENTS.md` holds what used to be this section — what a handler test can and
+cannot say, the five mutations that survive on purpose, the traps that belong to
+the wire rather than to the log.
 
-**A closed `Server` is not a closed store, and that is what makes the wiring
-testable.** There is no way from outside the package to see that a write went
-through the queue rather than straight to the store: the record lands either
-way. What can be seen is that closing the `Server` stops writes with a 503 while
-reads carry on, which is only true if the queue is in the path.
-`TestClosingTheServerStopsWritesAndNotReads` is doing that job, and three
-mutations depend on it. If it is ever weakened, four things stop being tested.
+The split is what the first section of this file always said the arrangement
+was: nothing in package `litekv` opens a socket. It is now true of the whole
+repository and not only of the package, which is what makes this a toolbox
+somebody can take the log out of.
 
-**Five mutations survive on purpose, and no others.** Written down so that
-nobody goes hunting for a test that was never written, and so that a sixth
-survivor is read as news rather than as normal:
+Two things follow for anyone working here.
 
-- **`Options.Queue` dropped on the way to `litekv.WriterOptions`.** The depth
-  decides when a sender blocks and how large a group gets, and neither can be
-  asserted without a timing test. A pass-through of an engine option the engine
-  tests.
-- **The snapshot's hold released before `Follow` takes its own.** `Follow` calls
-  `db.Hold` first and only then releases the caller's, so the mutation opens a
-  window between the two rather than removing a hold — a scheduling race, and
-  the engine's `Follow` has the reason in its own comment. What the mechanism
-  does is tested next door by `TestDBHoldKeepsALogFromMerging` and
-  `TestDBFollowIsNotStrandedByAMerge`. A test here would be a race with a
-  deadline, which is the kind this repo does not write.
-- **Promote raising the term before it stops following, rather than after.**
-  Both orders reach the same end state, and nothing observable from outside the
-  package tells them apart — which is exactly why the code says why the order
-  matters and this says no test enforces it. What the wrong order opens is a
-  window in which the store's term is above its leader's and the follower is
-  still running, so a batch that arrives in it is applied by a node that has
-  just fenced the sender. Reproducing that needs the window held open, and
-  there is no seam for it.
-- **The drain after a snapshot.** `take` consumes whatever `ApplySnapshot` did
-  not, and that cannot fire today: ApplySnapshot reads to the end of what it is
-  given and reports an error if it stops early, and `take` returns that error,
-  which ends the stream — so there is never a next frame for a desynchronised
-  connection to ruin. It stays because "consume exactly what the header
-  promised" is a property of the framing and not of the store, and an
-  ApplySnapshot that one day returned nil having read less would leave the
-  reader in the middle of a record.
-- **The backoff not resetting after a long-lived connection.** With it gone,
-  reconnects still happen and still converge; what is lost is that a leader
-  restarting once a day is reconnected to at 5s instead of 100ms. That the
-  backoff *grows* is tested — `TestTheBackoffGrows`, by counting attempts in a
-  window rather than asserting a latency — and that it comes back down is
-  tuning, not correctness.
+**The engine can no longer be tested through the server, and mostly never was.**
+Everything below this line is held up by tests in this repository. If a change
+here would break the daemon, the daemon's own suite is where that shows up, and
+it is a separate `go test` in a separate checkout — there is no single command
+that runs both. Tag a release here before expecting the daemon to see a change.
 
-**A catch that is not reproducible is not a catch.** The mutation removing the
-`Flush` after each frame was reported as caught by the two big replication tests
-in one sweep and as surviving the next. Both reports were true: those tests
-write hundreds of four-kilobyte values, which fill net/http's buffer and push
-the frames out whether the code flushes or not, so whether they notice is a fact
-about how much they happened to write. `TestOneSmallRecordArrivesAtOnce` writes
-one nine-byte record to an idle, caught-up follower — nothing can fill a buffer
-and nothing else is coming — and fails in 15 seconds flat without the flush. If
-a mutation's verdict changes between runs, the test is measuring the wrong thing.
-
-**A role is not a term, and the engine cannot tell you which of the two a node
-is.** Fencing is about two leaders: a store that has heard of a newer term stops
-taking writes. A node that is *following* has heard of no such thing — it holds
-its leader's term, so `ErrorFenced` never fires — and it will take a write, put
-it in its own log, and go on applying the leader's records around it. Nothing
-errors, no checksum is wrong, and the two stores disagree for ever. `role.go`
-exists for that one failure. The check has to be in the server because the thing
-that makes this node a replica is a goroutine in the server, and it has to be on
-every route that stores something: `TestAReplicaRefusesEveryWrite` runs all
-three, because a batch aimed at a replica is the same mistake as a `PUT` and a
-longer one.
-
-**Churn is not retention, and TotalAlloc measures the wrong one.** Two versions
-of the snapshot test failed on this. Measuring a follower catching up reported
-221 MB for a 32 MiB store — nearly all of it the follower *building* a store out
-of the records, which is inherent. Measuring the leader's send path reported
-40 MB, because the engine allocates every record as it reads it out of a frozen
-log, whatever it writes them to. What the claim actually is — that the leader is
-not *holding* the snapshot — is `HeapAlloc` after a collection, with the snapshot
-produced and not yet sent. That reads 611 KB against 67 MB, which is the
-difference stated plainly.
-
-**A test that watches for a race will lose it.** The first version of
-`TestAFollowerAppliesASnapshotAsItArrives` let the whole payload cross and polled
-for the store to be emptied, racing "the last byte arrived" against "the store
-was reset" — microseconds apart, and it passed against the buffering it was
-written to catch. The sender stops half way and waits now. If a test's assertion
-depends on which of two things happens first, arrange for one of them not to
-happen yet.
-
-**A measurement whose two arms agree is measuring the harness.** Semi-synchronous
-replication was first timed with a curl loop: 1507ms waiting for a follower
-against 1513ms not waiting, which reads as "it is free" and is really "a curl
-process costs seven milliseconds and that is all this measured". The benchmark
-says 8.3 µs against 215 µs. If two arms of a comparison land within half a
-percent of each other, suspect the harness before believing the result.
-
-**A wait that is never woken still returns the right answer.** The mutation that
-stops anything waking a blocked write survived, because `await` times out and
-counts again — so it answered correctly, five seconds late. Correctness and
-promptness are two claims and a test that only makes the first one lets the
-whole waking mechanism rot. `TestAWriteWaitsForAFollower` bounds how long it
-took.
-
-**A goroutine that outlives its handler is a race the tests cannot see.** The
-heartbeat is a second goroutine holding the stream's `http.ResponseWriter`, and
-a ResponseWriter may not be touched once its handler has returned. Left to stop
-in its own time it writes into a response net/http is finishing. The fix is two
-defers whose order is the whole of it — `close(served)` runs first, which ends
-the watcher, which closes `until`, which the heartbeat selects on, and only then
-does `beating.Wait()` let the handler return. **The race detector is the only
-thing that found this**, which is why the sweep now runs `go test -race`: it
-costs about a second a mutation and buys a class of bug no assertion covers.
-
-**A fake leader has to flush.** A test server that writes frames and then holds
-the connection open leaves all of them in net/http's buffer, so the follower
-reads nothing and sits there. `TestAFollowerReadsPastAHeartbeat` failed against
-correct code for exactly that, and the failure looks identical to the bug it was
-written to catch. The real leader flushes every frame; a fake that does not is
-testing the buffer.
-
-**Slowing a writer is not the same as trickling bytes.** The first version of
-`TestSilenceIsBytesAndNotFrames` slept once per `Write`, which is one long
-silence — and silence is what the idle deadline is meant to end, so it made the
-correct code fail and the bug pass. It sends the payload in flushed pieces now.
-The version before that just made the store bigger, which on loopback crossed in
-under the deadline and proved nothing at all.
-
-**A test that hangs when it fails is worse than one that fails.** The token
-test asks every route for a 401, and one of those routes is the replication
-stream: with the check removed it does not answer, it starts streaming, and the
-suite sat for the full timeout instead of naming the route that was open. That
-request goes on a two-second context now. The same shape bit the write-deadline
-test, where `defer wire.Close()` waited on a stream whose follower had not been
-stopped yet — a defer runs before every `t.Cleanup`, so the ordering `serving()`
-uses is the ordering to copy: store, listener, server, and the follower's own
-cleanup last-registered so it runs first.
-
-**"The record arrived" is not the same claim as "the stream stayed up."** A
-stream cut by a write deadline is one the follower reconnects to, and everything
-arrives either way, a little later. `TestAStreamTakesItsWriteDeadlineOff` counts
-connections for that reason: one is the assertion, and two means the deadline
-cut it and the reconnect hid it. Anything asserting that replication works has
-to be asked which of the two it is actually testing.
-
-**The shutdown order is four things now and only one of them is obvious.** Stop
-taking requests, stop the follower, close the `Server`, close the store. The
-`Server` step exists because a handler blocked on the queue is holding a request
-open: close the store first and a write a moment from being acknowledged becomes
-`ErrorClosed` for no reason but the order. The follower step exists because it
-writes to the store without going through the handlers or the queue, so nothing
-else orders it against the close, and its `Close` waits for the goroutine rather
-than merely asking — a batch being applied when the stop arrives is a write, and
-returning before it finished would leave the caller free to close the store
-underneath it. `cmd/litekvd` has no test of its own — the end-to-end curl run in
-"Verifying a change" is what covers it.
-
-**`Shutdown` waits for a stream forever, and the number is 10.05 seconds against
-0.03.** `http.Server.Shutdown` closes the listeners and then waits for every
-connection to go idle; it does not cancel a request's context. A replication
-stream is a request that never finishes on its own, so a leader with one
-follower attached spends the whole of `-shutdown-timeout` and then reports
-`context deadline exceeded`. That is the measurement, taken with two binaries on
-loopback and the hook removed. `Server.CloseStreams` ends the streams and
-refuses new ones, and `litekvd` hands it to `RegisterOnShutdown`. Anything else
-long-lived that gets added to this package needs the same treatment; the
-default is to hang.
-
-**A stream answers everything it can before the first byte of the body.** After
-a 200 there is no status left, so a failure can only end the stream and the
-follower is left guessing. That is why the first snapshot is taken before
-`WriteHeader` — a fenced leader is a 409 with the term on it, a closed store a
-503 — and why the term check happens before that. Everything after the header
-goes to the log at Debug and nowhere else.
-
-**A leader learns it has been replaced from `Since` and not from `Follow`.**
-`db.Since` writes the newer term down before reporting `ErrorFenced`; `db.Follow`
-returns the same error and writes nothing. The endpoint stands in for that by
-asking `Since` with the same position — which costs nothing, because a store
-that refuses on the term refuses before it reads a record — and
-`TestAFollowerWithANewerTermFencesTheLeader` holds it to it by writing to the
-leader afterwards and expecting `ErrorFenced`. The real fix is one line in
-`Follow`, in the engine, and belongs to whoever next has a reason to touch it.
-
-**What a leader is fenced by is asked of it, never volunteered.** `Snapshot`
-refuses when the store is fenced and `batch` does not, so a leader that has
-heard of a newer term goes on streaming to a follower that has not. Nothing in
-this piece can tell — there is no exported way to ask a store whether it is
-fenced, only to try a write. Piece 5 needs one for `/v1/status` anyway.
-
-**`utf8.Valid` is the encoding rule and nothing else may be.** `ndjson.go`
-decides between a plain string field and a `_b64` one by asking whether the
-bytes are valid UTF-8, because `encoding/json` does not refuse bytes that are
-not — it substitutes U+FFFD, in both directions, and says nothing. A route that
-let that happen would answer 200 having lost the caller's bytes, which is the
-worst shape this kind of bug has. `TestTheReplacementCharacterIsNotAnEncoding`
-demonstrates the loss with `encoding/json` first and then shows this rule not
-making it, and skips itself if the standard library ever stops doing it. The
-same check runs on the way in over the whole line, since a raw `0xff` inside a
-JSON string is not JSON and the decoder would quietly repair it.
-
-**A `bufio.Scanner` checks its maximum only when it grows.** `parseBatch` starts
-its buffer at `min(64 KiB, max)` for that reason: a Scanner given a starting
-buffer larger than its maximum token size never reaches the check and never
-reports `ErrTooLong`, so the limit is not a limit. This was caught by a test that
-asked for a 500-byte line under a 128-byte limit and got the line.
-
-**A body cut short reads as a line that is not JSON.** `http.MaxBytesReader`
-stops mid-line, the Scanner hands back the partial token, and blaming that line
-is blaming the wrong thing — the answer a client can act on is 413 and not "line
-12 is not JSON". `parseBatch` asks `lines.Err()` before reporting a parse
-failure, which works because a Scanner sets its error on the same call that
-returns the last partial token.
-
-**The batch route's queue test is the same one-trick job as the PUT's.** There is
-still no way from outside the package to see that a batch went through the
-writer rather than straight to the store, so `TestBatchGoesThroughTheQueue`
-closes the `Server` and asks for a 503 while the store is still open, exactly as
-`TestClosingTheServerStopsWritesAndNotReads` does. Weakening either weakens the
-only evidence that `writes` is in the path.
-
-**`litekv.Batch` does not copy, and the parser is what has to know.** Every key
-and value in a parsed batch is its own allocation — a string conversion or a
-base64 decode — because the batch reads them when it is written rather than when
-they are added. A decode buffer reused across the lines would store the last
-line's bytes under every key in the batch and report nothing.
-`TestEveryLineKeepsItsOwnBytes` writes two hundred lines whose values get shorter
-as it goes, which is the shape that catches a shared buffer that is not cleared;
-values of one length would not.
-
-**A range holds the store's read lock for the whole gather, so nothing writes to
-a socket inside the callback.** `scan.go` builds the whole answer in memory and
-sends it afterwards. It is the same trade `keys.go` makes with `Read` instead of
-`View` and for the same reason: a client that stopped reading would otherwise be
-deciding when the store is allowed to rotate. It also means a failure part way
-through is still a clean 503 or 500, since nothing has gone out —
-`TestScanOfAClosedStore` checks the answer holds no part of a range.
-
-**What `?limit=` bounds is smaller than it looks.** The engine gathers and sorts
-every matching key before it yields the first one, so returning false from the
-callback stops the record reads and not the walk. The limit bounds the memory
-this package holds and the values it copies; it does not bound the scan. Anybody
-adding a cheaper range should read the k-way-merge note above rather than
-tightening this.
+**The mutation sweep is in both repositories and they are not the same sweep.**
+This one has the eight for the directory lock and runs the engine's suite at ten
+minutes a mutation; the daemon's has a hundred and nine and runs its own at
+ninety seconds. The runner is duplicated, deliberately — a shared tool would be
+a third module for four hundred lines that change about once a year.
 
 ## What to build next, and what it needs
 
-Everything on this list that gets cheaper by being done before an API exists is
-now done, so the list has become the server, in six pieces:
+The six pieces that built the server are done and their notes went with it, to
+the daemon's own `AGENTS.md`. What is left here is the engine's list, and one
+item on it is the reason to read this section at all.
 
-| # | piece                                    | state |
-| - | ---------------------------------------- | ----- |
-| 1 | the package, the binary, and one key     | done  |
-| 2 | group commit under the handlers          | done  |
-| 3 | several at once, and ranges              | done  |
-| 4 | replication over the wire                | done  |
-| 5 | two roles, and reads that are not stale  | done  |
-| 6 | operations, and writing it down          | done  |
+| what                        | state | why                                     |
+| --------------------------- | ----- | --------------------------------------- |
+| a lock file                 | done  | hours of work against silent corruption |
+| `DB.Demote`, and a lease    | open  | the one real gap left; see below        |
+| ranges that stream and page | open  | scaling, and nobody has hit it yet      |
 
-The server is finished. Three things were weighed after it, and the first is
-done:
-
-| what                                | state | why it was or was not next          |
-| ----------------------------------- | ----- | ----------------------------------- |
-| a lock file                         | done  | hours of work against silent corruption |
-| a lease, and a way down             | open  | the one real gap left; see below    |
-| ranges that stream and page         | open  | scaling, and nobody has hit it yet  |
-
-**A lease, and a way down** is the gap worth naming clearly, because it is the
+**A way down, and a lease** is the gap worth naming clearly, because it is the
 only one where the current behaviour loses acknowledged writes. A replaced
 leader finds out it was replaced when something carrying a newer term asks it
 for records, and until then it goes on taking writes that are lost the moment it
-finds out. There is also no way down at all: the route table has
-`POST /v1/promote` and nothing opposite it, so a node that should hand over has
-to be killed. The shape is `DB.Demote`, a `POST /v1/demote`, and an optional
-lease loop in `litekvd` where a leader that cannot renew stops taking writes on
+finds out. There is also no way down at all: `Promote` raises a term and nothing
+lowers a store back to following, so a node that should hand over has to be
+killed. The engine's half is `DB.Demote`; the daemon's half is a `/v1/demote`
+route and a lease loop where a leader that cannot renew stops taking writes on
 its own — the external-lease arrangement argued for under "Consensus, and why it
 is not on that list". It bounds the window at the lease TTL less the clock skew
 rather than closing it, which is a much smaller number than "until a follower
@@ -1382,88 +1160,11 @@ the cursor, not the merge: a resume has to stay correct across a merge that
 moved the keys under it, which is the same class of problem as carrying a
 stranded follower and took longer than it looked there too.
 
-Piece 4 was the one the rest of the engine was waiting on, and it is done: there
-is now a connection for a leader to hang something off, which is what
-semi-synchronous replication needs and what nothing here had before. What it
-does not yet have is anything hanging off it — the handler keeps no list of
-followers and no record of how far each has got, and adding one is the first
-state a leader would have to keep. See "What piece 4 left for the pieces after
-it" below.
+Below is what was on the list before either of those, kept because the reasoning
+is still the reasoning — and because several entries end in "what is left of it,
+if anyone wants it", which is the useful part.
 
-### What piece 4 left for the pieces after it
-
-**Roles are the missing half and the endpoint is written as if they existed.** A
-node started with `-leader` still serves `PUT` and `DELETE`, and a write to it
-goes into its own active log while `applied` stays where the leader put it. The
-next batch is accepted — `Apply` compares `from` against `applied`, and
-`applied` did not move — so the leader's records land on top of the local ones
-and the two stores disagree with nothing reporting it. `litekvd` warned at
-startup and that was all it did. Piece 5 closed it — `role.go`, and a check on
-every route that stores anything — and this paragraph is kept because the shape
-of the hole is worth knowing: it is what a store does when nothing tells it
-which of the two it is.
-
-**A leader keeps no list of followers, on purpose and only for now.** The
-handler holds one connection and knows nothing about any other. Semi-synchronous
-replication needs the opposite: the leader has to know who is connected and how
-far each has got, and a write has to wait for some of them. The place for that
-is the `send` closure in `streamReplica`, which already sees every position that
-goes out and is the only code that knows a follower took it. What it does not
-see is acknowledgement — nothing comes back up this stream, and there is no
-frame kind for it. That is the first protocol change semi-sync needs, and it is
-also what a heartbeat would need, which is the other thing missing: a stream
-over a blackholed TCP connection is noticed by the OS keepalive in about fifteen
-minutes and by nothing else.
-
-**Two engine gaps this piece worked around are now fixed.** `Follow` writes down
-a newer term where before only `Since` did, and `DB.Fenced` is exported.
-
-The first was a real bug and not a tidiness complaint. Streaming and polling are
-two ways of asking a store for records, and only one of them told a replaced
-leader it had been replaced — so a leader with a follower attached, which is the
-ordinary arrangement and the one the server uses, went on taking writes after
-being superseded, and those writes are lost when it finds out.
-`TestFollowFencesALeaderTheWaySinceDoes` runs both calls through the same
-assertions for that reason: the answer to "who is the leader now" must not depend
-on which one was used.
-
-The handler still asks `Since` before it starts a stream, and that is no longer
-standing in for anything. Everything answerable with a status has to be answered
-before the first byte of the body, and a follower told 409 knows it is pointed at
-a store that has been replaced, where a stream that opened and then died says
-only that a connection ended.
-
-**The leader no longer holds a whole snapshot in memory, and neither does the
-follower.** It spools to a file and copies the file to the connection; the
-follower hands the payload to the store as a reader. The framing did not have to
-change at all — what changed is where the length comes from.
-
-**A file rather than the socket, and the reason is the engine's contract.**
-`DB.Snapshot` holds `mergeMu` for the whole of its call, so whatever it writes to
-decides how long merging is paused on that leader. A buffer is fast and costs the
-store in memory; the socket costs nothing in memory and pauses merging for the
-length of the transfer, which on a slow link is minutes of a leader that cannot
-compact while it is still taking writes. Anyone tempted to "simplify" this by
-handing the socket straight to `Snapshot` should read that sentence twice.
-
-**It cost the follower something and the cost is in a test.** `ApplySnapshot`
-resets the store before it reads, and it now reads from the wire, so a follower
-is emptied at the *start* of a snapshot rather than at the end and a torn
-transfer leaves it holding nothing. `TestAFollowerAppliesASnapshotAsItArrives`
-asserts exactly that, which is the same fact as "it streams" seen from the other
-side.
-
-**`MaxFrame` stopped being a memory bound.** It was a gigabyte and it was the
-largest store that could be replicated at all. It is a terabyte now and it is a
-sanity bound on a number a stranger sent: `readPayload` grows into a payload as
-the bytes arrive, so a header claiming more than it sends costs nothing.
-
-Below is what was on the list before that, kept because the reasoning is still
-the reasoning.
-
-Replication is finished in both halves, for a single store and for a `DB`. What
-follows is ordered for the destination above rather than for a library, which
-puts some small things ahead of some interesting ones.
+Replication is finished in both halves, for a single store and for a `DB`.
 
 Fencing is done: `Promote`, a term on every `DBPosition`, and `ErrorFenced` from
 a store that has heard of a newer one. Expiry is done. Reads that are not stale
@@ -1540,36 +1241,21 @@ anything can be yielded in order. A k-way merge over the per-log sorted keys
 would stream it and hold nothing, and is worth the code only when somebody is
 ranging over most of a large store.
 
-**Semi-synchronous replication** is done, and it needed all three of the things
-that note said it did: a leader that knows its followers, a follower that says
-how far it has got, and a write that waits. `acks.go` is the registry and the
-wait; the follower's half is in `follower.go`.
+**Semi-synchronous replication** is done and it is not here. It needed all three
+of the things that note said it did — a leader that knows its followers, a
+follower that says how far it has got, and a write that waits — and all three
+turned out to belong above the engine, so all three are in the daemon. The
+engine gave up nothing to make it possible, which is the test that the layering
+was right.
 
-The acknowledgement is `POST /v1/replica/ack` and not something coming back up
-the stream, because a response body only goes one way and the alternative is
-full-duplex HTTP/1.1 — which is the thing proxies break, and riding one listener
-through whatever proxy a replica sits behind was the reason for choosing HTTP at
-all.
-
-**What it cannot do is take a write back**, and that is not a shortcut. The
-record is in the log before anything waits — there is nothing to replicate until
-it is written — so a wait that runs out is reported and never undone: 202 rather
-than 204, with `Litekv-Replicated` saying how many followers had it. A client
-that retries on 202 writes the record twice. Say so to anyone who asks for
-"synchronous replication" here; what is on offer is a 204 that means a failover
-will not lose the write, and nothing stronger.
-
-**An ack only counts from a follower this leader is streaming to.** An ack is a
-claim, and what makes it worth anything is that this leader is the one sending
-that follower records. Taking one from anybody would let whatever can reach the
-route satisfy a semi-synchronous write by asserting it had the data — the
-guarantee, given away to a caller that guessed a URL.
-
-It costs 8.3 µs against 215 µs for a 128-byte write on loopback, and all of the
-difference is the network. See `BenchmarkSemiSynchronousWrite`, and read its
-comment before writing another benchmark here: the first measurement of this was
-a curl loop that reported 1507ms waiting against 1513ms not, because a curl
-process costs about seven milliseconds to start and that was the entire number.
+What is worth keeping on this side is the shape of the guarantee, because people
+ask the engine for it: **a write cannot be taken back.** The record is in the log
+before anything waits — there is nothing to replicate until it is written — so a
+wait that runs out is reported and never undone. Say that to anyone who asks for
+"synchronous replication" here; what is on offer is an acknowledgement that means
+a failover will not lose the write, and nothing stronger. Building it any other
+way means holding a record out of the log until a quorum has it, which is a
+different database and is filed under consensus below.
 
 **Carrying a stranded position forward** is done, and the mappings the earlier
 note here proposed turned out not to be needed. The records carry numbers, so a

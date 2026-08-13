@@ -12,9 +12,10 @@ idea, and shipped as the storage engine behind Riak. An append-only log holds th
 in-memory index holds an offset per key, so a write never seeks, a read is one lookup and one read, a
 crash costs at most the record being written, and every key has to fit in memory.
 
-It is also a server. `cmd/litekvd` puts an HTTP API in front of a `DB` and `server/` is the package
-behind it — see "Serving it over HTTP". Nothing in the library itself opens a socket, and that is the
-arrangement rather than an omission.
+This is the engine and nothing else. It imports only the standard library, and no part of it opens a
+socket — that is the arrangement rather than an omission. If you want a database you can run rather
+than a library to build one from, [litekvd](https://github.com/tillknuesting/litekvd) is the server
+that sits on this.
 
 ## Which of the two
 
@@ -625,10 +626,11 @@ next, err := leader.Since(pos, w, litekv.ReplicaOptions{})   // one batch
 
 `example/` wires a leader and a follower over a connection, end to end, in about fifty lines, and shows
 a `DB` followed by another further down. For the same thing over a real socket, with framing, a
-connection broken part way through and a reconnect, see [Replication over the
-wire](#replication-over-the-wire) below: `server/` has the endpoint and `server/replica_test.go` puts a
-leader and a follower through a real listener, which is the only place that says any of this survives a
-wire rather than a pipe.
+connection broken part way through and a reconnect, see
+[litekvd](https://github.com/tillknuesting/litekvd): it has the endpoint, and its tests put a leader
+and a follower through a real listener, which is the only place that says any of this survives a wire
+rather than a pipe. Everything here moves records through a `bytes.Buffer` or an `io.Pipe`, and a pipe
+never returns a short read.
 
 ### A position is not an offset
 
@@ -986,525 +988,21 @@ it.
 
 ## Serving it over HTTP
 
-Nothing in the library opens a socket and nothing in it should: the store has no idea what a request is,
-and keeping it that way is what lets the same code be embedded in a program and served to a network.
-`server/` is the other half of that bargain — a package that imports `litekv`, owns the protocol, and
-reaches the store through the same exported API any other caller would. It is an `http.Handler` and
-nothing else: it does not listen, it does not open the store, and it does not close it.
-`cmd/litekvd` does all three.
+The HTTP server and the `litekvd` daemon moved to a repository of their own:
+
+**[github.com/tillknuesting/litekvd](https://github.com/tillknuesting/litekvd)**
 
 ```bash
-go run ./cmd/litekvd -dir /var/lib/litekv -addr 127.0.0.1:8080
+go install github.com/tillknuesting/litekvd@latest
+litekvd
 ```
 
-| flag                | what it is                                                       | default          |
-| ------------------- | ---------------------------------------------------------------- | ---------------- |
-| `-dir`              | the directory holding the store                                  | required         |
-| `-addr`             | the address to listen on                                         | `127.0.0.1:8080` |
-| `-sync`             | `always`, `every` or `never`                                     | `always`         |
-| `-sync-interval`    | how often to sync under `-sync every`                            | 1s               |
-| `-segment-size`     | bytes before a log is frozen                                     | 4 MiB            |
-| `-merge-trigger`    | logs of a size before they are merged                            | 2                |
-| `-max-value`        | the largest value a write may carry                              | 16 MiB           |
-| `-max-batch`        | the largest body `POST /v1/batch` will take                      | 32 MiB           |
-| `-max-scan`         | the most pairs a range answers with, and the most `?limit=` may ask for | 1000      |
-| `-queue`            | writes that may be waiting before a handler blocks               | 1024             |
-| `-leader`           | base URL of a leader to follow                                   | follow nobody    |
-| `-token-file`       | file holding a shared bearer token; empty means no auth           | none             |
-| `-spool-dir`        | where a snapshot is written on its way to a follower              | system temp      |
-| `-wait-for`         | followers that must have a write before it is acknowledged       | 0 (async)        |
-| `-wait-timeout`     | how long a write waits for them before answering 202             | 5s               |
-| `-heartbeat`        | how often an idle leader says it is there                        | 10s              |
-| `-idle`             | how long a follower waits to hear it before reconnecting         | 30s              |
-| `-read-timeout`     | how long a request has to arrive, headers and body                | 60s              |
-| `-write-timeout`    | how long a response has to be written (streams exempt)            | 60s              |
-| `-idle-timeout`     | how long an idle keep-alive connection is held                    | 120s             |
-| `-shutdown-timeout` | how long requests in flight get once it is asked to stop         | 10s              |
-
-`-sync` defaults to `always` because the library does: a binary that quietly weakened durability
-relative to the code it wraps would be the wrong kind of convenient. `-sync every` is the usual trade
-and the one to reach for.
-
-It listens on loopback unless told otherwise. There is no authentication and no TLS here yet, so put it
-behind a proxy or on a private network before giving it an address a stranger can reach. One `litekvd`
-owns a directory, and the store enforces it: a second one on the same `-dir` fails to start with
-`store directory is open in another process` rather than writing over the first one's log. The claim
-is a lock held for as long as the process lives, so a machine that lost power comes back and starts
-normally — there is nothing to clean up by hand. See Limitations for the platforms that cannot take
-it.
-
-### The routes
-
-| method      | route            | what it does                          | answers          |
-| ----------- | ---------------- | ------------------------------------- | ---------------- |
-| `GET`       | `/v1/keys/{key}` | the value, as the body                | 200, 404         |
-| `HEAD`      | `/v1/keys/{key}` | the value's length and nothing else   | 200, 404         |
-| `PUT`       | `/v1/keys/{key}` | stores the body under the key         | 204              |
-| `DELETE`    | `/v1/keys/{key}` | writes a tombstone                    | 204              |
-| `GET`       | `/v1/keys`       | a range or a prefix, as NDJSON pairs  | 200, 400         |
-| `POST`      | `/v1/batch`      | several records, all of them or none  | 204, 400, 413    |
-| `GET`       | `/v1/replica/stream?from=` | the records after a position, streamed | 200, 400, 409 |
-| `GET`       | `/v1/status`     | which of the two this node is         | 200              |
-| `GET`       | `/health`        | whether this node can serve           | 200, 503         |
-| `GET`       | `/metrics`       | Prometheus text                       | 200              |
-| `POST`      | `/v1/promote`    | stop following and raise the term     | 200              |
-| `POST`      | `/v1/replica/ack` | a follower saying how far it has got | 204, 400, 409    |
-
-A value is the body, raw. There is no JSON envelope around a caller's bytes and nothing is base64 on the
-way through, because a key-value store's whole job is to hand back what it was given; the type is
-`application/octet-stream` and the server has no opinion about what is in it. An empty value is a value,
-and the `Content-Length` of `0` is what tells it apart from a missing key.
-
-`PUT` takes a `Litekv-Expires` header holding an RFC 3339 time, and writes a record that stops answering
-once that instant has passed. It is an instant and not a duration for the same reason the store's expiry
-is one: a duration has to be resolved against somebody's clock, and the only clock a client and a server
-agree on is the one they both write down. A client thinking in TTLs subtracts.
-
-`DELETE` of a key that was never there answers 204, not 404. The store cannot answer that question
-anyway — a delete appends a tombstone without looking for what it hides — so a 404 would be a lie
-dressed as a check.
-
-### Spelling a key in a URL
-
-A key is arbitrary bytes and a URL is not. Percent-encoding a path segment carries all of them: Go's
-`ServeMux` unescapes segment by segment and a `%2F` is deliberately *not* a separator, so a key holding
-slashes, spaces, control bytes, or sequences that are not UTF-8 at all survives the trip unchanged.
-
-```bash
-curl -X PUT --data-binary 'nested' http://127.0.0.1:8080/v1/keys/a%2Fb%2Fc
-curl http://127.0.0.1:8080/v1/keys/a%2Fb%2Fc      # nested
-```
-
-`TestKeyOfAnyBytes` puts thirteen awkward keys through a real socket and a real client rather than
-trusting the documentation for any of that, and checks the store holds the bytes the caller meant rather
-than the ones the URL was spelled with — reading it back through the same encoding would agree with
-itself however wrong both ends were.
-
-The one key with no spelling *here* is the empty one, which the store holds happily. A path wildcard
-does not match an empty segment, so `/v1/keys/` is not a route. It is reachable through the routes that
-do not spell a key in a path — a batch line writes it and a range hands it back — but not through this
-one.
-
-### What a failure says
-
-A failure is a status and a JSON body of one field: `{"error":"key not found"}`. A client that wants to
-branch on what went wrong branches on the status, and the sentence is for whoever is reading a terminal.
-
-| status | when                                                                              |
-| ------ | --------------------------------------------------------------------------------- |
-| 400    | an expiry, a batch line, a range query, or a `from` the server could not read       |
-| 404    | no value under that key — never written, deleted, or expired                        |
-| 405    | a method that route does not have, with an `Allow` header saying which it does      |
-| 409    | the store has been fenced, with `Litekv-Term` carrying the term it is on            |
-| 409    | a write aimed at a replica, with `Litekv-Leader` saying where it should go          |
-| 412    | a read carrying `Litekv-After` from a store that has not got there                  |
-| 504    | the same, after `Litekv-Wait` ran out                                               |
-| 413    | a value over `-max-value`, or a batch over `-max-batch`                             |
-| 503    | the store is closed, which is what a server on its way down looks like              |
-| 500    | anything else                                                                       |
-
-The three ways there can be no value under a key are one status on purpose. The store tells them apart
-because it knows whether the key was asked to go, told to go by itself, or was never there, and none of
-those change what a caller does next.
-
-A 500 says "internal error" and nothing more. An error from the store can name a path on the server's
-disk or an offset in a log, and a stranger has no business with either; it goes to the log instead.
-
-Fencing refuses writes and not reads. A fenced store's records are still records, and refusing to serve
-them would take a replica out of service for a reason that has nothing to do with reading — what the
-term on the answer is for is telling a client that what it just read may be behind.
-
-### One writer under the handlers
-
-A handler per request is a goroutine per request, and a write takes every shard of the store's lock. An
-HTTP server is therefore the worst caller a store of this shape can have: two goroutines writing do not
-merely fail to go faster, they halve its throughput. So `server.New` puts a `Writer` in front of the
-store and every `PUT` and `DELETE` goes through it. This is the caller "One writer in front of many
-callers" was written for, before there was one.
-
-Ten handler goroutines writing a 128-byte value, driven through the handler with recorders so that the
-socket — real cost, and the same cost either way — does not bury what is being measured:
-
-| `-sync`  | nothing stored | straight to the store | through the queue | the store's share |
-| -------- | -------------- | --------------------- | ----------------- | ----------------- |
-| `never`  | 971 ns         | 3,689 ns              | 1,248 ns          | 2,718 → 277 ns    |
-| `every`  | 996 ns         | 3,776 ns              | 1,276 ns          | 2,780 → 280 ns    |
-| `always` | 1,011 ns       | 3.82 ms               | 779 µs            | 3.82 ms → 778 µs  |
-
-The first column is a request that stores nothing, and it is there so the others can be read: building a
-request and a recorder is about a microsecond of every row, and without it the ratio looks smaller than
-it is. Take it off and the queue is worth **9.8x** with no sync at all — that is pure lock contention
-going away — and **4.9x** under `SyncAlways`, where what is being amortized is one wait for the disk
-shared out among everybody waiting. End to end, request and all, it is 3.0x and 4.9x.
-
-A `Server` therefore has to be closed, even though the store it serves is somebody else's: `New` starts
-the writer's goroutine. Three things go down and the order is the whole of it — stop taking requests,
-close the `Server`, close the store. Any other order answers a request that was already accepted with a
-503, or drops a write that was a moment from being acknowledged. `litekvd` does it in that order and
-`TestClosingTheServerStopsWritesAndNotReads` holds the middle step to it: a closed `Server` refuses
-writes with 503 and goes on answering reads, because the store is still open and still holds everything.
-
-### Several at once, and ranges
-
-Two routes carry more than one record, and both of them carry it as **newline-delimited JSON**: one
-object to a line, no array around them, so a body can be produced and consumed a line at a time and
-neither end has to hold a large answer as a single JSON value before it can look at any of it.
-
-```bash
-curl -X POST --data-binary @- http://127.0.0.1:8080/v1/batch <<'EOF'
-{"op":"write","key":"user:1","value":"ada"}
-{"op":"write","key":"user:2","value":"grace","expires":"2030-01-01T00:00:00Z"}
-{"op":"delete","key":"user:0"}
-EOF
-
-curl 'http://127.0.0.1:8080/v1/keys?prefix=user:'
-# {"key":"user:1","value":"ada"}
-# {"key":"user:2","value":"grace"}
-```
-
-`POST /v1/batch` stores every operation or none of them, and answers 204. `"op"` is `"write"` or
-`"delete"`, `"expires"` is an RFC 3339 time meaning exactly what the `Litekv-Expires` header means on a
-`PUT`, and a delete carrying a value or an expiry is refused rather than having them quietly dropped.
-An absent key or value is the empty one, a blank line is skipped, and an empty body stores nothing and
-answers 204 — an empty batch is what the engine calls an empty batch.
-
-All or nothing means two things and the route provides both. The engine provides the second:
-`WriteBatch` puts the records down behind a marker and recovery discards from that marker on unless
-every one of them is there. The route provides the first: the **whole body is parsed** into a
-`litekv.Batch` before any of it is handed to the store, so one line the server cannot read refuses the
-whole request with a 400 naming that line. A parser that stored as it went would make the marker
-pointless — atomic on the disk and torn on the wire.
-
-### A key is bytes and a JSON string is not
-
-Both routes use one encoding rule, in both directions:
-
-- A key or a value is a plain string field — `"key"`, `"value"` — when it is **valid UTF-8**.
-- It is a separate base64url field — `"key_b64"`, `"value_b64"` — when it is not. That is
-  `base64.RawURLEncoding`: the alphabet of RFC 4648 §5 and **no padding**, since padding carries
-  nothing and one spelling of a field is easier to be right about than two.
-- Which one is decided by `utf8.Valid` and by nothing else. `encoding/json` replaces a byte that is not
-  UTF-8 with U+FFFD rather than refusing it, in both directions, and a store that hands back a
-  replacement character where its caller wrote `0xff` has lost that caller's data while answering 200.
-- Sending both forms of one field is an error rather than something to resolve, and so is a raw byte
-  that is not UTF-8 anywhere in a line — that is what the `_b64` fields are for.
-
-The plain form is the ordinary one and is meant to be: keys people actually have are text, and a body
-of them should be readable in a terminal without anything being decoded first.
-
-This is also the only place the **empty key** can be reached. It has no spelling in a path, but a batch
-line with no `key` field — or with `"key":""` — writes it, and a range hands it back.
-
-### Reading a range over HTTP
-
-`GET /v1/keys` takes `?prefix=` or `?from=`&`?to=`, with `from` included and `to` excluded, and answers
-the matching pairs in key order. Both bounds and the prefix are percent-decoded exactly as a key in a
-path is, so they carry any byte a key can hold; `TestBoundOfAnyBytes` puts eleven awkward prefixes
-through a real socket the way `TestKeyOfAnyBytes` does for paths.
-
-| the request                     | what it means                                                  |
-| ------------------------------- | -------------------------------------------------------------- |
-| no parameters at all            | every key, capped by the maximum below                          |
-| `?prefix=` with nothing after it| the same thing: an empty prefix is every key, as it is in the engine |
-| `?from=` or `?to=` empty        | no bound on that side                                           |
-| `prefix` with `from` or `to`    | 400. They are two ways of naming one range, not two to intersect |
-| a `from` after its `to`         | an empty range, which is 200 and no lines                       |
-| nothing matched                 | 200 and no lines. There is no key here to be missing, so no 404  |
-| `?limit=` empty, zero, negative | 400. A client that built the query wrongly should hear about it  |
-| `?limit=` over `-max-scan`      | 400, naming the maximum                                         |
-
-The limit is refused rather than quietly lowered because counting the lines against the limit it asked
-for is the only way a client can tell that an answer was cut short. Paging is that plus one byte: `from`
-is inclusive, so the next page starts at the last key with a `%00` after it.
-
-**What the limit does not buy is a cheap range.** A range is gathered and not streamed — every log has
-to be asked before the first key can be yielded in order, and the store's read lock is held for all of
-it — so stopping at the limit does not stop the walk that found the keys. What it stops is reading the
-records: the value copies, and for a frozen log the system calls that fetch them, which is most of the
-cost of a large answer but not the search. A range that has to be cheap has to be narrow. `-max-scan` is
-there because rotation and merging want the write lock and would otherwise queue behind whoever is
-scanning; it is the cap a client cannot raise.
-
-For the same reason the answer is built in memory and sent afterwards rather than written from inside
-the range. The callback runs under the store's read lock, and a client that stopped reading a socket
-under it would be deciding when the store is allowed to rotate — the same trade `GET /v1/keys/{key}`
-makes by using `Read` instead of `View`. The framing is still NDJSON and a client can still consume it a
-line at a time; what it does not get is a lock held open while it does.
-### Replication over the wire
-
-Everything the [Replication](#replication) chapter describes now has a route. The leader streams from a
-position on the same listener it serves keys on, and a follower is a second `litekvd` pointed at it:
-
-```bash
-litekvd -dir /var/lib/litekv   -addr 127.0.0.1:8080
-litekvd -dir /var/lib/replica  -addr 127.0.0.1:8081 -leader http://127.0.0.1:8080
-```
-
-**One listener and not two.** One port to open, one thing to shut down, one place for authentication to
-go when there is any, and it goes through whatever proxy or load balancer a read replica is already
-behind — a second raw TCP listener would have needed every one of those again. What it costs is a few
-bytes of chunked framing per batch, which against the megabyte a batch defaults to is not a number worth
-writing down.
-
-The body is the framing `tcp_test.go` arrived at over a bare socket, carried across unchanged: a kind
-byte, the position those records leave a follower at, a length, and the payload, flushed per frame. A
-record stream is self-framing, but a reader still has to know where one batch stops and the next
-begins, and a snapshot has to be told from a batch because different calls apply them.
-
-**A position on the wire is opaque.** It is base64url of `MarshalBinary`, unpadded, and a follower hands
-back the bytes it was given without taking them apart. That is what lets a `DBPosition` gain a field — as
-it has twice, for the term and for the sequence number — with nothing on the client side knowing. It is
-a cookie, not a structure, and one that is not a position at all is a 400.
-
-**A leader answers divergence with a snapshot, not by hanging up.** Nothing holds a log open for a
-follower that is not connected, so a follower that was away long enough always comes back to a position
-that is gone — that is the ordinary fate of one that missed a merge, not an unusual path. A leader that
-treated it as a failed connection would leave that follower asking for the same dead position forever,
-and reconnecting would never help.
-
-**A connection ending is normal.** The follower reconnects with a backoff that doubles from 100 ms to
-5 s, half of each wait jittered so that several followers that lost the same leader do not all come
-back at the same instant. A connection that stayed up longer than the longest wait was a working one,
-so the next attempt starts from the shortest wait again. A leader that refuses — 409 because it has been
-replaced, 400 because it could not read the position — is retried at the longest interval rather than
-climbing to it: asking again straight away cannot change the answer, and somebody promoting something
-can.
-
-Stopping a follower does not cost it its place. The position is written down beside the follower's own
-logs by `Apply`, so a follower that comes back reads it out of the store and resumes; nothing in the
-process keeps a copy that could go stale. `Close` waits for the goroutine, so a batch being applied when
-the stop arrives is finished and written down before the store may be closed.
-
-**Shutting a leader down with a follower attached** needs one thing that is easy to leave out. A stream
-is a request that never finishes on its own, and `http.Server.Shutdown` waits for every request rather
-than cancelling any of them, so a leader would spend the whole of `-shutdown-timeout` waiting for a
-handler that had no intention of returning: **10.05 s against 0.03 s**, measured with two binaries on
-loopback. `Server.CloseStreams` ends the streams and refuses new ones, and `litekvd` hands it to
-`(*http.Server).RegisterOnShutdown`. A follower whose stream ends that way reconnects, which is what it
-does about any connection ending.
-
-What is **not** here yet is roles. Nothing marks a node as a follower, so one started with `-leader` also
-takes writes of its own, and a write to it will diverge it from its leader — its own records go into its
-own log while the leader's position marches on. `litekvd` says so at startup and that is all it does
-about it. Do not write to a node with `-leader` on it.
-
-### Sending a snapshot without holding one
-
-A snapshot frame is the whole live store, and a frame carries its length in front
-of it — so the leader has to know how long the snapshot is before it can start sending. It used to find
-out by building the thing in memory, and the follower read it back into a slice, which meant replicating
-a store cost that store **twice over in RAM**, in a database whose whole premise is that only the keys
-have to fit.
-
-Neither end holds one now. The leader writes the snapshot to a file, then copies the file to the
-connection; the follower hands the payload straight to the store as a reader. What it costs is disk:
-about the size of the live records, transiently, per follower taking a snapshot at once.
-
-**Why a file and not the socket.** `DB.Snapshot` holds the merge lock for the whole of its call — it has
-to, or a merge could take a log out from under the walk — so whatever it writes to decides how long
-merging on that leader is paused. A buffer is fast and costs the store in memory. The socket costs
-nothing in memory and pauses merging for as long as the transfer takes, which over a slow link is
-minutes of a leader that cannot compact while it is still taking writes. A local file is the only one of
-the three that is both fast and bounded.
-
-`-spool-dir` is where it lands, and it is worth setting. The default is the system temporary directory,
-and **on most Linux systems `/tmp` is a tmpfs** — which puts the whole live store back in memory and
-undoes the point. The store's own directory is usually right: it is sized for the data and it is the
-same filesystem. The file is unlinked the moment it is created, so nothing has to remember to remove it —
-not a panic, not a killed process, not a follower that hangs up half way.
-
-**What this cost.** A follower is now emptied at the *start* of a snapshot rather than at the end,
-because `ApplySnapshot` resets the store before it reads anything and it is now reading from the wire. A
-transfer that breaks half way leaves that follower holding nothing until it reconnects and takes another,
-where before it held what it had until the snapshot was known-complete. That is the trade, and
-`TestAFollowerAppliesASnapshotAsItArrives` is where it is written down.
-
-The frame bound went from a gigabyte to a terabyte with it. It used to be the largest store that could
-be replicated at all; what is left is a sanity bound on a number a stranger sent, since a payload is
-grown into as it arrives and a header claiming more than it sends costs nothing.
-
-### Semi-synchronous replication
-
-Replication here is asynchronous by default: a write returns as soon as the leader has it, so a leader
-that dies loses whatever its followers had not received. `-wait-for` is the answer to exactly that — a
-write is not acknowledged until that many followers have it.
-
-```bash
-litekvd -dir /var/lib/litekv -addr 0.0.0.0:8080 -wait-for 1 -wait-timeout 5s
-```
-
-**What it cannot do is take a write back.** The record is in the leader's log before anything waits; it
-has to be, since there is nothing to replicate until it is written, and nothing here can unwrite it. So
-a wait that runs out is *reported* and never undone:
-
-| status | means                                                                       |
-| ------ | --------------------------------------------------------------------------- |
-| 204    | stored, and `Litekv-Replicated` followers had it — a failover will not lose it |
-| 202    | stored, and fewer than `-wait-for` had it before the wait ran out              |
-
-A client that reads 202 as a failure and retries will write the record twice. That is the honest shape
-of semi-synchronous replication and not a shortcut in this one; MySQL degrades to asynchronous after its
-timeout for the same reason.
-
-Every write carries `Litekv-Replicated` once `-wait-for` is set, including the ones that did not reach
-it, and `litekv_replication_followers` says how many the leader could wait for at all. A leader
-answering 202 to everything with that gauge at zero is a leader whose followers are gone, which is
-exactly the thing worth alerting on.
-
-What it costs, with a real follower on a real listener — a write is now a round trip to that follower
-and back:
-
-| `-wait-for` | a 128-byte write |
-| ----------- | ---------------- |
-| unset       | 8.3 µs           |
-| 1           | 215 µs           |
-
-Twenty-six times, and all of it is the network: the leader writes the frame, the follower applies it and
-posts an acknowledgement, and the leader wakes. On loopback that is 200 µs; between two machines it is
-whatever two round trips cost there. It is the price of the guarantee and there is no version of this
-that is cheaper.
-
-**An acknowledgement only counts from a follower this leader is streaming to.** An ack is a claim, and
-what makes it worth anything is that this leader is the one sending that follower records — otherwise
-anything that could reach `/v1/replica/ack` could satisfy a semi-synchronous write by asserting it had
-the data. A follower whose stream has ended is forgotten rather than kept at its last position, because
-`-wait-for` is a number about now and one that left an hour ago is not going to acknowledge anything.
-
-The acknowledgement is a route of its own rather than something coming back up the stream. A response
-body only goes one way, and the alternative — a request body the follower writes to while reading the
-response — is full-duplex HTTP/1.1, which is the thing proxies break. Riding one listener was the reason
-for choosing HTTP; a scheme a proxy mangles would give that back.
-
-### A quiet stream and a dead one
-
-They look alike from the follower's end, and that is the problem. A TCP connection that has been
-blackholed rather than closed — a cable pulled, a firewall dropping instead of refusing, a leader that
-lost power — delivers nothing and reports nothing, and the OS keepalive notices in about fifteen
-minutes. A follower that is not being written to has no other way to tell.
-
-So a leader with nothing to send says so: a heartbeat frame every `Heartbeat` (10s by default), carrying
-the leader's own position so a follower can see how far behind it is while nothing is being written. It
-is not applied and must not be — it names records the follower has not been sent.
-
-A follower that hears nothing for `Idle` (30s by default, three beats) drops the connection and dials
-again, which costs it nothing: it comes back at the position it had.
-
-**The deadline is on silence, not on a frame.** A snapshot of a large store is one frame that takes as
-long as it takes, and a deadline that only moved when a frame completed would cancel the transfer it was
-in the middle of — turning a slow first sync into a loop that never finishes one. Every chunk that
-arrives counts as the leader being alive.
-
-Two things this cost, both worth knowing. There are now two goroutines with something to say on one
-connection, so every frame goes out under one lock — an `http.ResponseWriter` written by two goroutines
-at once is a data race and a corrupted frame, in that order. And the handler waits for its heartbeat
-goroutine before returning, because a `ResponseWriter` may not be touched once its handler has returned;
-left to stop in its own time it writes into a response net/http is already finishing. The race detector
-found the second one. Nothing else would have.
-
-### Which of the two, and reads that are not stale
-
-A node started with `-leader` is a **replica**. It refuses every write with 409 and a `Litekv-Leader`
-header saying where to send it — `PUT`, `DELETE` and `POST /v1/batch` alike — and it goes on answering
-reads, which is what it is for.
-
-That refusal is not fencing and could not be. A store that is following holds its leader's term, so
-`ErrorFenced` never fires, and it will take a write perfectly happily: the record goes into its own log,
-the leader's records keep arriving around it, and the two histories never reconcile. No checksum is
-wrong and nothing errors. It is the quietest way to lose data this design has, and the only thing that
-prevents it is this server knowing which of the two it is — the engine cannot know, because the thing
-pulling the records is up here.
-
-```bash
-curl -X POST http://127.0.0.1:8081/v1/promote      # {"term":1}
-curl http://127.0.0.1:8081/v1/status
-# {"role":"leader","term":1,"position":"...","segments":3,"keys":812}
-```
-
-`POST /v1/promote` stops the following first and raises the term second, and the order is the point: a
-term raised while records are still arriving is a store that has fenced its own leader and then applies
-another of its batches. What promotion does not do is decide that this node should be the leader — that
-is consensus, and it is not here; see `AGENTS.md` for why an external lease is the pragmatic answer at
-this size.
-
-**Reads that are not stale** are the other half, and the reason `Reached` and `Await` were built. Every
-write answers with `Litekv-Position`, an opaque cookie for where the store had got to. Send it back as
-`Litekv-After` on a later read and a node that has not got there refuses rather than answering with what
-it has:
-
-```bash
-POS=$(curl -si -X PUT --data-binary 'ada' http://127.0.0.1:8080/v1/keys/user:1 \
-      | grep -i '^litekv-position:' | cut -d' ' -f2 | tr -d '\r')
-
-curl -H "Litekv-After: $POS" -H "Litekv-Wait: 2s" http://127.0.0.1:8081/v1/keys/user:1
-```
-
-Without `Litekv-Wait` a replica that is behind answers 412 at once, with its own position in
-`Litekv-Position` so a client can decide whether to wait here or go elsewhere. With it, the read waits
-on `Await` and answers 504 if the time runs out — which says the wait was too short, not that the
-records are never coming. This is read-your-writes across a load balancer, and it hides the replication
-lag from the client that just wrote; it does not remove it.
-
-### Running it
-
-`GET /health` answers 200 while the store can serve and 503 once it is closing, and it asks the store
-the cheapest question that touches its state — no disk. **It is the one route a token does not cover**:
-a load balancer probing this node is not a client and has no business holding the secret that opens the
-database.
-
-`GET /metrics` is Prometheus text — a counter per route, method and status, a latency histogram per
-route, and the store's own numbers:
-
-```
-litekv_requests_total{route="/v1/keys/{key}",method="GET",status="200"} 41231
-litekv_request_duration_seconds_bucket{route="/v1/keys/{key}",le="0.001"} 41180
-litekv_replication_streams 2
-litekv_role{role="leader",leader=""} 1
-litekv_term 1
-litekv_store_keys 812
-litekv_store_segments 3
-```
-
-`litekv_replication_streams` is the one gauge a request in flight contributes to, and it exists because
-`litekv_requests_total` counts requests that *finished*: a replication stream that has been up for a
-week has never been counted once. How many followers are attached right now is the number an operator
-actually wants.
-
-The route label is the **pattern** and never the path. A label taken from the URL would be one series
-per key, and `/metrics` would grow with the store until it was the largest thing this server sends
-anybody. Every route is registered through one function so that it cannot be forgotten, and
-`TestEveryRouteIsCounted` holds it there.
-
-Requests are logged at Debug, so turning request logging on is a level rather than a flag. A server
-logging every request at Info is a server whose log nobody reads, and the failures that matter log
-themselves already.
-
-### Keeping strangers out
-
-`-token-file` names a file holding a shared secret that every request must carry as
-`Authorization: Bearer <token>`. A file and not a flag value, because an argument is visible in `ps` to
-every process on the machine. The same token authenticates this node to its `-leader`.
-
-It covers everything except `/health` — **replication included**, which is the route that matters most,
-since it hands the whole database to whoever asks. The comparison is constant time: one that stopped at
-the first wrong byte would tell a caller how much of the token it had right, and a few thousand requests
-turn that into all of it.
-
-This is a shared secret and nothing else. There are no users, no scopes, and no read-only credential:
-anything that can read can also write. It is not a substitute for TLS, which is still not here.
-
-### Timeouts, and the one route exempt from them
-
-Without timeouts a client that opens a connection and sends a byte an hour holds a handler for as long
-as it likes, and enough of them are the whole server. `litekvd` sets a 10s header timeout and the three
-above.
-
-`-write-timeout` bounds how long a response may take to write, and there is exactly one response here
-that is meant to still be being written next week: the replication stream. Rather than go without the
-timeout because of that route, **the route takes its own deadline off** — one call to
-`http.ResponseController`. `TestAStreamTakesItsWriteDeadlineOff` runs a real follower over a listener
-with a 150ms write timeout and counts connections rather than records, because a stream cut by a
-deadline is one the follower reconnects to and the records arrive either way. One connection is the
-assertion; two means the deadline cut it.
+It is a database you can run, built on this library: one key at a time, batches,
+ranges, leader and replica, semi-synchronous replication, health and metrics.
+This repository is the storage engine underneath it and imports nothing outside
+the standard library — no `net/http` anywhere in it. If you want a server, take
+that one; if you want to build something of your own on the log, you are in the
+right place.
 
 ## Concurrency
 
@@ -1793,14 +1291,11 @@ anything either.
   which is never merged. So the answer is always another snapshot, and a loop that follows a `DB` has to
   be written with that in it.
 - **The library's replication is asynchronous, and only that.** A write returns as soon as the leader
-  has it, so a leader that dies loses whatever its followers had not received yet. `server` adds
-  semi-synchronous replication on top — `-wait-for` — but the engine itself has no acknowledgement from
-  a follower and nothing in it waits for one. `Reached` lets a client refuse a replica that has not got
-  to a write it already knows about, which is a different thing: it hides the lag from that client, it
-  does not remove it.
-- **A semi-synchronous write cannot be taken back.** The record is in the leader's log before anything
-  waits, so a wait that runs out is reported — 202, and `Litekv-Replicated` — and never undone. A client
-  that retries on 202 writes the record twice.
+  has it, so a leader that dies loses whatever its followers had not received yet. There is no
+  acknowledgement from a follower here and nothing waits for one; `litekvd` builds semi-synchronous
+  replication on top of these pieces, out of an acknowledgement route of its own. `Reached` lets a
+  caller refuse a replica that has not got to a write it already knows about, which is a different
+  thing: it hides the lag from that caller, it does not remove it.
 - **There is no failover.** Which store is the leader is your decision and nobody else's: `Promote`
   writes the decision down, it does not make it. Raising the term in two places at once puts two stores
   on the same term and gives the guarantee away, so whatever decides has to be the only thing deciding.
@@ -1809,23 +1304,20 @@ anything either.
 - **A fenced leader has to be told, and only replication tells it.** It cannot know it was replaced;
   the news reaches it when something carrying a newer term asks it for records — either kind of asking,
   `Since` or `Follow`. Until then it goes on taking writes, and those writes are lost when it finds out.
-  `DB.Fenced` and `/v1/status` report the state once it is known, which is not the same as knowing it
-  early. Fencing bounds the damage, it does not prevent it.
-- **Sending a snapshot needs disk, not memory.** The leader spools it to `-spool-dir` — about the size
-  of the live records, transiently, per follower taking one at once — and the default is the system
-  temporary directory, which on most Linux systems is a tmpfs and therefore memory. Set it.
-- **A snapshot empties a follower before it fills it.** `ApplySnapshot` resets the store and then reads,
-  and it now reads from the connection, so a transfer that breaks half way leaves that follower holding
-  nothing until it reconnects and takes another one.
+  `DB.Fenced` reports the state once it is known, which is not the same as knowing it early. Fencing
+  bounds the damage, it does not prevent it.
+- **A snapshot empties a follower before it fills it.** `ApplySnapshot` resets the store and then reads
+  from the reader it was given, so a snapshot arriving over a connection that breaks half way leaves
+  that follower holding nothing until it takes another one.
 - **A follower is a whole copy.** There is no partial replication, no filtering by key, and no way to
   follow one part of a store. The unit is the log.
 - **A replica costs the leader a copy.** Each batch is copied out of `Data` under the read lock before
   it is written to the connection, which is what keeps a slow follower from blocking writes. Ten
   followers catching up at once is ten copies.
 - **One process owns a directory, and the lock is advisory.** `OpenDB` takes an exclusive lock on a
-  `LOCK` file in the directory and holds it until `Close`, so a second `litekvd` on the same `-dir`
-  reports `store directory is open in another process` and stops instead of writing over the first
-  one's log. What it excludes is anything asking for the same lock, which means another litekv and
+  `LOCK` file in the directory and holds it until `Close`, so a second process opening the same
+  directory gets `ErrorLocked` — `store directory is open in another process` — instead of writing
+  over the first one's log. What it excludes is anything asking for the same lock, which means another litekv and
   nothing else: a shell redirect into a log is unaffected. It is also local to the machine — `flock`
   is emulated or machine-local on network filesystems — and a store on NFS is already outside what
   the sync policies can promise.
@@ -1834,16 +1326,6 @@ anything either.
   `golang.org/x/sys`, and this module has no dependencies. Those platforms open exactly as every
   platform did before the lock existed, which is to say unprotected, and they create no `LOCK` file —
   one that locked nothing would read as protection. `lock_none.go` is the whole of it.
-- **The HTTP API has no authentication and no TLS.** `litekvd` listens on loopback for that reason. Put
-  it behind a proxy or on a private network before it has an address a stranger can reach, and note that
-  this applies to every route: there is nothing to stop a client writing as well as reading.
-- **The empty key has no spelling in a path.** The store holds it happily and a path wildcard will not
-  match an empty segment, so `/v1/keys/` is not a route and the single-key routes cannot reach it. A
-  batch line writes it and a range hands it back, which is where it went rather than a way around this.
-- **A range over HTTP is capped and cannot be paged through cheaply.** `-max-scan` bounds what one
-  request answers with, and a client walks a large store by asking again from the last key it saw —
-  which starts the gather over, since the engine has nowhere to resume from. The cap is a count and not
-  a number of bytes, so a store of large values wants a smaller one than a store of small ones.
 
 ## Working on it
 

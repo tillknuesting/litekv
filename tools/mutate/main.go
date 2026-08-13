@@ -5,14 +5,16 @@
 //	go run ./tools/mutate replica batch   # only those whose name matches
 //
 // Every mutation must be caught. A mutation that survives is a promise the code
-// makes that nothing is holding it to; the five that are allowed to survive are
-// listed in AGENTS.md with the reason for each, and a sixth is news.
+// makes that nothing is holding it to. Every one of these must be caught: the
+// survivors that are allowed on purpose all belonged to the server, and left
+// with it.
 //
 // # Why this is parallel, and why each worker gets its own copy of the tree
 //
-// The server's suite takes three seconds. A sweep of sixty-six mutations took
-// twenty-five minutes, and the difference is the thing worth knowing: a caught
-// mutation is usually caught by a test waiting out a deadline.
+// The suite takes forty-five seconds under -race. A sweep of sixty-six
+// mutations of the server once took twenty-five minutes, and the difference is
+// the thing worth knowing: a caught mutation is usually caught by a test
+// waiting out a deadline.
 // TestOneSmallRecordArrivesAtOnce gives a record fifteen seconds to arrive;
 // waitForPositions gives a follower thirty. Those numbers are right — a shorter
 // deadline is a test that fails on a busy machine and says nothing about the
@@ -154,8 +156,8 @@ func sweep(root, pool string, chosen []mutation) map[string]string {
 			defer running.Done()
 
 			// One tree per worker, named for the worker and not for the
-			// mutation, so that the copy is paid for once rather than a
-			// hundred and seventeen times.
+			// mutation, so that the copy is paid for once per worker rather
+			// than once per mutation.
 			where := filepath.Join(pool, fmt.Sprintf("w%d", w))
 
 			for m := range queue {
@@ -182,7 +184,7 @@ func attempt(root, where string, m mutation) string {
 		return "SKIPPED (no tree: " + err.Error() + ")"
 	}
 
-	full, pkg, timeout := locate(where, m.file)
+	full, pkg := locate(where, m.file)
 
 	source, err := os.ReadFile(full)
 	if err != nil {
@@ -202,17 +204,17 @@ func attempt(root, where string, m mutation) string {
 	}
 	defer os.WriteFile(full, source, 0o644)
 
-	return verdict(where, pkg, timeout)
+	return verdict(where, pkg)
 }
 
 // verdict builds and tests a tree that has already been broken.
-func verdict(where, pkg, timeout string) string {
+func verdict(where, pkg string) string {
 	// go vet is the gate rather than go build because vet catches the
 	// unreachable code a clumsy mutation leaves behind — and because a mutation
-	// that does not typecheck did not run either. It is the package under test
-	// and not always ./server/, which is what it used to be: an engine mutation
-	// was only ever type-checked as somebody else's dependency, so vet's own
-	// analyses never saw it.
+	// that does not typecheck did not run either. It is the package the mutation
+	// is in and not a fixed one, which it used to be: a mutation outside that
+	// package was only ever type-checked as somebody else's dependency, so vet's
+	// own analyses never looked at it.
 	if out, err := goCommand(where, "vet", pkg); err != nil {
 		// The message, not just the fact. A bare "does not build" is a mutation
 		// that did not run and no way to find out why, which is half a day the
@@ -231,7 +233,7 @@ func verdict(where, pkg, timeout string) string {
 	// handler returned is a race and nothing else, and a sweep without the flag
 	// reports it as caught by nobody. It costs about a second a mutation and
 	// buys the whole class.
-	out, err := goCommand(where, "test", "-race", "-count=1", "-timeout", timeout, pkg)
+	out, err := goCommand(where, "test", "-race", "-count=1", "-timeout", suiteTimeout, pkg)
 	if err == nil {
 		return "SURVIVED"
 	}
@@ -240,13 +242,13 @@ func verdict(where, pkg, timeout string) string {
 	// binary killed by -timeout exits non-zero exactly like a failing one, so a
 	// timeout set below what a suite honestly needs turns every mutation in
 	// that package into a pass — a sweep that reports 100% caught and tested
-	// nothing. Since the engine's suite is forty-five seconds where the
-	// server's is three, that stopped being hypothetical.
+	// nothing. See suiteTimeout, which is the number that must never be tuned
+	// down to make a sweep finish sooner.
 	if strings.Contains(out, "test timed out") {
 		if hung := stillRunning(out); len(hung) > 0 {
 			return "caught (hung " + strings.Join(hung, ", ") + ")"
 		}
-		return "TIMED OUT after " + timeout + " (raise it; this is not a catch)"
+		return "TIMED OUT after " + suiteTimeout + " (raise it; this is not a catch)"
 	}
 
 	if caught := failed(out); len(caught) > 0 {

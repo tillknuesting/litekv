@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 )
 
 // skipped are the directories a worker's copy does without.
@@ -125,30 +124,31 @@ func copyFile(from, to string, perm os.FileMode) error {
 	return target.Close()
 }
 
-// locate is the file to break, the package to run, and how long to give it.
+// suiteTimeout is how long a mutated tree gets before its tests are killed.
 //
-// A bare name is a file under server/, which is what every mutation was when
-// this tool was written and what most of them still are. A name with a slash in
-// it is relative to the repository — "./db.go" is the engine — because "db.go"
-// on its own would silently mean server/db.go, and a sweep that broke a file
-// nobody meant to break is the failure this whole tool exists to avoid.
-//
-// The timeout goes with the package because the two suites are not the same
-// size. The server's takes three seconds and the engine's forty-five under
-// -race, and a timeout below what the suite honestly needs is the worst
-// possible setting: every mutation reports caught, because a test binary killed
-// by the deadline exits non-zero exactly like a failing one.
-func locate(where, path string) (full, pkg, timeout string) {
-	if !strings.Contains(path, "/") {
-		return filepath.Join(where, "server", path), "./server/", "90s"
-	}
+// This suite takes about forty-five seconds under -race, so ten minutes is room
+// to spare on a machine running eight of them at once. Raising it is cheap;
+// lowering it below what the suite honestly needs is the worst thing that can be
+// done to this tool, because a test binary killed by the deadline exits non-zero
+// exactly like a failing one — every mutation would report caught and the sweep
+// would be testing nothing.
+const suiteTimeout = "600s"
 
+// locate is the file to break and the package to run it in.
+//
+// A path relative to the repository root, always: "db.go". It used to take a
+// bare name as meaning server/ and a slash as meaning the root, which saved
+// some typing and cost a rule nobody could keep in their head — and a sweep
+// that breaks a file nobody meant to break is the failure this whole tool
+// exists to avoid.
+func locate(where, path string) (full, pkg string) {
 	clean := filepath.Clean(path)
+
 	inside := filepath.Dir(clean)
 	if inside == "." {
-		return filepath.Join(where, clean), "./", "600s"
+		return filepath.Join(where, clean), "./"
 	}
-	return filepath.Join(where, clean), "./" + inside, "600s"
+	return filepath.Join(where, clean), "./" + inside
 }
 
 // goCommand runs the go tool in a worker's tree and hands back everything it
