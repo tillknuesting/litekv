@@ -211,9 +211,7 @@ func sweep(root, pool string, chosen []Mutation, opts Options) map[string]string
 
 	var running sync.WaitGroup
 	for w := range opts.workers() {
-		running.Add(1)
-		go func() {
-			defer running.Done()
+		running.Go(func() {
 
 			// One tree per worker, named for the worker and not for the
 			// mutation, so that the copy is paid for once per worker rather
@@ -231,7 +229,7 @@ func sweep(root, pool string, chosen []Mutation, opts Options) map[string]string
 				fmt.Printf("[%3d/%d] %-58s %s\n", done, len(chosen), verdict, m.Name)
 				mu.Unlock()
 			}
-		}()
+		})
 	}
 	running.Wait()
 
@@ -318,7 +316,7 @@ func verdict(where, pkg, timeout string) string {
 // test" for every mutation that only a t.Run caught.
 func failed(out string) []string {
 	var caught []string
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) >= 3 && fields[0] == "---" && fields[1] == "FAIL:" {
 			caught = append(caught, fields[2])
@@ -342,7 +340,7 @@ func failed(out string) []string {
 // is the same kind of quiet miss this tool is otherwise careful about.
 func stillRunning(out string) []string {
 	var hung []string
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "\t") || !strings.HasPrefix(trimmed, "Test") {
 			continue

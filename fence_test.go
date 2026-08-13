@@ -138,8 +138,8 @@ func TestFencedFollowerRefusesAnOldLeader(t *testing.T) {
 	if _, err := leader.Promote(); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 20; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+	for i := range 20 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -212,8 +212,8 @@ func TestPromotedFollowerFencesTheOldLeader(t *testing.T) {
 	if _, err := old.Promote(); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 20; i++ {
-		if err := old.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+	for i := range 20 {
+		if err := old.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}

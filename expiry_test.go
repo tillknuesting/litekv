@@ -237,8 +237,8 @@ func TestDBMergeKeepsAnExpiredRecordUntilItReachesTheOldestLog(t *testing.T) {
 	if err := db.Write([]byte("key"), []byte("older")); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 40; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("filler-%02d", i)), []byte("value")); err != nil {
+	for i := range 40 {
+		if err := db.Write(fmt.Appendf(nil, "filler-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -246,7 +246,7 @@ func TestDBMergeKeepsAnExpiredRecordUntilItReachesTheOldestLog(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 40; i < 80; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("filler-%02d", i)), []byte("value")); err != nil {
+		if err := db.Write(fmt.Appendf(nil, "filler-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -360,7 +360,7 @@ func TestDBTieredKeepsExpiredRecords(t *testing.T) {
 	if err := db.Write([]byte("doomed"), []byte("the old value")); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Write([]byte("filler"), []byte(fmt.Sprintf("%150s", "x"))); err != nil {
+	if err := db.Write([]byte("filler"), fmt.Appendf(nil, "%150s", "x")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -368,8 +368,8 @@ func TestDBTieredKeepsExpiredRecords(t *testing.T) {
 	if err := db.WriteExpiring([]byte("doomed"), []byte("the new value"), start.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 6; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("other%d", i)), []byte(fmt.Sprintf("%150s", "y"))); err != nil {
+	for i := range 6 {
+		if err := db.Write(fmt.Appendf(nil, "other%d", i), fmt.Appendf(nil, "%150s", "y")); err != nil {
 			t.Fatal(err)
 		}
 	}

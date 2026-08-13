@@ -224,10 +224,7 @@ func (w *watchedDisk) allowWrite(name string, n int) (int, bool) {
 	}
 
 	already := w.written[key]
-	room := limit - already
-	if room < 0 {
-		room = 0
-	}
+	room := max(limit-already, 0)
 	if int64(n) <= room {
 		w.written[key] = already + int64(n)
 		return n, true
@@ -484,8 +481,8 @@ func TestDBSyncReachesEveryLog(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 60; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key%02d", i)), []byte(strings.Repeat("v", 30))); err != nil {
+	for i := range 60 {
+		if err := db.Write(fmt.Appendf(nil, "key%02d", i), []byte(strings.Repeat("v", 30))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -547,9 +544,9 @@ func TestMergeOrdersItsWrites(t *testing.T) {
 	}
 	defer db.Close()
 
-	for round := 0; round < 30; round++ {
+	for round := range 30 {
 		for _, key := range []string{"a", "b", "c"} {
-			if err := db.Write([]byte(key), []byte(fmt.Sprintf("%s-%02d", key, round))); err != nil {
+			if err := db.Write([]byte(key), fmt.Appendf(nil, "%s-%02d", key, round)); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -635,7 +632,7 @@ func filledDB(t *testing.T, dir string, opts DBOptions) (*DB, map[string]string)
 	}
 
 	want := map[string]string{}
-	for round := 0; round < 30; round++ {
+	for round := range 30 {
 		for _, key := range []string{"a", "b", "c"} {
 			value := fmt.Sprintf("%s-%02d", key, round)
 			if err := db.Write([]byte(key), []byte(value)); err != nil {
@@ -805,8 +802,8 @@ func TestRewriteRenameFailureKeepsTheOldFile(t *testing.T) {
 	}
 	defer kvs.Close()
 
-	for i := 0; i < 20; i++ {
-		if err := kvs.Write([]byte("k"), []byte(fmt.Sprintf("value%02d", i))); err != nil {
+	for i := range 20 {
+		if err := kvs.Write([]byte("k"), fmt.Appendf(nil, "value%02d", i)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -879,7 +876,7 @@ func bigDB(t *testing.T, dir string) (*DB, map[string]string) {
 
 	value := strings.Repeat("v", 200)
 	want := map[string]string{}
-	for i := 0; i < 4000; i++ {
+	for i := range 4000 {
 		key := fmt.Sprintf("key%06d", i)
 		if err := db.Write([]byte(key), []byte(value)); err != nil {
 			t.Fatal(err)
@@ -1039,8 +1036,8 @@ func TestShortReadIsReported(t *testing.T) {
 			defer db.Close()
 
 			allowed := test.allowed
-			for i := 0; i < 60; i++ {
-				if err := db.Write([]byte(fmt.Sprintf("key%02d", i)), []byte(strings.Repeat("v", test.value))); err != nil {
+			for i := range 60 {
+				if err := db.Write(fmt.Appendf(nil, "key%02d", i), []byte(strings.Repeat("v", test.value))); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -1090,8 +1087,8 @@ func TestShortReadWhileIndexing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 60; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key%02d", i)), []byte(strings.Repeat("v", 40))); err != nil {
+	for i := range 60 {
+		if err := db.Write(fmt.Appendf(nil, "key%02d", i), []byte(strings.Repeat("v", 40))); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -26,8 +26,8 @@ func TestReachedRefusesAStoreThatIsBehind(t *testing.T) {
 		t.Errorf("an empty store has not reached the empty position: %v", err)
 	}
 
-	for i := 0; i < 20; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+	for i := range 20 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -63,8 +63,8 @@ func TestReachedChecksTheRecordAndNotOnlyTheLength(t *testing.T) {
 	one := &KeyValueStore{}
 	other := &KeyValueStore{}
 
-	for i := 0; i < 10; i++ {
-		key := []byte(fmt.Sprintf("key-%02d", i))
+	for i := range 10 {
+		key := fmt.Appendf(nil, "key-%02d", i)
 		if err := one.Write(key, []byte("mine")); err != nil {
 			t.Fatal(err)
 		}
@@ -176,8 +176,8 @@ func TestDBReachedRefusesAReplicaThatIsBehind(t *testing.T) {
 	}
 	defer follower.Close()
 
-	for i := 0; i < 50; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+	for i := range 50 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -228,8 +228,8 @@ func TestDBReachedOrdersTheWholeStream(t *testing.T) {
 	defer leader.Close()
 
 	var marks []DBPosition
-	for i := 0; i < 40; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+	for i := range 40 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 		marks = append(marks, leader.Position())
@@ -275,8 +275,8 @@ func TestDBReachedFallsBackToLogsAndOffsets(t *testing.T) {
 	defer leader.Close()
 
 	var marks []DBPosition
-	for i := 0; i < 40; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+	for i := range 40 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 
@@ -333,8 +333,8 @@ func TestDBReachedAfterAPromotion(t *testing.T) {
 	if _, err := leader.Promote(); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 20; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+	for i := range 20 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -452,8 +452,8 @@ func TestDBReachedAtTheStartOfALog(t *testing.T) {
 	}
 	defer follower.Close()
 
-	for i := 0; i < 20; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+	for i := range 20 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -584,8 +584,8 @@ func TestFollowerTermNeverOutrunsItsPosition(t *testing.T) {
 	if _, err := leader.Promote(); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 60; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+	for i := range 60 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}

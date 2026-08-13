@@ -124,7 +124,7 @@ func TestModel(t *testing.T) {
 			// Two keys that are easy to get wrong.
 			keys = append(keys, "", "\x00\xff\x00")
 
-			for step := 0; step < 3000; step++ {
+			for step := range 3000 {
 				key := keys[random.Intn(len(keys))]
 
 				switch n := random.Intn(100); {
@@ -234,8 +234,8 @@ func TestModelSurvivesReopening(t *testing.T) {
 		keys[i] = fmt.Sprintf("key%02d", i)
 	}
 
-	for round := 0; round < 12; round++ {
-		for step := 0; step < 200; step++ {
+	for round := range 12 {
+		for step := range 200 {
 			key := keys[random.Intn(len(keys))]
 
 			switch n := random.Intn(10); {

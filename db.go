@@ -7,6 +7,7 @@ import (
 	"iter"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -431,7 +432,7 @@ func segmentIDs(dir string) ([]uint64, error) {
 		ids = append(ids, id)
 	}
 
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	return ids, nil
 }
 
@@ -817,16 +818,14 @@ func (db *DB) mergeInBackground() {
 	}
 
 	db.merging = true
-	db.merges.Add(1)
 
-	go func() {
-		defer db.merges.Done()
+	db.merges.Go(func() {
 		db.merge()
 
 		db.mu.Lock()
 		db.merging = false
 		db.mu.Unlock()
-	}()
+	})
 }
 
 // Merge merges every frozen log into one now, rather than waiting for enough of

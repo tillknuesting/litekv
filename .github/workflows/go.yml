@@ -29,6 +29,20 @@ jobs:
     - name: Vet
       run: go vet ./...
 
+    # go fix rewrites rather than reports, so the check is to run it and see
+    # whether anything moved. It applies the modernisers — a C-style loop that
+    # could be `for i := range n`, an if-and-assign that is `min` or `max`, an
+    # Add/go/defer Done that is `WaitGroup.Go` — and every one of those is a
+    # change to code that is under test, so it belongs in front of a person
+    # rather than in a commit somebody rubber-stamped.
+    #
+    # --exit-code fails the build and prints the diff, which is the part that
+    # makes the failure actionable: `go fix ./...` locally, read it, commit it.
+    - name: Fix
+      run: |
+        go fix ./...
+        git diff --exit-code
+
     - name: Test
       run: go test -race -v ./...
 

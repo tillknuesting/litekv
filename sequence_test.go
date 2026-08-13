@@ -165,8 +165,8 @@ func TestDBNumbersEveryRecord(t *testing.T) {
 	}
 	defer db.Close()
 
-	for i := 0; i < 30; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+	for i := range 30 {
+		if err := db.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -203,12 +203,12 @@ func TestNumbersFollowTheRecordOrder(t *testing.T) {
 	defer db.Close()
 
 	var writers sync.WaitGroup
-	for w := 0; w < 8; w++ {
+	for w := range 8 {
 		writers.Add(1)
 		go func(w int) {
 			defer writers.Done()
-			for i := 0; i < 50; i++ {
-				if err := db.Write([]byte(fmt.Sprintf("key-%d-%02d", w, i)), []byte("value")); err != nil {
+			for i := range 50 {
+				if err := db.Write(fmt.Appendf(nil, "key-%d-%02d", w, i), []byte("value")); err != nil {
 					t.Errorf("write: %v", err)
 					return
 				}
@@ -239,8 +239,8 @@ func TestNumbersSurviveARestart(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			for i := 0; i < 20; i++ {
-				if err := db.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+			for i := range 20 {
+				if err := db.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -284,7 +284,7 @@ func TestNumbersSurviveARestart(t *testing.T) {
 			}
 
 			for i := 20; i < 25; i++ {
-				if err := reopened.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+				if err := reopened.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -308,8 +308,8 @@ func TestMergeKeepsTheHighestNumber(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 20; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+	for i := range 20 {
+		if err := db.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -381,8 +381,8 @@ func TestFollowerKeepsTheLeadersNumbers(t *testing.T) {
 	// applies what has arrived as it arrives, and this is about what each of
 	// those pieces is allowed to do to the numbering.
 	value := make([]byte, 64)
-	for i := 0; i < 400; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%03d", i)), value); err != nil {
+	for i := range 400 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%03d", i), value); err != nil {
 			t.Fatal(err)
 		}
 	}

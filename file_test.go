@@ -76,8 +76,8 @@ func TestOpenRoundTrip(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 
-	for i := 0; i < 50; i++ {
-		if err := kvs.Write([]byte(fmt.Sprintf("key%02d", i)), []byte(fmt.Sprintf("value%02d", i))); err != nil {
+	for i := range 50 {
+		if err := kvs.Write(fmt.Appendf(nil, "key%02d", i), fmt.Appendf(nil, "value%02d", i)); err != nil {
 			t.Fatalf("Write: %v", err)
 		}
 	}
@@ -332,7 +332,7 @@ func TestSyncPolicies(t *testing.T) {
 		kvs := &KeyValueStore{}
 		kvs.Attach(log, Options{Sync: SyncAlways})
 
-		for i := 0; i < 5; i++ {
+		for i := range 5 {
 			kvs.Write([]byte{byte(i)}, []byte("v"))
 		}
 		if got := log.syncCount(); got != 5 {
@@ -345,7 +345,7 @@ func TestSyncPolicies(t *testing.T) {
 		kvs := &KeyValueStore{}
 		kvs.Attach(log, Options{Sync: SyncNever})
 
-		for i := 0; i < 5; i++ {
+		for i := range 5 {
 			kvs.Write([]byte{byte(i)}, []byte("v"))
 		}
 		if got := log.syncCount(); got != 0 {
@@ -433,8 +433,8 @@ func TestCompactRewritesTheFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 200; i++ {
-		kvs.Write([]byte("hot"), []byte(fmt.Sprintf("value%03d", i)))
+	for i := range 200 {
+		kvs.Write([]byte("hot"), fmt.Appendf(nil, "value%03d", i))
 	}
 	kvs.Write([]byte("cold"), []byte("kept"))
 	kvs.Write([]byte("gone"), []byte("deleted"))
@@ -546,13 +546,13 @@ func TestFileStoreConcurrent(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			key := []byte(fmt.Sprintf("key%d", i))
-			for j := 0; j < 50; j++ {
-				if err := kvs.Write(key, []byte(fmt.Sprintf("value%d", j))); err != nil {
+			key := fmt.Appendf(nil, "key%d", i)
+			for j := range 50 {
+				if err := kvs.Write(key, fmt.Appendf(nil, "value%d", j)); err != nil {
 					t.Errorf("Write: %v", err)
 					return
 				}
@@ -582,7 +582,7 @@ func TestFileStoreConcurrent(t *testing.T) {
 func TestNoGoroutineLeak(t *testing.T) {
 	before := runtime.NumGoroutine()
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		path := filepath.Join(t.TempDir(), "kv")
 		kvs, err := Open(path, Options{Sync: SyncEvery, Interval: time.Millisecond})
 		if err != nil {
@@ -684,8 +684,8 @@ func TestUnclosedStoreSurvives(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			for i := 0; i < 20; i++ {
-				if err := doomed.Write([]byte(fmt.Sprintf("key%02d", i)), []byte("value")); err != nil {
+			for i := range 20 {
+				if err := doomed.Write(fmt.Appendf(nil, "key%02d", i), []byte("value")); err != nil {
 					t.Fatal(err)
 				}
 			}

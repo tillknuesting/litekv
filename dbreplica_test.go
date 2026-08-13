@@ -181,9 +181,9 @@ func TestDBSnapshotIsTheLiveRecords(t *testing.T) {
 	defer db.Close()
 
 	// Every key written several times over, so most records are superseded.
-	for round := 0; round < 10; round++ {
+	for round := range 10 {
 		for _, key := range []string{"alpha", "beta", "gamma", "delta"} {
-			if err := db.Write([]byte(key), []byte(fmt.Sprintf("%s-%02d", key, round))); err != nil {
+			if err := db.Write([]byte(key), fmt.Appendf(nil, "%s-%02d", key, round)); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -229,8 +229,8 @@ func TestDBSnapshotKeepsWritingCheck(t *testing.T) {
 	}
 	defer db.Close()
 
-	for i := 0; i < 100; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key-%03d", i)), []byte("before")); err != nil {
+	for i := range 100 {
+		if err := db.Write(fmt.Appendf(nil, "key-%03d", i), []byte("before")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -243,8 +243,8 @@ func TestDBSnapshotKeepsWritingCheck(t *testing.T) {
 	defer releaseAt()
 
 	// Written after the snapshot was taken, so none of it may be in it.
-	for i := 0; i < 100; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key-%03d", i)), []byte("after")); err != nil {
+	for i := range 100 {
+		if err := db.Write(fmt.Appendf(nil, "key-%03d", i), []byte("after")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -254,7 +254,7 @@ func TestDBSnapshotKeepsWritingCheck(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		key := fmt.Sprintf("key-%03d", i)
 		got, err := follower.Read([]byte(key))
 		if err != nil {
@@ -269,7 +269,7 @@ func TestDBSnapshotKeepsWritingCheck(t *testing.T) {
 	tailInto(t, db, follower, at, ReplicaOptions{})
 	sameContents(t, db, follower, nil)
 
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		key := fmt.Sprintf("key-%03d", i)
 		got, err := follower.Read([]byte(key))
 		if err != nil {
@@ -296,8 +296,8 @@ func TestDBTailCrossesRotations(t *testing.T) {
 	defer db.Close()
 
 	// Something to snapshot, so that the position it comes with names a record.
-	for i := 0; i < 20; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("early-%02d", i)), []byte("value")); err != nil {
+	for i := range 20 {
+		if err := db.Write(fmt.Appendf(nil, "early-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -305,8 +305,8 @@ func TestDBTailCrossesRotations(t *testing.T) {
 	follower, pos := replicaOf(t, db, ReplicaOptions{})
 
 	before := db.Segments()
-	for i := 0; i < 200; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key-%03d", i)), []byte("value")); err != nil {
+	for i := range 200 {
+		if err := db.Write(fmt.Appendf(nil, "key-%03d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -327,7 +327,7 @@ func TestDBTailCrossesRotations(t *testing.T) {
 
 	// And it keeps up from there, across another rotation.
 	for i := 200; i < 300; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key-%03d", i)), []byte("value")); err != nil {
+		if err := db.Write(fmt.Appendf(nil, "key-%03d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -355,8 +355,8 @@ func TestDBTailCrossesFrozenLogs(t *testing.T) {
 
 	// Enough to fill several logs, so that the follower has frozen logs ahead
 	// of it rather than the one being written.
-	for i := 0; i < 120; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key-%03d", i)), []byte("value")); err != nil {
+	for i := range 120 {
+		if err := db.Write(fmt.Appendf(nil, "key-%03d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -410,9 +410,9 @@ func TestDBTailDivergesOnAMerge(t *testing.T) {
 	// records it began with before, and a follower reading it carries on
 	// perfectly correctly — merging only strands a follower when it throws
 	// records away in front of where that follower is.
-	for round := 0; round < 40; round++ {
+	for round := range 40 {
 		for _, key := range []string{"alpha", "beta", "gamma"} {
-			if err := db.Write([]byte(key), []byte(fmt.Sprintf("%s-%02d", key, round))); err != nil {
+			if err := db.Write([]byte(key), fmt.Appendf(nil, "%s-%02d", key, round)); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -490,8 +490,8 @@ func TestDBSnapshotOfAnEmptyStore(t *testing.T) {
 	// Left unused while that log fills and freezes, it cannot be checked, and
 	// the answer is to say so rather than to hand over a log that may be a
 	// different one.
-	for i := 0; i < 100; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key-%03d", i)), []byte("value")); err != nil {
+	for i := range 100 {
+		if err := db.Write(fmt.Appendf(nil, "key-%03d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -516,8 +516,8 @@ func TestDBPositionBinary(t *testing.T) {
 	}
 	defer db.Close()
 
-	for i := 0; i < 20; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+	for i := range 20 {
+		if err := db.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -589,7 +589,7 @@ func TestDBReplicaModel(t *testing.T) {
 	pos := DBPosition{}
 	snapshots, tails := 0, 0
 
-	for step := 0; step < 1500; step++ {
+	for step := range 1500 {
 		key := keys[random.Intn(len(keys))]
 
 		switch n := random.Intn(100); {
@@ -639,7 +639,7 @@ func TestDBReplicaModel(t *testing.T) {
 			// a follower falls far enough behind for the log it was reading to
 			// be rewritten under it, which is the case the whole snapshot path
 			// exists for.
-			for i := 0; i < 150; i++ {
+			for i := range 150 {
 				value := fmt.Sprintf("burst-%d-%d", step, i)
 				key := keys[random.Intn(len(keys))]
 				if err := db.Write([]byte(key), []byte(value)); err != nil {
@@ -780,13 +780,13 @@ func TestDBFollower(t *testing.T) {
 	}
 	defer follower.Close()
 
-	for i := 0; i < 300; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%03d", i)), []byte("value")); err != nil {
+	for i := range 300 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%03d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for i := 0; i < 50; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%03d", i)), []byte("updated")); err != nil {
+	for i := range 50 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%03d", i), []byte("updated")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -810,7 +810,7 @@ func TestDBFollower(t *testing.T) {
 	// whole log's worth may find that log merged away underneath it, which is
 	// the case TestDBFollowerModel covers and this one is not about.
 	for i := 300; i < 306; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%03d", i)), []byte("value")); err != nil {
+		if err := leader.Write(fmt.Appendf(nil, "key-%03d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -912,8 +912,8 @@ func TestDBFollowerSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 200; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%03d", i)), []byte("value")); err != nil {
+	for i := range 200 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%03d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -942,7 +942,7 @@ func TestDBFollowerSurvivesRestart(t *testing.T) {
 	// log being written does not fill, so no merge can take the position away
 	// and the answer does not depend on when a background merge happens to run.
 	for i := 200; i < 206; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%03d", i)), []byte("value")); err != nil {
+		if err := leader.Write(fmt.Appendf(nil, "key-%03d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -969,8 +969,8 @@ func TestDBFollowerBatchIsAllOrNothing(t *testing.T) {
 	}
 	defer follower.Close()
 
-	for i := 0; i < 20; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+	for i := range 20 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -980,7 +980,7 @@ func TestDBFollowerBatchIsAllOrNothing(t *testing.T) {
 	keys := follower.Len()
 
 	for i := 20; i < 30; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+		if err := leader.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1104,8 +1104,8 @@ func TestDBFollowerReset(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 200; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%03d", i)), []byte("value")); err != nil {
+	for i := range 200 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%03d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1228,8 +1228,8 @@ func TestDBFollowerStreams(t *testing.T) {
 		}
 	}()
 
-	for i := 0; i < records; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%03d", i)), []byte("value")); err != nil {
+	for i := range records {
+		if err := leader.Write(fmt.Appendf(nil, "key-%03d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1280,7 +1280,7 @@ func TestDBFollowerModel(t *testing.T) {
 	live := map[string]string{}
 	rounds, resyncs := 0, 0
 
-	for step := 0; step < 1200; step++ {
+	for step := range 1200 {
 		key := keys[random.Intn(len(keys))]
 
 		switch n := random.Intn(100); {
@@ -1326,7 +1326,7 @@ func TestDBFollowerModel(t *testing.T) {
 			// A stretch with nobody replicating, then a merge: this is how a
 			// follower falls far enough behind for the log it was reading to be
 			// rewritten under it.
-			for i := 0; i < 150; i++ {
+			for i := range 150 {
 				value := fmt.Sprintf("burst-%d-%d", step, i)
 				burst := keys[random.Intn(len(keys))]
 				if err := leader.Write([]byte(burst), []byte(value)); err != nil {
@@ -1368,8 +1368,8 @@ func TestDBFollowerWritesRecordsBeforeThePosition(t *testing.T) {
 	}
 	defer leader.Close()
 
-	for i := 0; i < 20; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+	for i := range 20 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1399,7 +1399,7 @@ func TestDBFollowerWritesRecordsBeforeThePosition(t *testing.T) {
 	// And again for a batch, which is the other path that writes records down
 	// and then says it holds them.
 	for i := 20; i < 40; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+		if err := leader.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1468,8 +1468,8 @@ func TestDBFollowerIgnoresADamagedPosition(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 20; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+	for i := range 20 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1535,8 +1535,8 @@ func TestDBFollowerRefusesATruncatedSnapshot(t *testing.T) {
 	}
 	defer leader.Close()
 
-	for i := 0; i < 40; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+	for i := range 40 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1584,8 +1584,8 @@ func TestDBFollowerAppliesTwiceAfterACrash(t *testing.T) {
 	}
 	defer leader.Close()
 
-	for i := 0; i < 20; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("first")); err != nil {
+	for i := range 20 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%02d", i), []byte("first")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1606,8 +1606,8 @@ func TestDBFollowerAppliesTwiceAfterACrash(t *testing.T) {
 
 	// A batch that supersedes half of what is there, so applying it twice would
 	// show up as the wrong value rather than merely as wasted bytes.
-	for i := 0; i < 10; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("second")); err != nil {
+	for i := range 10 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%02d", i), []byte("second")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1689,8 +1689,8 @@ func TestDBFollowerSurvivesADisk(t *testing.T) {
 			}
 			defer leader.Close()
 
-			for i := 0; i < 20; i++ {
-				if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+			for i := range 20 {
+				if err := leader.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -1758,8 +1758,8 @@ func TestDBSnapshotReportsADisk(t *testing.T) {
 	}
 	defer db.Close()
 
-	for i := 0; i < 60; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+	for i := range 60 {
+		if err := db.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1804,8 +1804,8 @@ func BenchmarkDBSnapshot(b *testing.B) {
 	defer db.Close()
 
 	const keys = 20000
-	for i := 0; i < keys; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key-%08d", i)), value); err != nil {
+	for i := range keys {
+		if err := db.Write(fmt.Appendf(nil, "key-%08d", i), value); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -1847,8 +1847,8 @@ func BenchmarkDBFollowerApply(b *testing.B) {
 			defer leader.Close()
 
 			value := make([]byte, size)
-			for i := 0; i < 4096; i++ {
-				if err := leader.Write([]byte(fmt.Sprintf("key-%08d", i)), value); err != nil {
+			for i := range 4096 {
+				if err := leader.Write(fmt.Appendf(nil, "key-%08d", i), value); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -1909,8 +1909,8 @@ func TestDBFollowerPositionIsNoMoreDurableThanTheRecords(t *testing.T) {
 			}
 			defer leader.Close()
 
-			for i := 0; i < 10; i++ {
-				if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+			for i := range 10 {
+				if err := leader.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -1962,8 +1962,8 @@ func TestDBFollowerResetDropsThePositionFirst(t *testing.T) {
 	}
 	defer leader.Close()
 
-	for i := 0; i < 60; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+	for i := range 60 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -2104,7 +2104,7 @@ func TestDBHoldKeepsALogFromMerging(t *testing.T) {
 	round := 0
 	write := func(int) {
 		for _, key := range []string{"alpha", "beta", "gamma"} {
-			if err := db.Write([]byte(key), []byte(fmt.Sprintf("%s-%03d", key, round))); err != nil {
+			if err := db.Write([]byte(key), fmt.Appendf(nil, "%s-%03d", key, round)); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -2121,11 +2121,11 @@ func TestDBHoldKeepsALogFromMerging(t *testing.T) {
 	held, release := holdFrozen(t, db, 1, func() { write(0) })
 
 	// Enough writing and merging to have taken that log several times over.
-	for i := 0; i < 200; i++ {
+	for range 200 {
 		write(0)
 	}
 
-	for attempt := 0; attempt < 50; attempt++ {
+	for range 50 {
 		if _, err := db.Since(held, io.Discard, ReplicaOptions{}); err != nil {
 			t.Fatalf("a held position stopped working: %v", err)
 		}
@@ -2179,7 +2179,7 @@ func TestDBHoldIsCounted(t *testing.T) {
 		t.Helper()
 		for round := from; round < to; round++ {
 			for _, key := range []string{"alpha", "beta"} {
-				if err := db.Write([]byte(key), []byte(fmt.Sprintf("%s-%03d", key, round))); err != nil {
+				if err := db.Write([]byte(key), fmt.Appendf(nil, "%s-%03d", key, round)); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -2257,7 +2257,7 @@ func TestDBFollowIsNotStrandedByAMerge(t *testing.T) {
 	// that happens to land on a rotation leaves the active log empty, and how
 	// many records that takes is a fact about the record layout, which changes.
 	for i := 0; i < 200 && leader.Position().Log.Offset == 0; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("early-%02d", i)), []byte("value")); err != nil {
+		if err := leader.Write(fmt.Appendf(nil, "early-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -2293,8 +2293,8 @@ func TestDBFollowIsNotStrandedByAMerge(t *testing.T) {
 	// caught up and waiting — which is exactly when it is resting on a log that
 	// merging would otherwise take.
 	live := map[string]string{}
-	for burst := 0; burst < 40; burst++ {
-		for i := 0; i < 20; i++ {
+	for burst := range 40 {
+		for i := range 20 {
 			key := fmt.Sprintf("key-%02d", i)
 			value := fmt.Sprintf("value-%d-%d", burst, i)
 			if err := leader.Write([]byte(key), []byte(value)); err != nil {
@@ -2365,9 +2365,9 @@ func TestDBHoldPinsFromTheOldestHolder(t *testing.T) {
 
 	write := func(rounds int) {
 		t.Helper()
-		for round := 0; round < rounds; round++ {
+		for round := range rounds {
 			for _, key := range []string{"alpha", "beta"} {
-				if err := db.Write([]byte(key), []byte(fmt.Sprintf("%s-%03d", key, round))); err != nil {
+				if err := db.Write([]byte(key), fmt.Appendf(nil, "%s-%03d", key, round)); err != nil {
 					t.Fatal(err)
 				}
 			}

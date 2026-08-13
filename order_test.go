@@ -132,7 +132,7 @@ func TestRangeAcrossADBsLogs(t *testing.T) {
 
 	// Written out of order and spread over several logs by rotation.
 	for i := 30; i >= 0; i-- {
-		if err := db.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte(fmt.Sprintf("first-%02d", i))); err != nil {
+		if err := db.Write(fmt.Appendf(nil, "key-%02d", i), fmt.Appendf(nil, "first-%02d", i)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -178,8 +178,8 @@ func TestRangeStopsWhenTold(t *testing.T) {
 	}
 	defer db.Close()
 
-	for i := 0; i < 40; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+	for i := range 40 {
+		if err := db.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -205,8 +205,8 @@ func TestRangeSeesTheSortedKeysOnce(t *testing.T) {
 	}
 	defer db.Close()
 
-	for i := 0; i < 20; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+	for i := range 20 {
+		if err := db.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -273,8 +273,8 @@ func BenchmarkRange(b *testing.B) {
 	// A hundred thousand keys over a good few logs, and a prefix matching a
 	// hundred of them: the shape a server answering ?prefix= actually has.
 	value := make([]byte, 64)
-	for i := 0; i < 100_000; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key-%06d", i)), value); err != nil {
+	for i := range 100_000 {
+		if err := db.Write(fmt.Appendf(nil, "key-%06d", i), value); err != nil {
 			b.Fatal(err)
 		}
 	}

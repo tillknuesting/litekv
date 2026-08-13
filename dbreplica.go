@@ -946,10 +946,7 @@ func (d *diskSegment) batch(pos Position, size int64, dst []byte) ([]byte, Posit
 		return dst, pos, nil
 	}
 
-	want := d.bytes - pos.Offset
-	if want > size {
-		want = size
-	}
+	want := min(d.bytes-pos.Offset, size)
 	if want < 0 {
 		// A batch that is already over its size still takes one record, below.
 		want = 0
@@ -1585,9 +1582,6 @@ func readReplicaState(dir string) (term, seen uint64, pos DBPosition) {
 	}
 
 	term = binary.LittleEndian.Uint64(raw[5:13])
-	seen = binary.LittleEndian.Uint64(raw[13:21])
-	if seen < term {
-		seen = term
-	}
+	seen = max(binary.LittleEndian.Uint64(raw[13:21]), term)
 	return term, seen, pos
 }

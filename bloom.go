@@ -62,10 +62,7 @@ func maybeBloom(index map[string]int64, min int) *bloom {
 
 // newBloom builds a filter over the keys of an index.
 func newBloom(index map[string]int64) *bloom {
-	blocks := len(index)*bloomBits/512 + 1
-	if blocks < 1 {
-		blocks = 1
-	}
+	blocks := max(len(index)*bloomBits/512+1, 1)
 	// A power of two, so choosing a block is a mask rather than a division.
 	blocks = 1 << bits.Len(uint(blocks-1))
 
@@ -94,7 +91,7 @@ func (b *bloom) locate(h uint64) (*bloomBlock, uint32, uint32) {
 
 func (b *bloom) add(key string) {
 	block, h1, h2 := b.locate(maphash.String(bloomSeed, key))
-	for i := uint32(0); i < bloomProbes; i++ {
+	for i := range uint32(bloomProbes) {
 		bit := (h1 + i*h2) & 511
 		block[bit>>6] |= 1 << (bit & 63)
 	}
@@ -108,7 +105,7 @@ func (b *bloom) add(key string) {
 // and asks no further. TestBloomHasNoFalseNegatives is the guard.
 func (b *bloom) mayContain(key []byte) bool {
 	block, h1, h2 := b.locate(maphash.Bytes(bloomSeed, key))
-	for i := uint32(0); i < bloomProbes; i++ {
+	for i := range uint32(bloomProbes) {
 		bit := (h1 + i*h2) & 511
 		if block[bit>>6]&(1<<(bit&63)) == 0 {
 			return false

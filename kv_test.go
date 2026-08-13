@@ -305,9 +305,7 @@ func TestKeyValueStore_RebuildIndex(t *testing.T) {
 	kvs.Delete([]byte("foo3"))
 
 	before := make(map[string]int64, len(kvs.Index))
-	for key, pos := range kvs.Index {
-		before[key] = pos
-	}
+	maps.Copy(before, kvs.Index)
 
 	kvs.Index = nil
 	if err := kvs.RebuildIndex(); err != nil {
@@ -676,13 +674,13 @@ func TestKeyValueStore_Concurrent(t *testing.T) {
 	// Enough distinct keys that every lock shard is exercised, and a mix of the
 	// paths that take a shard, take them all, or walk the whole store.
 	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			key := []byte(fmt.Sprintf("key%d", i))
-			for j := 0; j < 100; j++ {
-				kvs.Write(key, []byte(fmt.Sprintf("value%d", j)))
+			key := fmt.Appendf(nil, "key%d", i)
+			for j := range 100 {
+				kvs.Write(key, fmt.Appendf(nil, "value%d", j))
 				kvs.Read(key)
 				kvs.Read([]byte("seed"))
 				kvs.View([]byte("seed"), func(value []byte) error {
@@ -700,16 +698,14 @@ func TestKeyValueStore_Concurrent(t *testing.T) {
 	}
 
 	// A reader using the exported lock directly, as the docs describe.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for j := 0; j < 200; j++ {
+	wg.Go(func() {
+		for range 200 {
 			kvs.RLock()
 			_ = len(kvs.Index)
 			_ = len(kvs.Data)
 			kvs.RUnlock()
 		}
-	}()
+	})
 
 	wg.Wait()
 
@@ -829,7 +825,7 @@ func TestKeyValueStore_View(t *testing.T) {
 func makeKeys(n int) [][]byte {
 	keys := make([][]byte, n)
 	for i := range keys {
-		keys[i] = []byte(fmt.Sprintf("key:%016d", i))
+		keys[i] = fmt.Appendf(nil, "key:%016d", i)
 	}
 	return keys
 }
@@ -913,7 +909,7 @@ func BenchmarkKeyValueStore_WriteParallel(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 
-			for w := 0; w < writers; w++ {
+			for w := range writers {
 				wg.Add(1)
 				go func(w int) {
 					defer wg.Done()
@@ -1199,7 +1195,7 @@ func BenchmarkKeyValueStore_Compact(b *testing.B) {
 	keys := makeKeys(4096)
 	value := make([]byte, 256)
 	golden := &KeyValueStore{}
-	for round := 0; round < 4; round++ { // every key written 4 times
+	for range 4 { // every key written 4 times
 		for _, key := range keys {
 			golden.Write(key, value)
 		}
@@ -1267,7 +1263,7 @@ func BenchmarkKeyValueStore_ReadUnderWrite(b *testing.B) {
 
 			stop := make(chan struct{})
 			var wg sync.WaitGroup
-			for w := 0; w < writers; w++ {
+			for w := range writers {
 				wg.Add(1)
 				go func(w int) {
 					defer wg.Done()
@@ -1625,8 +1621,8 @@ func TestShardedRWMutex(t *testing.T) {
 
 	// Every shard must be reachable, or the read side is not really sharded.
 	seen := make(map[*paddedRWMutex]bool)
-	for i := 0; i < 1000; i++ {
-		shard := m.rlockKey([]byte(fmt.Sprintf("key%d", i)))
+	for i := range 1000 {
+		shard := m.rlockKey(fmt.Appendf(nil, "key%d", i))
 		shard.RUnlock()
 		seen[shard] = true
 	}
@@ -1662,12 +1658,12 @@ func TestShardedRWMutexExcludes(t *testing.T) {
 	guarded := 0
 
 	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			key := []byte(fmt.Sprintf("key%d", i))
-			for j := 0; j < 500; j++ {
+			key := fmt.Appendf(nil, "key%d", i)
+			for j := range 500 {
 				if j%10 == 0 {
 					m.Lock()
 					guarded++

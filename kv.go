@@ -388,7 +388,7 @@ func (m *shardedRWMutex) RUnlock() { m.shards[0].RUnlock() }
 // shards are always taken in the same order, and a reader only ever holds one,
 // so this cannot deadlock.
 func (m *shardedRWMutex) Lock() {
-	for i := 0; i < numShards; i++ {
+	for i := range numShards {
 		m.shards[i].Lock()
 	}
 }

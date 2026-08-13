@@ -29,8 +29,8 @@ func strandedLeader(t *testing.T, dir string, opts DBOptions) (*DB, map[string]s
 	}
 
 	live := map[string]string{}
-	for round := 0; round < 20; round++ {
-		for i := 0; i < 5; i++ {
+	for round := range 20 {
+		for i := range 5 {
 			key := fmt.Sprintf("key-%02d", i)
 			value := fmt.Sprintf("value-%02d-%d", round, i)
 			if err := db.Write([]byte(key), []byte(value)); err != nil {
@@ -151,7 +151,7 @@ func TestStrandedFollowerCarriesOn(t *testing.T) {
 	// It goes away. The leader carries on writing, fills more logs, and folds
 	// the ones the follower was resting on into an older one.
 	for round := 20; round < 30; round++ {
-		for i := 0; i < 5; i++ {
+		for i := range 5 {
 			key := fmt.Sprintf("key-%02d", i)
 			value := fmt.Sprintf("value-%02d-%d", round, i)
 			if err := leader.Write([]byte(key), []byte(value)); err != nil {
@@ -221,7 +221,7 @@ func TestStrandedFollowerAcrossADroppedTombstone(t *testing.T) {
 	}
 	for round := 20; round < 30; round++ {
 		for i := 1; i < 5; i++ {
-			if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte(fmt.Sprintf("value-%02d-%d", round, i))); err != nil {
+			if err := leader.Write(fmt.Appendf(nil, "key-%02d", i), fmt.Appendf(nil, "value-%02d-%d", round, i)); err != nil {
 				t.Fatal(err)
 			}
 		}

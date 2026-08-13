@@ -273,8 +273,8 @@ func FuzzDBApplySnapshot(f *testing.F) {
 	if err != nil {
 		f.Fatal(err)
 	}
-	for i := 0; i < 8; i++ {
-		leader.Write([]byte(fmt.Sprintf("key-%d", i)), []byte("value"))
+	for i := range 8 {
+		leader.Write(fmt.Appendf(nil, "key-%d", i), []byte("value"))
 	}
 
 	var wire bytes.Buffer
@@ -337,8 +337,8 @@ func FuzzDBSince(f *testing.F) {
 	}
 	f.Cleanup(func() { leader.Close() })
 
-	for i := 0; i < 60; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+	for i := range 60 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			f.Fatal(err)
 		}
 	}

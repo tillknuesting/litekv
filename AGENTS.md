@@ -80,6 +80,7 @@ of the bugs listed further down were found by one of them.
 gofmt -l .            # must print nothing
 go vet ./...
 staticcheck ./...     # has earned its keep here, twice
+go fix ./... && git diff --exit-code   # the modernisers, and CI runs it too
 go test -race ./...
 GOMAXPROCS=1 go test ./...   # the lock degrades to one shard; that path is real
 go run ./example      # it exercises every exported call
@@ -90,6 +91,14 @@ go test -run xxx -fuzz '^FuzzDBApply$' -fuzztime 30s .   # and into a DB
 
 The `^...$` matters: `-fuzz FuzzApply` now matches `FuzzApplySnapshot` too, and
 the go tool refuses to run rather than choosing.
+
+`go fix` rewrites rather than reports, which is why the check is to run it and
+see whether anything moved. Read what it did before committing it: it is an
+automated edit to code that is under test, and it once touched twenty-seven
+files here in one go — `min`, `max`, `for i := range n`, `slices.Sort`,
+`WaitGroup.Go`, `fmt.Appendf`. Then **run the mutation sweep**, because the
+table matches source text exactly and a rewrite is exactly the thing that turns
+a mutation into a silent SKIP. That sweep is the only check that would notice.
 
 Anything with a test behind it also gets mutation tested. `tools/mutate` is the
 sweep — eight mutations, eight workers, and it prints each verdict as it lands

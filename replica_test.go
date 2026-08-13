@@ -96,8 +96,8 @@ func TestReplicaCatchUp(t *testing.T) {
 	leader := &KeyValueStore{}
 	follower := &KeyValueStore{}
 
-	for i := 0; i < 200; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%03d", i)), []byte(fmt.Sprintf("value-%03d", i))); err != nil {
+	for i := range 200 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%03d", i), fmt.Appendf(nil, "value-%03d", i)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -221,7 +221,7 @@ func TestPositionTracksTheLog(t *testing.T) {
 // end of the bytes, so that a follower is never sent half of one.
 func TestPositionIgnoresATornTail(t *testing.T) {
 	kvs := &KeyValueStore{}
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if err := kvs.Write([]byte{byte('a' + i)}, []byte("value")); err != nil {
 			t.Fatal(err)
 		}
@@ -284,8 +284,8 @@ func TestReplicaDiverged(t *testing.T) {
 		leader := &KeyValueStore{}
 		follower := &KeyValueStore{}
 
-		for i := 0; i < 20; i++ {
-			if err := leader.Write([]byte("one key"), []byte(fmt.Sprintf("version %d", i))); err != nil {
+		for i := range 20 {
+			if err := leader.Write([]byte("one key"), fmt.Appendf(nil, "version %d", i)); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -334,7 +334,7 @@ func TestReplicaDiverged(t *testing.T) {
 		// checksum, but ending a byte away from where the record actually ends,
 		// describes a log this one has never been.
 		leader := &KeyValueStore{}
-		for i := 0; i < 3; i++ {
+		for i := range 3 {
 			if err := leader.Write([]byte{byte('a' + i)}, []byte("value")); err != nil {
 				t.Fatal(err)
 			}
@@ -429,8 +429,8 @@ func TestReplicaDiverged(t *testing.T) {
 // between, and a record kept without checking is one no later read can question.
 func TestReplicaRejectsDamagedBatch(t *testing.T) {
 	leader := &KeyValueStore{}
-	for i := 0; i < 5; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%d", i)), []byte("value")); err != nil {
+	for i := range 5 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -474,8 +474,8 @@ func TestReplicaRejectsDamagedBatch(t *testing.T) {
 // carried on from. A connection that drops is exactly this.
 func TestReplicaTruncatedBatch(t *testing.T) {
 	leader := &KeyValueStore{}
-	for i := 0; i < 5; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%d", i)), []byte("value")); err != nil {
+	for i := range 5 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -515,8 +515,8 @@ func TestReplicaTruncatedBatch(t *testing.T) {
 // written, describes a log the store is no longer holding.
 func TestReplicaWrongPosition(t *testing.T) {
 	leader := &KeyValueStore{}
-	for i := 0; i < 3; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%d", i)), []byte("value")); err != nil {
+	for i := range 3 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -576,7 +576,7 @@ func TestReplicaBatchIsBounded(t *testing.T) {
 
 	value := bytes.Repeat([]byte("x"), 512)
 	for i := 0; leader.Size() < 3*opts.BatchSize; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%06d", i)), value); err != nil {
+		if err := leader.Write(fmt.Appendf(nil, "key-%06d", i), value); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -636,8 +636,8 @@ func TestReplicaBatchIsBounded(t *testing.T) {
 // a store like any other afterwards: closed, reopened, and still where it was.
 func TestReplicaFollowerKeepsAFile(t *testing.T) {
 	leader := &KeyValueStore{}
-	for i := 0; i < 50; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+	for i := range 50 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -682,8 +682,8 @@ func TestReplicaFollowerKeepsAFile(t *testing.T) {
 // recovery, and the whole reason a follower keeps a log of its own.
 func TestReplicaSurvivesACrashMidBatch(t *testing.T) {
 	leader := &KeyValueStore{}
-	for i := 0; i < 30; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+	for i := range 30 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -747,8 +747,8 @@ func TestReplicaSurvivesACrashMidBatch(t *testing.T) {
 // have to arrive after it as well.
 func TestReplicaCrashWithMoreToCome(t *testing.T) {
 	leader := &KeyValueStore{}
-	for i := 0; i < 60; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+	for i := range 60 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -808,8 +808,8 @@ func TestReplicaCrashWithMoreToCome(t *testing.T) {
 // at a time.
 func TestReplicaAppliesABatchAtOnce(t *testing.T) {
 	leader := &KeyValueStore{}
-	for i := 0; i < 50; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+	for i := range 50 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -841,8 +841,8 @@ func TestReplicaAppliesABatchAtOnce(t *testing.T) {
 // has, since Apply appends through the same path.
 func TestReplicaLogFailureLeavesFollowerAlone(t *testing.T) {
 	leader := &KeyValueStore{}
-	for i := 0; i < 5; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%d", i)), []byte("value")); err != nil {
+	for i := range 5 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -941,8 +941,8 @@ func TestReplicaFollowsAsItHappens(t *testing.T) {
 		}
 	}()
 
-	for i := 0; i < records; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%03d", i)), []byte("value")); err != nil {
+	for i := range records {
+		if err := leader.Write(fmt.Appendf(nil, "key-%03d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -990,8 +990,8 @@ func TestReplicaStreamArrivesWithoutAsking(t *testing.T) {
 	}()
 
 	// One record at a time, with nothing sent from the follower in between.
-	for i := 0; i < 5; i++ {
-		key := []byte(fmt.Sprintf("key-%d", i))
+	for i := range 5 {
+		key := fmt.Appendf(nil, "key-%d", i)
 		if err := leader.Write(key, []byte("value")); err != nil {
 			t.Fatal(err)
 		}
@@ -1040,8 +1040,8 @@ func TestReplicaFollowChecksThePositionFirst(t *testing.T) {
 // can shut down without leaving a goroutine behind.
 func TestReplicaFollowStopsWhenTold(t *testing.T) {
 	leader := &KeyValueStore{}
-	for i := 0; i < 10; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%d", i)), []byte("value")); err != nil {
+	for i := range 10 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1080,12 +1080,10 @@ func TestChangedWakesEveryWaiter(t *testing.T) {
 	kvs := &KeyValueStore{}
 
 	var waiting sync.WaitGroup
-	for i := 0; i < 8; i++ {
-		waiting.Add(1)
-		go func() {
-			defer waiting.Done()
+	for range 8 {
+		waiting.Go(func() {
 			<-kvs.Changed()
-		}()
+		})
 	}
 
 	// Whether a waiter has reached the channel yet or not, the write either
@@ -1160,7 +1158,7 @@ func TestChangedCoversEveryChangeToTheLog(t *testing.T) {
 // believed.
 func TestPositionBinary(t *testing.T) {
 	kvs := &KeyValueStore{}
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if err := kvs.Write([]byte{byte('a' + i)}, []byte("value")); err != nil {
 			t.Fatal(err)
 		}
@@ -1294,7 +1292,7 @@ func TestReplicaModel(t *testing.T) {
 
 	replications, resyncs := 0, 0
 
-	for step := 0; step < 3000; step++ {
+	for step := range 3000 {
 		key := keys[random.Intn(len(keys))]
 
 		switch n := random.Intn(100); {
@@ -1355,8 +1353,8 @@ func TestReplicaOfAReplica(t *testing.T) {
 	middle := &KeyValueStore{}
 	tail := &KeyValueStore{}
 
-	for i := 0; i < 50; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+	for i := range 50 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1371,8 +1369,8 @@ func TestReplicaOfAReplica(t *testing.T) {
 	sameStore(t, leader, tail)
 
 	// And it keeps up down the chain, one record at a time.
-	for i := 0; i < 5; i++ {
-		if err := leader.Write([]byte("late"), []byte(fmt.Sprintf("record-%d", i))); err != nil {
+	for i := range 5 {
+		if err := leader.Write([]byte("late"), fmt.Appendf(nil, "record-%d", i)); err != nil {
 			t.Fatal(err)
 		}
 		catchUp(t, leader, middle)
@@ -1438,8 +1436,8 @@ func TestReplicaManyFollowers(t *testing.T) {
 		}(replicas[i])
 	}
 
-	for i := 0; i < records; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%03d", i)), []byte("value")); err != nil {
+	for i := range records {
+		if err := leader.Write(fmt.Appendf(nil, "key-%03d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1474,8 +1472,8 @@ func TestReplicaFollowReportsDivergence(t *testing.T) {
 
 	// The same key over and over, so that compaction has most of the log to
 	// throw away and every offset after the first moves.
-	for i := 0; i < 20; i++ {
-		if err := leader.Write([]byte("one key"), []byte(fmt.Sprintf("version %d", i))); err != nil {
+	for i := range 20 {
+		if err := leader.Write([]byte("one key"), fmt.Appendf(nil, "version %d", i)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1546,8 +1544,8 @@ func TestReplicaOldFormat(t *testing.T) {
 // two, and one byte less than that must send one.
 func TestReplicaBatchEndsOnARecord(t *testing.T) {
 	leader := &KeyValueStore{}
-	for i := 0; i < 5; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%d", i)), []byte("value")); err != nil {
+	for i := range 5 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1593,8 +1591,8 @@ func TestReplicaBatchEndsOnARecord(t *testing.T) {
 // asking again from where it actually is.
 func TestReplicaShortWriteOnTheWire(t *testing.T) {
 	leader := &KeyValueStore{}
-	for i := 0; i < 5; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%d", i)), []byte("value")); err != nil {
+	for i := range 5 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1658,8 +1656,8 @@ func TestReplicaSupersededAcrossBatches(t *testing.T) {
 	leader := &KeyValueStore{}
 	follower := &KeyValueStore{}
 
-	for round := 0; round < 5; round++ {
-		if err := leader.Write([]byte("key"), []byte(fmt.Sprintf("version %d", round))); err != nil {
+	for round := range 5 {
+		if err := leader.Write([]byte("key"), fmt.Appendf(nil, "version %d", round)); err != nil {
 			t.Fatal(err)
 		}
 		if err := leader.Write([]byte("other"), []byte("unchanged")); err != nil {
@@ -1699,8 +1697,8 @@ func TestReplicaSupersededAcrossBatches(t *testing.T) {
 // histories with no way to tell.
 func TestReplicaResetEmptiesTheFile(t *testing.T) {
 	leader := &KeyValueStore{}
-	for i := 0; i < 20; i++ {
-		if err := leader.Write([]byte("one key"), []byte(fmt.Sprintf("version %d", i))); err != nil {
+	for i := range 20 {
+		if err := leader.Write([]byte("one key"), fmt.Appendf(nil, "version %d", i)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1825,9 +1823,7 @@ func BenchmarkWriteWithAWaiter(b *testing.B) {
 			var waiter sync.WaitGroup
 
 			if waiting {
-				waiter.Add(1)
-				go func() {
-					defer waiter.Done()
+				waiter.Go(func() {
 
 					for {
 						changed := kvs.Changed()
@@ -1837,7 +1833,7 @@ func BenchmarkWriteWithAWaiter(b *testing.B) {
 							return
 						}
 					}
-				}()
+				})
 			}
 
 			b.SetBytes(16)
@@ -1867,7 +1863,7 @@ func BenchmarkReplicaCatchUp(b *testing.B) {
 
 	leader := &KeyValueStore{}
 	for i := 0; leader.Size() < 8<<20; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%08d", i)), value); err != nil {
+		if err := leader.Write(fmt.Appendf(nil, "key-%08d", i), value); err != nil {
 			b.Fatal(err)
 		}
 	}

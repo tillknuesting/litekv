@@ -519,10 +519,7 @@ var applyBuffers = sync.Pool{
 // growBuffer makes room to read into: twice what there is, up to a batch, and
 // past a batch only when one record needs more than that.
 func growBuffer(buf []byte, limit int64) []byte {
-	size := cap(buf) * 2
-	if size < initialApply {
-		size = initialApply
-	}
+	size := max(cap(buf)*2, initialApply)
 	if int64(size) > limit && int64(cap(buf)) < limit {
 		size = int(limit)
 	}

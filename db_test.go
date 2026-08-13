@@ -50,8 +50,8 @@ func TestDBBasics(t *testing.T) {
 		t.Errorf("a new DB has %d segments, want 1", got)
 	}
 
-	for i := 0; i < 100; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key%03d", i)), []byte(fmt.Sprintf("value%03d", i))); err != nil {
+	for i := range 100 {
+		if err := db.Write(fmt.Appendf(nil, "key%03d", i), fmt.Appendf(nil, "value%03d", i)); err != nil {
 			t.Fatalf("Write: %v", err)
 		}
 	}
@@ -61,7 +61,7 @@ func TestDBBasics(t *testing.T) {
 	}
 
 	// Every key is findable wherever it landed.
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		value, ok := liveValue(t, db, fmt.Sprintf("key%03d", i))
 		if !ok || value != fmt.Sprintf("value%03d", i) {
 			t.Fatalf("key%03d: got '%s' (%v)", i, value, ok)
@@ -130,9 +130,9 @@ func TestDBMerge(t *testing.T) {
 	defer db.Close()
 
 	// Rewrite the same few keys over and over, so most records are superseded.
-	for round := 0; round < 40; round++ {
+	for round := range 40 {
 		for _, key := range []string{"a", "b", "c", "d"} {
-			if err := db.Write([]byte(key), []byte(fmt.Sprintf("%s-%02d", key, round))); err != nil {
+			if err := db.Write([]byte(key), fmt.Appendf(nil, "%s-%02d", key, round)); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -195,7 +195,7 @@ func TestDBMergeInterrupted(t *testing.T) {
 	// rewritten, a key deleted part way through, and one written again after
 	// its delete.
 	want := map[string]string{}
-	for round := 0; round < 30; round++ {
+	for round := range 30 {
 		for _, key := range []string{"a", "b", "c"} {
 			value := fmt.Sprintf("%s-%02d", key, round)
 			if err := db.Write([]byte(key), []byte(value)); err != nil {
@@ -288,7 +288,7 @@ func TestDBReopen(t *testing.T) {
 	}
 
 	want := map[string]string{}
-	for i := 0; i < 200; i++ {
+	for i := range 200 {
 		key := fmt.Sprintf("key%03d", i%50)
 		value := fmt.Sprintf("value%03d", i)
 		if err := db.Write([]byte(key), []byte(value)); err != nil {
@@ -382,7 +382,7 @@ func TestDBMergeDoesNotBlock(t *testing.T) {
 	stop := make(chan struct{})
 
 	// Writers, which keep rotating segments and so keep merges coming.
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -393,7 +393,7 @@ func TestDBMergeDoesNotBlock(t *testing.T) {
 				default:
 				}
 				key := fmt.Sprintf("key%d-%d", i, n%20)
-				if err := db.Write([]byte(key), []byte(fmt.Sprintf("value%d", n))); err != nil {
+				if err := db.Write([]byte(key), fmt.Appendf(nil, "value%d", n)); err != nil {
 					t.Errorf("Write: %v", err)
 					return
 				}
@@ -406,10 +406,8 @@ func TestDBMergeDoesNotBlock(t *testing.T) {
 	if err := db.Write([]byte("constant"), []byte("value")); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 4; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 4 {
+		wg.Go(func() {
 			for {
 				select {
 				case <-stop:
@@ -422,7 +420,7 @@ func TestDBMergeDoesNotBlock(t *testing.T) {
 					return
 				}
 			}
-		}()
+		})
 	}
 
 	time.Sleep(300 * time.Millisecond)
@@ -501,7 +499,7 @@ func TestDBModel(t *testing.T) {
 		}
 	}
 
-	for step := 0; step < 2000; step++ {
+	for step := range 2000 {
 		key := keys[random.Intn(len(keys))]
 
 		switch n := random.Intn(100); {
@@ -627,8 +625,8 @@ func TestDBDefaults(t *testing.T) {
 	}
 	defer db.Close()
 
-	for i := 0; i < 20; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key%d", i)), []byte("value")); err != nil {
+	for i := range 20 {
+		if err := db.Write(fmt.Appendf(nil, "key%d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -651,8 +649,8 @@ func TestDBSync(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 40; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key%02d", i)), []byte("value")); err != nil {
+	for i := range 40 {
+		if err := db.Write(fmt.Appendf(nil, "key%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -675,8 +673,8 @@ func TestDBForEachStopsAndRefusesWhenClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 30; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key%02d", i)), []byte("value")); err != nil {
+	for i := range 30 {
+		if err := db.Write(fmt.Appendf(nil, "key%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -716,8 +714,8 @@ func TestDBViewMissingKey(t *testing.T) {
 	}
 	defer db.Close()
 
-	for i := 0; i < 20; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key%02d", i)), []byte("value")); err != nil {
+	for i := range 20 {
+		if err := db.Write(fmt.Appendf(nil, "key%02d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -788,7 +786,7 @@ func TestCompactionStall(t *testing.T) {
 
 	worst := func(records int, write func(i int) error) time.Duration {
 		var longest time.Duration
-		for i := 0; i < records; i++ {
+		for i := range records {
 			start := time.Now()
 			if err := write(i); err != nil {
 				t.Fatal(err)
@@ -804,7 +802,7 @@ func TestCompactionStall(t *testing.T) {
 		// Half the writes are rewrites, so compaction has records to drop, and
 		// the live set grows with the run: that is what makes compacting the
 		// single log cost more the more it holds.
-		key := func(i int) []byte { return []byte(fmt.Sprintf("key%06d", i%(records/2))) }
+		key := func(i int) []byte { return fmt.Appendf(nil, "key%06d", i%(records/2)) }
 
 		single, err := Open(filepath.Join(t.TempDir(), "kv"), Options{Sync: SyncNever})
 		if err != nil {
@@ -857,7 +855,7 @@ func TestDBMemory(t *testing.T) {
 		valueSize = 1024
 	)
 	value := make([]byte, valueSize)
-	key := func(i int) []byte { return []byte(fmt.Sprintf("key%06d", i)) }
+	key := func(i int) []byte { return fmt.Appendf(nil, "key%06d", i) }
 
 	held := func(build func() (func() error, error)) uint64 {
 		runtime.GC()
@@ -887,7 +885,7 @@ func TestDBMemory(t *testing.T) {
 		if err != nil {
 			return nil, err
 		}
-		for i := 0; i < records; i++ {
+		for i := range records {
 			if err := kvs.Write(key(i), value); err != nil {
 				return nil, err
 			}
@@ -901,7 +899,7 @@ func TestDBMemory(t *testing.T) {
 		if err != nil {
 			return nil, err
 		}
-		for i := 0; i < records; i++ {
+		for i := range records {
 			if err := db.Write(key(i), value); err != nil {
 				return nil, err
 			}
@@ -942,8 +940,8 @@ func TestDBRotationFailureLeavesTheStoreWritable(t *testing.T) {
 	// The log the rotation will try to open next.
 	watcher.fail["open:"+fmt.Sprintf("%010d%s", db.Position().Segment+1, segmentSuffix)] = errDiskFailed
 
-	for i := 0; i < 40; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")); err != nil {
+	for i := range 40 {
+		if err := db.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value")); err != nil {
 			t.Fatalf("write %d, with the next log refused: %v", i, err)
 		}
 	}
@@ -957,7 +955,7 @@ func TestDBRotationFailureLeavesTheStoreWritable(t *testing.T) {
 		t.Errorf("%d logs, want the one it could not rotate away from", got)
 	}
 
-	for i := 0; i < 40; i++ {
+	for i := range 40 {
 		key := fmt.Sprintf("key-%02d", i)
 		if _, err := db.Read([]byte(key)); err != nil {
 			t.Fatalf("%s: %v", key, err)
@@ -1001,9 +999,9 @@ func TestDBMergeTriggerBelowTwoDisablesMerging(t *testing.T) {
 
 			// The same few keys over and over, which is what a merge would have
 			// most to gain from and so what it would take first.
-			for round := 0; round < 60; round++ {
+			for round := range 60 {
 				for _, key := range []string{"alpha", "beta", "gamma"} {
-					if err := db.Write([]byte(key), []byte(fmt.Sprintf("%s-%02d", key, round))); err != nil {
+					if err := db.Write([]byte(key), fmt.Appendf(nil, "%s-%02d", key, round)); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -1069,8 +1067,8 @@ func TestDBTieredKeepsTombstones(t *testing.T) {
 	if err := db.Delete([]byte("doomed")); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 6; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("other%d", i)), []byte(strings.Repeat("y", 150))); err != nil {
+	for i := range 6 {
+		if err := db.Write(fmt.Appendf(nil, "other%d", i), []byte(strings.Repeat("y", 150))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1120,8 +1118,8 @@ func TestDBTiers(t *testing.T) {
 	defer db.Close()
 
 	value := make([]byte, 256)
-	for i := 0; i < 4000; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key%06d", i)), value); err != nil {
+	for i := range 4000 {
+		if err := db.Write(fmt.Appendf(nil, "key%06d", i), value); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1252,8 +1250,8 @@ func TestDBReadsTheOldFormat(t *testing.T) {
 	db.mu.RUnlock()
 
 	// New records land beside the old ones, in the current layout.
-	for i := 0; i < 40; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("new%02d", i)), []byte("in the current format")); err != nil {
+	for i := range 40 {
+		if err := db.Write(fmt.Appendf(nil, "new%02d", i), []byte("in the current format")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1390,8 +1388,8 @@ func TestDBRotationFailureLeavesStoreUsable(t *testing.T) {
 	defer os.Chmod(active, 0o644)
 
 	// Enough to want a rotation, which cannot be finished.
-	for i := 0; i < 20; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key%02d", i)), []byte(strings.Repeat("x", 40))); err != nil {
+	for i := range 20 {
+		if err := db.Write(fmt.Appendf(nil, "key%02d", i), []byte(strings.Repeat("x", 40))); err != nil {
 			t.Fatalf("the write itself failed: %v", err)
 		}
 	}
@@ -1482,8 +1480,8 @@ func TestDBSyncCoversEveryLog(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 60; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key%02d", i)), []byte(strings.Repeat("v", 30))); err != nil {
+	for i := range 60 {
+		if err := db.Write(fmt.Appendf(nil, "key%02d", i), []byte(strings.Repeat("v", 30))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1518,8 +1516,8 @@ func benchDB(b *testing.B, valueSize int) (*DB, []byte, []byte) {
 	}
 
 	value := make([]byte, valueSize)
-	for i := 0; i < records; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key%06d", i)), value); err != nil {
+	for i := range records {
+		if err := db.Write(fmt.Appendf(nil, "key%06d", i), value); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -1531,7 +1529,7 @@ func benchDB(b *testing.B, valueSize int) (*DB, []byte, []byte) {
 	// key in it and take that one.
 	var inMemory, onDisk string
 	for attempt := 0; inMemory == "" && attempt < 4; attempt++ {
-		if err := db.Write([]byte(fmt.Sprintf("active%d", attempt)), value); err != nil {
+		if err := db.Write(fmt.Appendf(nil, "active%d", attempt), value); err != nil {
 			b.Fatal(err)
 		}
 		db.mu.RLock()
@@ -1598,8 +1596,8 @@ func benchMissDB(b *testing.B, keys, logs int) (db *DB, absent, oldest [][]byte,
 		b.Fatal(err)
 	}
 
-	for i := 0; i < keys; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key%013d", i)), value); err != nil {
+	for i := range keys {
+		if err := db.Write(fmt.Appendf(nil, "key%013d", i), value); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -1633,7 +1631,7 @@ func benchMissDB(b *testing.B, keys, logs int) (db *DB, absent, oldest [][]byte,
 
 	absent = make([][]byte, probes)
 	for i := range absent {
-		absent[i] = []byte(fmt.Sprintf("absent%010d", i))
+		absent[i] = fmt.Appendf(nil, "absent%010d", i)
 	}
 	return db, absent, oldest, segments
 }
@@ -1851,7 +1849,7 @@ func BenchmarkDB_Delete(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := db.Delete([]byte(fmt.Sprintf("key%08d", i))); err != nil {
+		if err := db.Delete(fmt.Appendf(nil, "key%08d", i)); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -1882,7 +1880,7 @@ func BenchmarkDB_Write(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if err := db.Write([]byte(fmt.Sprintf("key%08d", i)), value); err != nil {
+				if err := db.Write(fmt.Appendf(nil, "key%08d", i), value); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -1903,8 +1901,8 @@ func BenchmarkDB_Merge(b *testing.B) {
 			b.Fatal(err)
 		}
 		// Rewrites, so the merge has records to drop as well as to copy.
-		for j := 0; j < 4000; j++ {
-			if err := db.Write([]byte(fmt.Sprintf("key%04d", j%1000)), value); err != nil {
+		for j := range 4000 {
+			if err := db.Write(fmt.Appendf(nil, "key%04d", j%1000), value); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -1930,8 +1928,8 @@ func BenchmarkDB_Open(b *testing.B) {
 		b.Fatal(err)
 	}
 	value := make([]byte, 1024)
-	for i := 0; i < 16_000; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key%08d", i)), value); err != nil {
+	for i := range 16_000 {
+		if err := db.Write(fmt.Appendf(nil, "key%08d", i), value); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -2011,7 +2009,7 @@ func TestDBMergeFailureDoesNotStrandAnIndex(t *testing.T) {
 	// The same keys over and over, so a merge has most of the log to throw away
 	// and every offset after the first moves.
 	want := map[string]string{}
-	for round := 0; round < 40; round++ {
+	for round := range 40 {
 		for _, key := range []string{"alpha", "beta", "gamma", "delta"} {
 			value := fmt.Sprintf("%s-%02d", key, round)
 			if err := db.Write([]byte(key), []byte(value)); err != nil {
@@ -2106,7 +2104,7 @@ func TestDBMergeSurvivesARefusedRemoval(t *testing.T) {
 	// older log holds a tombstone which a newer log has already superseded.
 	// That tombstone is what comes back if the removals go out of order.
 	want := map[string]string{}
-	for round := 0; round < 30; round++ {
+	for round := range 30 {
 		for _, key := range []string{"alpha", "beta"} {
 			value := fmt.Sprintf("%s-%02d", key, round)
 			if err := db.Write([]byte(key), []byte(value)); err != nil {
@@ -2195,7 +2193,7 @@ func TestDBMergeStopsWhenItCanNeitherRemoveNorEmpty(t *testing.T) {
 	}
 
 	want := map[string]string{}
-	for round := 0; round < 30; round++ {
+	for round := range 30 {
 		for _, key := range []string{"alpha", "beta"} {
 			value := fmt.Sprintf("%s-%02d", key, round)
 			if err := db.Write([]byte(key), []byte(value)); err != nil {

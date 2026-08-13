@@ -174,7 +174,7 @@ func parseHint(data []byte, segmentSize int64) (index map[string]int64, maxSeq u
 	index = make(map[string]int64, count)
 
 	rest := body[hintHeaderSize:]
-	for i := uint64(0); i < count; i++ {
+	for range count {
 		if len(rest) < hintEntrySize {
 			return nil, 0, false, false
 		}

@@ -82,13 +82,13 @@ func TestWriterStoresEverythingConcurrently(t *testing.T) {
 	const writers, each = 8, 100
 
 	var wg sync.WaitGroup
-	for id := 0; id < writers; id++ {
+	for id := range writers {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
 
-			for i := 0; i < each; i++ {
-				key := []byte(fmt.Sprintf("key-%d-%03d", id, i))
+			for i := range each {
+				key := fmt.Appendf(nil, "key-%d-%03d", id, i)
 				if err := w.Write(key, []byte("value")); err != nil {
 					t.Errorf("write: %v", err)
 					return
@@ -106,8 +106,8 @@ func TestWriterStoresEverythingConcurrently(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for id := 0; id < writers; id++ {
-		for i := 0; i < each; i++ {
+	for id := range writers {
+		for i := range each {
 			key := fmt.Sprintf("key-%d-%03d", id, i)
 			if got, err := db.Read([]byte(key)); err != nil || string(got) != "value" {
 				t.Fatalf("%s = %q, '%v'", key, got, err)
@@ -133,8 +133,8 @@ func TestWriterStoresWhatIsWaitingAsOne(t *testing.T) {
 	<-held.entered
 
 	// Nine more, which cannot be taken off the queue while the writer is held.
-	for i := 0; i < 9; i++ {
-		go func(i int) { done <- w.Write([]byte(fmt.Sprintf("key-%d", i)), []byte("value")) }(i)
+	for i := range 9 {
+		go func(i int) { done <- w.Write(fmt.Appendf(nil, "key-%d", i), []byte("value")) }(i)
 	}
 	queued(t, w, 9)
 
@@ -144,7 +144,7 @@ func TestWriterStoresWhatIsWaitingAsOne(t *testing.T) {
 	<-held.entered
 	held.release <- struct{}{}
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		select {
 		case err := <-done:
 			if err != nil {
@@ -181,14 +181,14 @@ func TestWriterGroupIsOneBatchInTheLog(t *testing.T) {
 	w := kvs.Writer(WriterOptions{})
 
 	var wg sync.WaitGroup
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 
 			var b Batch
-			b.Write([]byte(fmt.Sprintf("key-%02d-a", i)), []byte("value"))
-			b.Write([]byte(fmt.Sprintf("key-%02d-b", i)), []byte("value"))
+			b.Write(fmt.Appendf(nil, "key-%02d-a", i), []byte("value"))
+			b.Write(fmt.Appendf(nil, "key-%02d-b", i), []byte("value"))
 
 			if err := w.WriteBatch(&b); err != nil {
 				t.Errorf("WriteBatch: %v", err)
@@ -224,7 +224,7 @@ func TestWriterGroupIsOneBatchInTheLog(t *testing.T) {
 	if group == 0 {
 		t.Fatal("the writer wrote no batches at all")
 	}
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		a := spans[fmt.Sprintf("key-%02d-a", i)]
 		b := spans[fmt.Sprintf("key-%02d-b", i)]
 		if a == 0 || a != b {
@@ -240,15 +240,15 @@ func TestWriterAnswersEveryoneInAFailedGroup(t *testing.T) {
 	defer w.Close()
 
 	done := make(chan error, 5)
-	for i := 0; i < 5; i++ {
-		go func(i int) { done <- w.Write([]byte(fmt.Sprintf("key-%d", i)), []byte("value")) }(i)
+	for i := range 5 {
+		go func(i int) { done <- w.Write(fmt.Appendf(nil, "key-%d", i), []byte("value")) }(i)
 	}
 
 	// However they fall into groups, every group goes through and every caller
 	// hears the same answer.
 	close(held.release)
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		select {
 		case err := <-done:
 			if !errors.Is(err, failed) {
@@ -276,8 +276,8 @@ func TestWriterCloseDrainsTheQueue(t *testing.T) {
 	go func() { done <- w.Write([]byte("held"), []byte("value")) }()
 	<-held.entered
 
-	for i := 0; i < 5; i++ {
-		go func(i int) { done <- w.Write([]byte(fmt.Sprintf("key-%d", i)), []byte("value")) }(i)
+	for i := range 5 {
+		go func(i int) { done <- w.Write(fmt.Appendf(nil, "key-%d", i), []byte("value")) }(i)
 	}
 	queued(t, w, 5)
 
@@ -316,7 +316,7 @@ func TestWriterCloseDrainsTheQueue(t *testing.T) {
 		t.Errorf("Close returned with %d of the 6 records it had accepted written", stored)
 	}
 
-	for i := 0; i < 6; i++ {
+	for i := range 6 {
 		select {
 		case err := <-done:
 			if err != nil {

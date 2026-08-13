@@ -1,21 +1,38 @@
 # LiteKV
 
-LiteKV is a small key-value store written in Go. Records are appended to a log, an index maps each key
-to its newest record, and the whole store is one byte slice you can hold in memory, save yourself, or
-have written to disk as it changes. For a store bigger than memory, `DB` splits it across several logs,
-keeps only the keys and the newest log in memory, and merges the rest in the background. A
-`KeyValueStore` can be followed by a replica, which is the same log sent somewhere else.
+**A Bitcask-style key-value storage engine for Go.** Records are appended to a log, an index maps each
+key to its newest record, and the whole store is one byte slice you can hold in memory, save yourself,
+or have written to disk as it changes. For a store bigger than memory, `DB` splits it across several
+logs, keeps only the keys and the newest log in memory, and merges the rest in the background. Either
+half can be followed by a replica, which is the same log sent somewhere else.
+
+[![Go](https://github.com/tillknuesting/litekv/actions/workflows/go.yml/badge.svg)](https://github.com/tillknuesting/litekv/actions/workflows/go.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/tillknuesting/litekv.svg)](https://pkg.go.dev/github.com/tillknuesting/litekv)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+```bash
+go get github.com/tillknuesting/litekv
+```
+
+```go
+db, err := litekv.OpenDB("data", litekv.DBOptions{Sync: litekv.SyncEvery})
+defer db.Close()
+
+err = db.Write([]byte("foo"), []byte("bar"))
+value, err := db.Read([]byte("foo"))
+```
+
+**This is the engine and nothing else.** It imports only the standard library, no part of it opens a
+socket, and `go list -deps` on it names no `net/*` package at all — that is the arrangement rather than
+an omission. If you want a database you can *run* rather than a library to build one from,
+**[litekvd](https://github.com/tillknuesting/litekvd)** is the server that sits on this: one binary,
+an HTTP API, replication, metrics.
 
 The design is Bitcask, described by Justin Sheehy and David Smith at Basho Technologies in their 2010
 paper *Bitcask: A Log-Structured Hash Table for Fast Key/Value Data*, which credits Eric Brewer for the
 idea, and shipped as the storage engine behind Riak. An append-only log holds the records and an
 in-memory index holds an offset per key, so a write never seeks, a read is one lookup and one read, a
 crash costs at most the record being written, and every key has to fit in memory.
-
-This is the engine and nothing else. It imports only the standard library, and no part of it opens a
-socket — that is the arrangement rather than an omission. If you want a database you can run rather
-than a library to build one from, [litekvd](https://github.com/tillknuesting/litekvd) is the server
-that sits on this.
 
 ## Which of the two
 

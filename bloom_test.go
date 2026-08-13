@@ -13,7 +13,7 @@ func TestBloomHasNoFalseNegatives(t *testing.T) {
 	for _, count := range []int{1, 2, 100, 10_000, 200_000} {
 		t.Run(fmt.Sprint(count), func(t *testing.T) {
 			index := make(map[string]int64, count)
-			for i := 0; i < count; i++ {
+			for i := range count {
 				index[fmt.Sprintf("key:%016d", i)] = int64(i)
 			}
 
@@ -42,7 +42,7 @@ func TestBloomEmpty(t *testing.T) {
 // not before, and that the option can force either.
 func TestBloomThreshold(t *testing.T) {
 	index := make(map[string]int64, 100)
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		index[fmt.Sprintf("key:%016d", i)] = int64(i)
 	}
 
@@ -94,8 +94,8 @@ func TestBloomMinKeysOption(t *testing.T) {
 
 			// Small logs, so the default declines to filter them and the
 			// explicit settings are the only thing that can differ.
-			for i := 0; i < 200; i++ {
-				if err := db.Write([]byte(fmt.Sprintf("key%04d", i)), []byte("value")); err != nil {
+			for i := range 200 {
+				if err := db.Write(fmt.Appendf(nil, "key%04d", i), []byte("value")); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -138,20 +138,20 @@ func TestDBWithFiltersAnswersTheSame(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		for i := 0; i < 600; i++ {
-			if err := db.Write([]byte(fmt.Sprintf("key%04d", i)), []byte(fmt.Sprintf("value%04d", i))); err != nil {
+		for i := range 600 {
+			if err := db.Write(fmt.Appendf(nil, "key%04d", i), fmt.Appendf(nil, "value%04d", i)); err != nil {
 				t.Fatal(err)
 			}
 		}
 		// Rewrites, so a newer log shadows an older one.
 		for i := 0; i < 600; i += 3 {
-			if err := db.Write([]byte(fmt.Sprintf("key%04d", i)), []byte(fmt.Sprintf("rewritten%04d", i))); err != nil {
+			if err := db.Write(fmt.Appendf(nil, "key%04d", i), fmt.Appendf(nil, "rewritten%04d", i)); err != nil {
 				t.Fatal(err)
 			}
 		}
 		// Deletes, so tombstones have to be found through the filter too.
 		for i := 1; i < 600; i += 7 {
-			if err := db.Delete([]byte(fmt.Sprintf("key%04d", i))); err != nil {
+			if err := db.Delete(fmt.Appendf(nil, "key%04d", i)); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -160,10 +160,10 @@ func TestDBWithFiltersAnswersTheSame(t *testing.T) {
 
 	// Every key written, every key deleted, and a wide band that never existed.
 	probes := make([]string, 0, 2000)
-	for i := 0; i < 600; i++ {
+	for i := range 600 {
 		probes = append(probes, fmt.Sprintf("key%04d", i))
 	}
-	for i := 0; i < 1400; i++ {
+	for i := range 1400 {
 		probes = append(probes, fmt.Sprintf("absent%04d", i))
 	}
 
@@ -240,8 +240,8 @@ func TestBloomSurvivesReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 400; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key%04d", i)), []byte(fmt.Sprintf("value%04d", i))); err != nil {
+	for i := range 400 {
+		if err := db.Write(fmt.Appendf(nil, "key%04d", i), fmt.Appendf(nil, "value%04d", i)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -269,7 +269,7 @@ func TestBloomSurvivesReopen(t *testing.T) {
 		t.Fatalf("after reopening, %d of %d logs have a filter", filtered, total)
 	}
 
-	for i := 0; i < 400; i++ {
+	for i := range 400 {
 		key := fmt.Sprintf("key%04d", i)
 		value, err := reopened.Read([]byte(key))
 		if err != nil {
@@ -290,14 +290,14 @@ func TestBloomFalsePositiveRate(t *testing.T) {
 	const count = 100_000
 
 	index := make(map[string]int64, count)
-	for i := 0; i < count; i++ {
+	for i := range count {
 		index[fmt.Sprintf("key:%016d", i)] = int64(i)
 	}
 	filter := newBloom(index)
 
 	positives := 0
-	for i := 0; i < count; i++ {
-		if filter.mayContain([]byte(fmt.Sprintf("absent:%016d", i))) {
+	for i := range count {
+		if filter.mayContain(fmt.Appendf(nil, "absent:%016d", i)) {
 			positives++
 		}
 	}

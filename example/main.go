@@ -269,8 +269,8 @@ func main() {
 	fmt.Println("\n== replicated to a follower ==")
 
 	leader := &litekv.KeyValueStore{}
-	for i := 0; i < 5; i++ {
-		must(leader.Write([]byte(fmt.Sprintf("key-%d", i)), []byte("value")))
+	for i := range 5 {
+		must(leader.Write(fmt.Appendf(nil, "key-%d", i), []byte("value")))
 	}
 
 	replica := &litekv.KeyValueStore{}
@@ -404,9 +404,9 @@ func main() {
 
 	// The same few keys over and over: most of these records are dead the
 	// moment the next one lands.
-	for round := 0; round < 20; round++ {
+	for round := range 20 {
 		for _, key := range []string{"alpha", "beta", "gamma"} {
-			must(db.Write([]byte(key), []byte(fmt.Sprintf("%s-%02d", key, round))))
+			must(db.Write([]byte(key), fmt.Appendf(nil, "%s-%02d", key, round)))
 		}
 	}
 	must(db.Delete([]byte("gamma")))
@@ -550,12 +550,12 @@ func main() {
 	queue := db.Writer(litekv.WriterOptions{})
 
 	var writers sync.WaitGroup
-	for id := 0; id < 4; id++ {
+	for id := range 4 {
 		writers.Add(1)
 		go func(id int) {
 			defer writers.Done()
-			for i := 0; i < 5; i++ {
-				must(queue.Write([]byte(fmt.Sprintf("queued-%d-%d", id, i)), []byte("value")))
+			for i := range 5 {
+				must(queue.Write(fmt.Appendf(nil, "queued-%d-%d", id, i), []byte("value")))
 			}
 		}(id)
 	}

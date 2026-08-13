@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -89,13 +90,13 @@ func chaosLeader(t *testing.T) *DB {
 	// Enough records that a follower rotates several times taking them, so the
 	// sweep covers freezing a log and writing a hint rather than only the first
 	// few writes.
-	for i := 0; i < 200; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%03d", i)), []byte("first")); err != nil {
+	for i := range 200 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%03d", i), []byte("first")); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for i := 0; i < 60; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%03d", i)), []byte("second")); err != nil {
+	for i := range 60 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%03d", i), []byte("second")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -107,12 +108,12 @@ func chaosLeader(t *testing.T) *DB {
 	// near one: a follower that applies half of a batch is a disagreement the
 	// records themselves cannot show, since the ones that arrived read
 	// perfectly well on their own.
-	for round := 0; round < 2; round++ {
+	for round := range 2 {
 		var b Batch
-		for i := 0; i < 8; i++ {
-			b.Write([]byte(fmt.Sprintf("batched-%d-%d", round, i)), []byte("together"))
+		for i := range 8 {
+			b.Write(fmt.Appendf(nil, "batched-%d-%d", round, i), []byte("together"))
 		}
-		b.Delete([]byte(fmt.Sprintf("key-%03d", 190+round)))
+		b.Delete(fmt.Appendf(nil, "key-%03d", 190+round))
 		if err := leader.WriteBatch(&b); err != nil {
 			t.Fatal(err)
 		}
@@ -293,7 +294,7 @@ func TestDBFollowerChaosRandomised(t *testing.T) {
 
 	faults, restarts := 0, 0
 
-	for step := 0; step < 400; step++ {
+	for step := range 400 {
 		// The leader carries on regardless, which is what makes this different
 		// from failing a store that is standing still.
 		for i := 0; i < 1+random.Intn(6); i++ {
@@ -483,8 +484,8 @@ func TestDBLeaderChaos(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for i := 0; i < 120; i++ {
-			if err := leader.Write([]byte(fmt.Sprintf("key-%03d", i)), []byte("value")); err != nil {
+		for i := range 120 {
+			if err := leader.Write(fmt.Appendf(nil, "key-%03d", i), []byte("value")); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -579,8 +580,8 @@ func TestDBLeaderChaosRefusedReads(t *testing.T) {
 	}
 	defer leader.Close()
 
-	for i := 0; i < 120; i++ {
-		if err := leader.Write([]byte(fmt.Sprintf("key-%03d", i)), []byte("value")); err != nil {
+	for i := range 120 {
+		if err := leader.Write(fmt.Appendf(nil, "key-%03d", i), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -600,7 +601,7 @@ func TestDBLeaderChaosRefusedReads(t *testing.T) {
 	refused := 0
 
 	for _, log := range logs {
-		for allowed := 0; allowed < 4; allowed++ {
+		for allowed := range 4 {
 			watcher.calm()
 			watcher.refuseReads(log, allowed)
 
@@ -703,9 +704,9 @@ func whereIsIt(t *testing.T, db *DB, key string) string {
 }
 
 func joinLines(lines []string) string {
-	out := ""
+	var out strings.Builder
 	for _, line := range lines {
-		out += line + "\n"
+		out.WriteString(line + "\n")
 	}
-	return out
+	return out.String()
 }

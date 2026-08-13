@@ -158,8 +158,8 @@ func TestBatchSurvivesReopening(t *testing.T) {
 	}
 
 	var b Batch
-	for i := 0; i < 5; i++ {
-		b.Write([]byte(fmt.Sprintf("key-%d", i)), []byte("value"))
+	for i := range 5 {
+		b.Write(fmt.Appendf(nil, "key-%d", i), []byte("value"))
 	}
 	if err := kvs.WriteBatch(&b); err != nil {
 		t.Fatal(err)
@@ -177,7 +177,7 @@ func TestBatchSurvivesReopening(t *testing.T) {
 	}
 	defer reopened.Close()
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		key := fmt.Sprintf("key-%d", i)
 		if got, err := reopened.Read([]byte(key)); err != nil || string(got) != "value" {
 			t.Errorf("%s = %q, '%v' after reopening", key, got, err)
@@ -211,8 +211,8 @@ func TestBatchTornAtEveryLength(t *testing.T) {
 
 	before := int64(len(kvs.Data))
 	batch := func(b *Batch) {
-		for i := 0; i < 5; i++ {
-			b.Write([]byte(fmt.Sprintf("key-%d", i)), []byte(fmt.Sprintf("value-%d", i)))
+		for i := range 5 {
+			b.Write(fmt.Appendf(nil, "key-%d", i), fmt.Appendf(nil, "value-%d", i))
 		}
 	}
 
@@ -267,8 +267,8 @@ func TestBatchTornAtEveryLength(t *testing.T) {
 		}
 
 		held := 0
-		for i := 0; i < 5; i++ {
-			if _, err := reopened.Read([]byte(fmt.Sprintf("key-%d", i))); err == nil {
+		for i := range 5 {
+			if _, err := reopened.Read(fmt.Appendf(nil, "key-%d", i)); err == nil {
 				held++
 			}
 		}
@@ -304,8 +304,8 @@ func TestBatchInADBIsOneLog(t *testing.T) {
 
 	// A batch far larger than the log it goes into.
 	var b Batch
-	for i := 0; i < 40; i++ {
-		b.Write([]byte(fmt.Sprintf("key-%02d", i)), []byte("value"))
+	for i := range 40 {
+		b.Write(fmt.Appendf(nil, "key-%02d", i), []byte("value"))
 	}
 	if err := db.WriteBatch(&b); err != nil {
 		t.Fatal(err)
@@ -315,7 +315,7 @@ func TestBatchInADBIsOneLog(t *testing.T) {
 		t.Errorf("the store is in %d logs, want the batch in one and an empty one after it", got)
 	}
 
-	for i := 0; i < 40; i++ {
+	for i := range 40 {
 		key := fmt.Sprintf("key-%02d", i)
 		if got, err := db.Read([]byte(key)); err != nil || string(got) != "value" {
 			t.Fatalf("%s = %q, '%v'", key, got, err)
@@ -327,7 +327,7 @@ func TestBatchInADBIsOneLog(t *testing.T) {
 	if err := db.Merge(); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 40; i++ {
+	for i := range 40 {
 		key := fmt.Sprintf("key-%02d", i)
 		if got, err := db.Read([]byte(key)); err != nil || string(got) != "value" {
 			t.Errorf("after merging, %s = %q, '%v'", key, got, err)
@@ -347,10 +347,10 @@ func TestMergeDropsTheMarkers(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for round := 0; round < 3; round++ {
+	for round := range 3 {
 		var b Batch
-		for i := 0; i < 5; i++ {
-			b.Write([]byte(fmt.Sprintf("key-%d-%d", round, i)), []byte("value"))
+		for i := range 5 {
+			b.Write(fmt.Appendf(nil, "key-%d-%d", round, i), []byte("value"))
 		}
 		if err := db.WriteBatch(&b); err != nil {
 			t.Fatal(err)
@@ -384,8 +384,8 @@ func TestMergeDropsTheMarkers(t *testing.T) {
 		}
 	}
 
-	for round := 0; round < 3; round++ {
-		for i := 0; i < 5; i++ {
+	for round := range 3 {
+		for i := range 5 {
 			key := fmt.Sprintf("key-%d-%d", round, i)
 			if got, err := db.Read([]byte(key)); err != nil || string(got) != "value" {
 				t.Errorf("%s = %q, '%v' after merging", key, got, err)
@@ -439,8 +439,8 @@ func TestBatchRefusedByTheLogLeavesNothing(t *testing.T) {
 	watcher.inject(dir, 0, 1, 0)
 
 	var b Batch
-	for i := 0; i < 5; i++ {
-		b.Write([]byte(fmt.Sprintf("key-%d", i)), []byte("value"))
+	for i := range 5 {
+		b.Write(fmt.Appendf(nil, "key-%d", i), []byte("value"))
 	}
 	if err := db.WriteBatch(&b); err == nil {
 		t.Fatal("a batch the disk refused reported no error")
@@ -453,7 +453,7 @@ func TestBatchRefusedByTheLogLeavesNothing(t *testing.T) {
 	if got := active.highestSeq(); got != number {
 		t.Errorf("a refused batch spent numbers: %d, want %d", got, number)
 	}
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		key := fmt.Sprintf("key-%d", i)
 		if _, err := db.Read([]byte(key)); err == nil {
 			t.Errorf("%s is readable after the batch was refused", key)
@@ -486,8 +486,8 @@ func TestBatchInAFileIsOneWrite(t *testing.T) {
 	watcher.reset()
 
 	var b Batch
-	for i := 0; i < 10; i++ {
-		b.Write([]byte(fmt.Sprintf("key-%d", i)), []byte("value"))
+	for i := range 10 {
+		b.Write(fmt.Appendf(nil, "key-%d", i), []byte("value"))
 	}
 	if err := kvs.WriteBatch(&b); err != nil {
 		t.Fatal(err)
@@ -627,15 +627,15 @@ func TestBatchCrossesWhole(t *testing.T) {
 	}
 	followDB(t, leader, follower, ReplicaOptions{})
 
-	for round := 0; round < 12; round++ {
+	for round := range 12 {
 		var b Batch
-		for i := 0; i < 6; i++ {
-			b.Write([]byte(fmt.Sprintf("key-%02d-%d", round, i)), []byte("value"))
+		for i := range 6 {
+			b.Write(fmt.Appendf(nil, "key-%02d-%d", round, i), []byte("value"))
 		}
 		if err := leader.WriteBatch(&b); err != nil {
 			t.Fatal(err)
 		}
-		if err := leader.Write([]byte(fmt.Sprintf("single-%02d", round)), []byte("value")); err != nil {
+		if err := leader.Write(fmt.Appendf(nil, "single-%02d", round), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -727,8 +727,8 @@ func TestBatchLargerThanTheWireCrossesAnyway(t *testing.T) {
 
 			var b Batch
 			value := make([]byte, 512)
-			for i := 0; i < 20; i++ {
-				b.Write([]byte(fmt.Sprintf("key-%02d", i)), value)
+			for i := range 20 {
+				b.Write(fmt.Appendf(nil, "key-%02d", i), value)
 			}
 			if err := leader.WriteBatch(&b); err != nil {
 				t.Fatal(err)
@@ -763,10 +763,10 @@ func TestBatchOverAKeyValueStoreWire(t *testing.T) {
 	leader := &KeyValueStore{}
 	follower := &KeyValueStore{}
 
-	for round := 0; round < 8; round++ {
+	for round := range 8 {
 		var b Batch
-		for i := 0; i < 5; i++ {
-			b.Write([]byte(fmt.Sprintf("key-%d-%d", round, i)), []byte("value"))
+		for i := range 5 {
+			b.Write(fmt.Appendf(nil, "key-%d-%d", round, i), []byte("value"))
 		}
 		if err := leader.WriteBatch(&b); err != nil {
 			t.Fatal(err)
@@ -874,8 +874,8 @@ func TestBatchWithADamagedRecordIsDroppedWhole(t *testing.T) {
 	}
 
 	var b Batch
-	for i := 0; i < 4; i++ {
-		b.Write([]byte(fmt.Sprintf("key-%d", i)), []byte("value"))
+	for i := range 4 {
+		b.Write(fmt.Appendf(nil, "key-%d", i), []byte("value"))
 	}
 	if err := kvs.WriteBatch(&b); err != nil {
 		t.Fatal(err)
@@ -903,7 +903,7 @@ func TestBatchWithADamagedRecordIsDroppedWhole(t *testing.T) {
 	if got, err := loaded.Read([]byte("before")); err != nil || string(got) != "the batch" {
 		t.Errorf("the record before the batch reads %q, '%v'", got, err)
 	}
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		key := fmt.Sprintf("key-%d", i)
 		if _, err := loaded.Read([]byte(key)); err == nil {
 			t.Errorf("%s survived a batch with a damaged record in it", key)
@@ -936,8 +936,8 @@ func TestBatchDamagedInAFrozenLog(t *testing.T) {
 			}
 
 			var b Batch
-			for i := 0; i < 4; i++ {
-				b.Write([]byte(fmt.Sprintf("key-%d", i)), []byte("value"))
+			for i := range 4 {
+				b.Write(fmt.Appendf(nil, "key-%d", i), []byte("value"))
 			}
 			if err := db.WriteBatch(&b); err != nil {
 				t.Fatal(err)
@@ -992,7 +992,7 @@ func TestBatchDamagedInAFrozenLog(t *testing.T) {
 			if got, err := reopened.Read([]byte("before")); err != nil || string(got) != "the batch" {
 				t.Errorf("the record before the batch reads %q, '%v'", got, err)
 			}
-			for i := 0; i < 4; i++ {
+			for i := range 4 {
 				key := fmt.Sprintf("key-%d", i)
 				if _, err := reopened.Read([]byte(key)); err == nil {
 					t.Errorf("%s survived a batch that could not be trusted", key)
@@ -1045,8 +1045,8 @@ func TestBatchDamagedOnTheWire(t *testing.T) {
 	catchUp(t, leader, follower)
 
 	var b Batch
-	for i := 0; i < 4; i++ {
-		b.Write([]byte(fmt.Sprintf("key-%d", i)), []byte("value"))
+	for i := range 4 {
+		b.Write(fmt.Appendf(nil, "key-%d", i), []byte("value"))
 	}
 	if err := leader.WriteBatch(&b); err != nil {
 		t.Fatal(err)
@@ -1074,7 +1074,7 @@ func TestBatchDamagedOnTheWire(t *testing.T) {
 	if len(follower.Data) != was {
 		t.Errorf("the follower kept %d bytes of a batch it refused", len(follower.Data)-was)
 	}
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		key := fmt.Sprintf("key-%d", i)
 		if _, err := follower.Read([]byte(key)); err == nil {
 			t.Errorf("%s was applied from a batch that was refused", key)

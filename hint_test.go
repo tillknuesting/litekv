@@ -34,7 +34,7 @@ func fillSegments(t *testing.T, db *DB, records int) map[string]string {
 	t.Helper()
 
 	want := map[string]string{}
-	for i := 0; i < records; i++ {
+	for i := range records {
 		key := fmt.Sprintf("key%05d", i)
 		value := fmt.Sprintf("value%05d", i)
 		if err := db.Write([]byte(key), []byte(value)); err != nil {
@@ -273,8 +273,8 @@ func TestHintFollowsTheMerge(t *testing.T) {
 
 	// Rewrites, so merging has something to drop.
 	want := map[string]string{}
-	for round := 0; round < 30; round++ {
-		for i := 0; i < 10; i++ {
+	for round := range 30 {
+		for i := range 10 {
 			key := fmt.Sprintf("key%02d", i)
 			value := fmt.Sprintf("value-%02d-%02d", i, round)
 			if err := db.Write([]byte(key), []byte(value)); err != nil {
@@ -360,8 +360,8 @@ func TestHintOpenCost(t *testing.T) {
 	}
 
 	value := make([]byte, 1024)
-	for i := 0; i < 64_000; i++ {
-		if err := db.Write([]byte(fmt.Sprintf("key%08d", i)), value); err != nil {
+	for i := range 64_000 {
+		if err := db.Write(fmt.Appendf(nil, "key%08d", i), value); err != nil {
 			t.Fatal(err)
 		}
 	}
