@@ -946,11 +946,11 @@ func (d *diskSegment) batch(pos Position, size int64, dst []byte) ([]byte, Posit
 		return dst, pos, nil
 	}
 
-	want := min(d.bytes-pos.Offset, size)
-	if want < 0 {
-		// A batch that is already over its size still takes one record, below.
-		want = 0
-	}
+	// Clamped at zero because a batch that is already over its size still takes
+	// one record, below. The comment sits above the statement rather than
+	// inside it because go fix folds this shape into a max and would otherwise
+	// wedge the comment into the middle of the call.
+	want := max(min(d.bytes-pos.Offset, size), 0)
 
 	start := len(dst)
 	dst = append(dst, make([]byte, want)...)
